@@ -1,0 +1,28 @@
+[package]
+name = "ruwriter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+
+[package.metadata.cove]
+id = "dev.cyke.ruwriter"
+name = "Ruwriter"
+build = 1
+
+[workspace]
+members = [".", "crates/core", "xtask"]
+
+[dependencies]
+cove-ui = { path = "../Cove" }
+ruwriter-core = { path = "crates/core" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
