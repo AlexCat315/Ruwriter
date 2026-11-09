@@ -171,6 +171,7 @@ dependencies = [
  "cove-devtools-protocol",
  "cove-examples",
  "cove-graphics",
+ "cove-hosts",
  "cove-logging",
  "cove-platform",
  "cove-text",
@@ -931,15 +932,16 @@ dependencies = [
 
 [[package]]
 name = "ruwriter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cove-ui",
+ "libc",
  "ruwriter-core",
 ]
 
 [[package]]
 name = "ruwriter-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",

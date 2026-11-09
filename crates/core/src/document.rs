@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DOCUMENT_EXTENSION: &str = "md";
 const TITLE_LIMIT: usize = 48;
+const EXCERPT_LIMIT: usize = 120;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
@@ -17,6 +18,19 @@ pub struct Document {
     /// Opened from outside the library; saving keeps the original path.
     pub external: bool,
     pub updated_at: u64,
+    #[serde(default)]
+    pub created_at: u64,
+    /// Kept above unpinned documents in every list.
+    #[serde(default)]
+    pub pinned: bool,
+    /// In the trash: hidden from the library until restored or purged.
+    #[serde(default)]
+    pub trashed: bool,
+    /// Plain-text preview of the body, refreshed on every write.
+    #[serde(default)]
+    pub excerpt: String,
+    #[serde(default)]
+    pub words: usize,
 }
 
 impl Document {
@@ -26,13 +40,29 @@ impl Document {
         path: PathBuf,
         external: bool,
     ) -> Self {
+        let now = now();
         Self {
             id: id.into(),
             title: title.into(),
             path,
             external,
-            updated_at: now(),
+            updated_at: now,
+            created_at: now,
+            pinned: false,
+            trashed: false,
+            excerpt: String::new(),
+            words: 0,
         }
+    }
+
+    /// Refreshes everything derived from the text. External files keep the
+    /// title chosen at import unless the text supplies a heading.
+    pub fn refresh(&mut self, text: &str, fallback: &str) {
+        if !self.external {
+            self.title = title_from_text(text, fallback);
+        }
+        self.excerpt = excerpt_from_text(text);
+        self.words = crate::stats::count(text).words;
     }
 
     pub fn display_title(&self) -> &str {
@@ -97,6 +127,73 @@ pub fn title_from_text(text: &str, fallback: &str) -> String {
     } else {
         title
     }
+}
+
+/// The body after the title line, with Markdown markers removed and
+/// whitespace collapsed, cut on a char boundary.
+pub fn excerpt_from_text(text: &str) -> String {
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let _title = lines.next();
+    let mut excerpt = String::new();
+    let mut count = 0;
+    for line in lines {
+        if line.starts_with("```") || line.starts_with("---") || line.starts_with("***") {
+            continue;
+        }
+        let stripped = strip_markers(line);
+        if stripped.is_empty() {
+            continue;
+        }
+        if !excerpt.is_empty() {
+            excerpt.push(' ');
+            count += 1;
+        }
+        for character in stripped.chars() {
+            if count >= EXCERPT_LIMIT {
+                return excerpt.trim_end().to_owned();
+            }
+            excerpt.push(character);
+            count += 1;
+        }
+    }
+    excerpt
+}
+
+fn strip_markers(line: &str) -> String {
+    let mut rest = line.trim_start_matches(['#', '>', ' ']);
+    for prefix in ["- [ ] ", "- [x] ", "- ", "* ", "+ "] {
+        if let Some(stripped) = rest.strip_prefix(prefix) {
+            rest = stripped;
+            break;
+        }
+    }
+    if let Some(position) = rest.find(". ")
+        && position <= 3
+        && rest[..position].chars().all(|c| c.is_ascii_digit())
+    {
+        rest = &rest[position + 2..];
+    }
+    let mut out = String::with_capacity(rest.len());
+    let mut chars = rest.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '*' | '_' | '`' | '~' => {}
+            '!' if chars.peek() == Some(&'[') => {}
+            '[' => {}
+            ']' => {
+                // Drop a link target: `](...)`.
+                if chars.peek() == Some(&'(') {
+                    for next in chars.by_ref() {
+                        if next == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => out.push(character),
+        }
+    }
+    out.trim().to_owned()
 }
 
 /// Filesystem-safe stem; never produces separators or dot segments.

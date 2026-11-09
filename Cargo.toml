@@ -1,6 +1,6 @@
 [package]
 name = "ruwriter"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
@@ -8,7 +8,7 @@ publish = false
 [package.metadata.cove]
 id = "dev.cyke.ruwriter"
 name = "Ruwriter"
-build = 1
+build = 2
 
 [workspace]
 members = [".", "crates/core", "xtask"]
@@ -16,6 +16,9 @@ members = [".", "crates/core", "xtask"]
 [dependencies]
 cove-ui = { path = "../Cove" }
 ruwriter-core = { path = "crates/core" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

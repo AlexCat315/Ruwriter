@@ -34,3 +34,17 @@ fn file_names_never_contain_separators() {
 fn ids_are_unique() {
     assert_ne!(new_id(), new_id());
 }
+
+#[test]
+fn excerpt_skips_title_and_markup() {
+    use ruwriter_core::document::excerpt_from_text;
+    let text = "# 标题\n\n## 小节\n\n- **加粗** 与 [链接](https://x.y)\n\n```\ncode\n```\n> 引用";
+    assert_eq!(excerpt_from_text(text), "小节 加粗 与 链接 code 引用");
+    assert_eq!(excerpt_from_text("只有标题"), "");
+    assert_eq!(
+        excerpt_from_text(&format!("t\n{}", "长".repeat(400)))
+            .chars()
+            .count(),
+        120
+    );
+}
