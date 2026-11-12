@@ -120,6 +120,41 @@ impl View for Palette {
                 .keywords(["theme", "appearance", "dark", "light", "waiguan"]),
             );
         }
+        items.push(
+            command(
+                "新建文件夹",
+                "资料库",
+                icons::file::folder_plus(),
+                Rc::new(Model::new_folder_here),
+            )
+            .keywords(["folder", "new folder", "wenjianjia"]),
+        );
+        items.push(
+            command(
+                "打开文件夹作为资料库…",
+                "资料库",
+                icons::file::folder_open(),
+                Rc::new(Model::open_library_picker),
+            )
+            .keywords(["vault", "library", "open folder", "ziliaoku"]),
+        );
+        let folders = model
+            .read(|session| session.library.folders.clone())
+            .unwrap_or_default();
+        for folder in folders {
+            let id = folder.id.clone();
+            let path = folder.id.replace('/', " / ");
+            items.push(
+                command(
+                    &format!("文件夹：{}", folder.name),
+                    "跳转到文件夹",
+                    icons::file::folder(),
+                    Rc::new(move |model: &Model| model.select_folder(&id)),
+                )
+                .id(format!("folder-{}", folder.id))
+                .subtitle(path),
+            );
+        }
         for collection in Collection::ALL {
             items.push(command(
                 collection.title(),

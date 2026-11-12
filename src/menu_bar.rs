@@ -76,8 +76,13 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
         vec![
             item(action(model, "新建文稿", Model::create), Some(primary("n"))),
             item(
-                action(model, "打开…", Model::open_picker),
-                Some(primary("o")),
+                action(model, "新建文件夹", Model::new_folder_here),
+                Some(primary_shift("n")),
+            ),
+            item(action(model, "打开文件…", Model::open_picker), Some(primary("o"))),
+            item(
+                action(model, "打开文件夹作为资料库…", Model::open_library_picker),
+                Some(primary_shift("o")),
             ),
             NativeMenuItem::Separator,
             item(action(model, "保存", Model::save), Some(primary("s"))),

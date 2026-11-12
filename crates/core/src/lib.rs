@@ -9,6 +9,6 @@ pub mod session;
 pub mod stats;
 
 pub use document::{Document, title_from_text};
-pub use library::{AppearancePreference, Collection, Library, Settings};
-pub use session::{Session, ViewOptions};
+pub use library::{AppearancePreference, Collection, Folder, Library, Settings};
+pub use session::{Rescan, Session, ViewOptions};
 pub use stats::{WritingStats, count};

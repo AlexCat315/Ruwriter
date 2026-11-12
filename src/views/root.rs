@@ -16,16 +16,19 @@ use cove_ui::compose::primitives::text::{Divider, TextBuffer};
 use cove_ui::compose::theme::SemanticColorRef;
 use cove_ui::compose::theme::styles::circular_appearance::{CircularThemeHost, ThemeTransition};
 use cove_ui::composition::{AnyView, EmptyView, Scope, View};
+use cove_ui::core::ThreadPoster;
 use cove_ui::core::scene::{Align, OpenedDocuments};
+use cove_ui::watch::{DirectoryWatcher, WatchOptions};
 use ruwriter_core::{Session, count};
 
 use super::editor::EditorPane;
 use super::list::ListPane;
 use super::palette::Palette;
+use super::rename::RenameDialog;
 use super::sidebar::LibrarySidebar;
 use super::ui::{full_height, full_size, hstack, vstack};
 use crate::menu_bar;
-use crate::model::Model;
+use crate::model::{Model, deliver_disk_change};
 use crate::shortcuts;
 use crate::theme::Mode;
 
@@ -95,12 +98,15 @@ impl View for RootView {
             query: cx.state(TextBuffer::empty),
             palette: cx.state(|| false),
             showing_editor: cx.state(|| true),
+            rename: cx.state(|| None),
+            rename_text: cx.state(TextBuffer::empty),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file
         // association, command-line paths) land in the library once.
         let installed = cx.remember(|| Rc::new(Cell::new(false)));
         if !installed.replace(true) {
+            model.install_disk_handler();
             let opener = model.clone();
             OpenedDocuments::set_handler(Some(Rc::new(move |paths: Vec<String>| {
                 for path in paths {
@@ -110,6 +116,24 @@ impl View for RootView {
         }
 
         let _ = model.revision.get();
+
+        // One watcher per library folder; opening another folder replaces it.
+        let watcher = cx.remember(|| Rc::new(RefCell::new(None::<DirectoryWatcher>)));
+        let library_root = session.borrow().library_root().to_path_buf();
+        let stale = watcher
+            .borrow()
+            .as_ref()
+            .is_none_or(|current| current.root() != library_root);
+        if stale {
+            let poster = ThreadPoster::current();
+            *watcher.borrow_mut() = DirectoryWatcher::new(
+                &library_root,
+                WatchOptions::default(),
+                move |paths| poster.post(move || deliver_disk_change(paths)),
+            )
+            .ok();
+        }
+
         let environment = cx.composition_value(&SurfaceEnvironment::key());
         let layout = Layout::resolve(
             environment.viewport.width,
@@ -190,6 +214,9 @@ impl View for RootView {
                 AnyView::new(shell),
                 AnyView::new(shortcut_host),
                 AnyView::new(Palette {
+                    model: model.clone(),
+                }),
+                AnyView::new(RenameDialog {
                     model: model.clone(),
                 }),
             ],

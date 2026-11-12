@@ -1,6 +1,6 @@
 //! Small layout helpers and the custom styles Ruwriter draws with.
 
-use cove_ui::compose::modifiers::layout::{LayoutFrameExt, PaddingExt};
+use cove_ui::compose::modifiers::layout::{FlexExt, LayoutFrameExt, PaddingExt};
 use cove_ui::compose::modifiers::style::{AppearanceExt, SemanticStyleViewExt};
 use cove_ui::compose::primitives::controls::{Button, ButtonIconSource};
 use cove_ui::compose::theme::SemanticColorRef;
@@ -138,5 +138,59 @@ pub struct ProseFieldStyle;
 impl TextFieldStyle for ProseFieldStyle {
     fn make_body(&self, configuration: TextFieldStyleConfiguration) -> AnyView {
         configuration.content
+    }
+}
+
+/// Folder tree rows that look like the sidebar's own rows: the same neutral
+/// selection fill and radius, a hover wash, full-width bands, and no change
+/// of ink when selected.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SidebarTreeRowStyle;
+
+impl cove_ui::compose::theme::styles::components::tree_row_style::TreeRowStyle
+    for SidebarTreeRowStyle
+{
+    fn make_body(
+        &self,
+        configuration: cove_ui::compose::theme::styles::components::tree_row_style::TreeRowStyleConfiguration,
+    ) -> AnyView {
+        use cove_ui::compose::theme::styles::components::selection_appearance::{
+            SelectionAppearance, SelectionRole,
+        };
+        let appearance = SelectionAppearance::resolve(SelectionRole::Sidebar, &configuration.theme);
+        let fill = if configuration.is_selected {
+            appearance.fill
+        } else if configuration.is_hovered || configuration.is_search_hit {
+            configuration.theme.colors.state_layer_hover
+        } else {
+            cove_ui::core::Color::CLEAR
+        };
+        let row = hstack(
+            0.0,
+            Align::Center,
+            vec![
+                AnyView::new(
+                    AnyView::new(configuration.content.clone())
+                        .flex_with(1.0, 1.0, Some(0.0)),
+                ),
+            ],
+        )
+        .padding_edges(8.0, 0.0)
+        .frame(
+            Some(FrameDimension::Percent(100.0)),
+            Some(FrameDimension::Percent(100.0)),
+            None,
+            None,
+            None,
+            None,
+        )
+        .background_color(fill)
+        .corner_radius(appearance.corner_radius);
+        let row = AnyView::new(AnyView::new(row).flex_with(1.0, 1.0, Some(0.0)));
+        if configuration.is_enabled {
+            row
+        } else {
+            AnyView::new(row.opacity(0.55))
+        }
     }
 }

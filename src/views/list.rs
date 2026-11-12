@@ -6,7 +6,9 @@ use cove_ui::compose::modifiers::style::SemanticStyleViewExt;
 use cove_ui::compose::primitives::controls::fields::SearchField;
 use cove_ui::compose::primitives::controls::{Button, ButtonIcon, ButtonIconSource, MenuButton};
 use cove_ui::compose::primitives::media::ui_icon_catalog as icons;
-use cove_ui::compose::primitives::overlays::{ContextMenuExt, MenuEntry, MenuItem, MenuItemRole};
+use cove_ui::compose::primitives::overlays::{
+    ContextMenuExt, MenuEntry, MenuItem, MenuItemRole, MenuSubmenu,
+};
 use cove_ui::compose::primitives::text::Text;
 use cove_ui::compose::theme::styles::buttons::ButtonStyleViewExt;
 use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
@@ -19,7 +21,7 @@ use super::root::Layout;
 use super::sidebar::appearance_label;
 use super::ui::{RowButtonStyle, hstack, icon_button, spacer, vstack};
 use crate::dates::relative;
-use crate::model::Model;
+use crate::model::{Model, RenameTarget};
 
 pub struct ListPane {
     pub model: Model,
@@ -57,9 +59,23 @@ impl View for ListPane {
 impl ListPane {
     fn header(&self) -> AnyView {
         let model = &self.model;
-        let collection = model.settings().collection;
-        let count = model.read(|session| session.count(collection)).unwrap_or(0);
-        let title = Text::new(collection.title())
+        let settings = model.settings();
+        let collection = settings.collection;
+        let in_trash = settings.folder.is_none() && collection == Collection::Trash;
+        let (heading_title, count) = model
+            .read(|session| match settings.folder.as_deref() {
+                Some(folder) => (
+                    session
+                        .library
+                        .folder(folder)
+                        .map(|folder| folder.name.clone())
+                        .unwrap_or_else(|| model.library_name()),
+                    session.library.folder_count(folder),
+                ),
+                None => (collection.title().to_owned(), session.count(collection)),
+            })
+            .unwrap_or_default();
+        let title = Text::new(heading_title)
             .truncated()
             .semantic_font(SemanticFontRef::headline());
         let subtitle = Text::new(if count == 0 {
@@ -98,7 +114,7 @@ impl ListPane {
             )
         };
 
-        let action: AnyView = if collection == Collection::Trash {
+        let action: AnyView = if in_trash {
             let empty = model.clone();
             AnyView::new(
                 Button::title("清空", move || empty.empty_trash())
@@ -142,6 +158,27 @@ fn collections_menu(model: &Model) -> Vec<MenuEntry> {
             )
         })
         .collect();
+    let folders = model
+        .read(|session| session.library.folders.clone())
+        .unwrap_or_default();
+    if !folders.is_empty() {
+        entries.push(MenuEntry::separator(80));
+        entries.push(MenuEntry::label(81, model.library_name()));
+        let selected = model.settings().folder;
+        for (index, folder) in folders.into_iter().enumerate() {
+            let choose = model.clone();
+            let indent = "\u{3000}".repeat(folder.depth);
+            let is_selected = selected.as_deref() == Some(folder.id.as_str());
+            entries.push(MenuEntry::Item(
+                MenuItem::new(
+                    1000 + index as u64,
+                    format!("{indent}{}", folder.name),
+                    move || choose.select_folder(&folder.id),
+                )
+                .selected(is_selected),
+            ));
+        }
+    }
     entries.push(MenuEntry::separator(90));
     let (title, _) = appearance_label(model.settings().appearance);
     let cycle = model.clone();
@@ -165,18 +202,17 @@ impl View for DocumentRows {
         let _ = self.model.revision.get();
         let _ = self.model.listing.get();
         let query = self.model.query.get().string_value();
-        let (documents, active, collection) = self
+        let (documents, active, settings) = self
             .model
-            .read(|session| {
-                (
-                    session.list(&query),
-                    session.active_id(),
-                    session.settings().collection,
-                )
-            })
+            .read(|session| (session.list(&query), session.active_id(), session.settings()))
             .unwrap_or_default();
+        let collection = settings.collection;
         if documents.is_empty() {
-            return empty_state(collection, !query.trim().is_empty());
+            return empty_state(
+                collection,
+                settings.folder.is_some(),
+                !query.trim().is_empty(),
+            );
         }
         let rows: Vec<AnyView> = documents
             .into_iter()
@@ -199,9 +235,11 @@ impl View for DocumentRows {
     }
 }
 
-fn empty_state(collection: Collection, searching: bool) -> AnyView {
+fn empty_state(collection: Collection, in_folder: bool, searching: bool) -> AnyView {
     let message = if searching {
         "没有匹配的文稿"
+    } else if in_folder {
+        "文件夹是空的"
     } else {
         match collection {
             Collection::Trash => "废纸篓是空的",
@@ -272,8 +310,9 @@ fn row(model: &Model, document: Document, selected: bool, collection: Collection
 }
 
 fn row_menu(model: &Model, document: &Document, collection: Collection) -> Vec<MenuEntry> {
+    let _ = collection;
     let id = document.id.clone();
-    if collection == Collection::Trash {
+    if document.trashed {
         let restore = model.clone();
         let purge = model.clone();
         let restore_id = id.clone();
@@ -296,7 +335,7 @@ fn row_menu(model: &Model, document: &Document, collection: Collection) -> Vec<M
     let pin_id = id.clone();
     let open_id = id.clone();
     let export_id = id.clone();
-    vec![
+    let mut entries = vec![
         MenuEntry::Item(MenuItem::new(1, "打开", move || open.select(&open_id))),
         MenuEntry::Item(MenuItem::new(
             2,
@@ -308,9 +347,55 @@ fn row_menu(model: &Model, document: &Document, collection: Collection) -> Vec<M
             export.export();
         })),
         MenuEntry::separator(4),
-        MenuEntry::Item(
-            MenuItem::new(5, "移到废纸篓", move || trash.trash(&id))
-                .role(MenuItemRole::Destructive),
-        ),
-    ]
+    ];
+    let rename = model.clone();
+    let rename_id = id.clone();
+    entries.push(MenuEntry::Item(MenuItem::new(6, "重命名…", move || {
+        rename.begin_rename(RenameTarget::Document(rename_id.clone()))
+    })));
+    if !document.external {
+        entries.push(MenuEntry::Submenu(MenuSubmenu::new(
+            7,
+            "移动到",
+            move_targets(model, &id, document.folder.as_deref()),
+        )));
+    }
+    entries.push(MenuEntry::separator(8));
+    entries.push(MenuEntry::Item(
+        MenuItem::new(
+            5,
+            if document.external { "从列表中移除" } else { "移到废纸篓" },
+            move || trash.trash(&id),
+        )
+        .role(MenuItemRole::Destructive),
+    ));
+    entries
+}
+
+/// The library folder and every folder in it, indented by depth; the
+/// document's own folder is checked and does nothing.
+fn move_targets(model: &Model, id: &str, current: Option<&str>) -> Vec<MenuEntry> {
+    let folders = model
+        .read(|session| session.library.folders.clone())
+        .unwrap_or_default();
+    let mut targets = vec![(String::new(), model.library_name(), 0)];
+    targets.extend(folders.into_iter().map(|f| (f.id, f.name, f.depth + 1)));
+    targets
+        .into_iter()
+        .enumerate()
+        .map(|(index, (folder, name, depth))| {
+            let mover = model.clone();
+            let id = id.to_owned();
+            let here = current == Some(folder.as_str());
+            MenuEntry::Item(
+                MenuItem::new(
+                    100 + index as u64,
+                    format!("{}{name}", "\u{3000}".repeat(depth)),
+                    move || mover.move_document(&id, &folder),
+                )
+                .selected(here)
+                .enabled(!here),
+            )
+        })
+        .collect()
 }

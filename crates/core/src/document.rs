@@ -1,77 +1,105 @@
-//! Document identity and title derivation. A document is a Markdown file on
-//! disk; the library index only records where it lives.
+//! A document is a Markdown or text file. Library files are identified by
+//! their path relative to the library folder (`小说/第一章.md`); files opened
+//! from elsewhere by their absolute path. Everything else is derived from the
+//! file and cached by the library.
 
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DOCUMENT_EXTENSION: &str = "md";
+/// Extensions the library lists as documents.
+pub const DOCUMENT_EXTENSIONS: [&str; 3] = ["md", "markdown", "txt"];
+pub const UNTITLED: &str = "未命名";
 const TITLE_LIMIT: usize = 48;
 const EXCERPT_LIMIT: usize = 120;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
     pub id: String,
     pub title: String,
     pub path: PathBuf,
+    /// Folder id inside the library (`""` is the library folder itself);
+    /// `None` for files outside it.
+    pub folder: Option<String>,
     /// Opened from outside the library; saving keeps the original path.
     pub external: bool,
+    /// File modification time, seconds since the epoch.
     pub updated_at: u64,
-    #[serde(default)]
     pub created_at: u64,
     /// Kept above unpinned documents in every list.
-    #[serde(default)]
     pub pinned: bool,
-    /// In the trash: hidden from the library until restored or purged.
-    #[serde(default)]
+    /// Lives in the library's trash folder.
     pub trashed: bool,
-    /// Plain-text preview of the body, refreshed on every write.
-    #[serde(default)]
+    /// Plain-text preview of the body.
     pub excerpt: String,
-    #[serde(default)]
     pub words: usize,
 }
 
 impl Document {
-    pub fn new(
-        id: impl Into<String>,
-        title: impl Into<String>,
-        path: PathBuf,
-        external: bool,
-    ) -> Self {
-        let now = now();
-        Self {
-            id: id.into(),
-            title: title.into(),
-            path,
-            external,
-            updated_at: now,
-            created_at: now,
-            pinned: false,
-            trashed: false,
-            excerpt: String::new(),
-            words: 0,
-        }
-    }
-
-    /// Refreshes everything derived from the text. External files keep the
-    /// title chosen at import unless the text supplies a heading.
-    pub fn refresh(&mut self, text: &str, fallback: &str) {
-        if !self.external {
-            self.title = title_from_text(text, fallback);
-        }
-        self.excerpt = excerpt_from_text(text);
-        self.words = crate::stats::count(text).words;
-    }
-
     pub fn display_title(&self) -> &str {
         if self.title.trim().is_empty() {
-            "未命名"
+            UNTITLED
         } else {
             &self.title
         }
     }
+
+    /// The file name without its extension.
+    pub fn stem(&self) -> String {
+        file_stem(&self.path)
+    }
+}
+
+pub fn file_stem(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+pub fn is_document_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            DOCUMENT_EXTENSIONS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(extension))
+        })
+}
+
+/// What a file's text says about it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Derived {
+    pub title: String,
+    pub excerpt: String,
+    pub words: usize,
+}
+
+/// Title, excerpt and word count for a file. Ruwriter-named drafts take their
+/// title from the first line; any other file takes it from a leading heading,
+/// or its file name, so notes written elsewhere keep the names given to them.
+pub fn derive(text: &str, stem: &str, auto_named: bool) -> Derived {
+    let first = first_line(text);
+    let from_text = auto_named || first.starts_with('#');
+    let title = if from_text {
+        title_from_text(text, if stem.is_empty() { UNTITLED } else { stem })
+    } else if stem.is_empty() {
+        UNTITLED.to_owned()
+    } else {
+        stem.to_owned()
+    };
+    Derived {
+        title,
+        excerpt: excerpt_after(text, from_text && !first.is_empty()),
+        words: crate::stats::count(text).words,
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
 }
 
 /// Sortable, collision-resistant within one process and across restarts.
@@ -132,8 +160,14 @@ pub fn title_from_text(text: &str, fallback: &str) -> String {
 /// The body after the title line, with Markdown markers removed and
 /// whitespace collapsed, cut on a char boundary.
 pub fn excerpt_from_text(text: &str) -> String {
+    excerpt_after(text, true)
+}
+
+fn excerpt_after(text: &str, skip_title: bool) -> String {
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    let _title = lines.next();
+    if skip_title {
+        let _title = lines.next();
+    }
     let mut excerpt = String::new();
     let mut count = 0;
     for line in lines {
@@ -208,7 +242,8 @@ pub fn file_name_for(title: &str) -> String {
             }
         })
         .collect();
-    let cleaned = cleaned.trim().trim_matches('-').to_owned();
+    let cleaned: String = cleaned.trim().trim_matches('-').chars().take(80).collect();
+    let cleaned = cleaned.trim().to_owned();
     if cleaned.is_empty() {
         "untitled".to_owned()
     } else {
