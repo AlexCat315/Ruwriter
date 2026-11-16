@@ -15,14 +15,19 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use cove_ui::compose::primitives::text::TextBuffer;
+use cove_ui::compose::primitives::text::text_field::{
+    TextFieldCaretState, TextFieldNavigationRequest,
+};
 use cove_ui::core::Signal;
 use cove_ui::core::scene::{
     FilePicker, FilePickerFilter, FileSaveOutcome, FileSaveRequest, FileSaver,
 };
 use ruwriter_core::document::file_name_for;
 use ruwriter_core::{
-    AppearancePreference, Collection, Document, Rescan, Session, WritingStats, count,
+    AppearancePreference, Collection, Document, Rescan, Session, SortOrder, WritingStats, count,
 };
+
+use crate::formatting::{self, Command};
 
 /// What the rename dialog is renaming.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,8 +36,10 @@ pub enum RenameTarget {
     Document(String),
 }
 
+type DiskHandler = Rc<dyn Fn(Vec<PathBuf>)>;
+
 thread_local! {
-    static DISK_HANDLER: RefCell<Option<Rc<dyn Fn(Vec<PathBuf>)>>> = const { RefCell::new(None) };
+    static DISK_HANDLER: RefCell<Option<DiskHandler>> = const { RefCell::new(None) };
     static DEFERRED: RefCell<Vec<Box<dyn FnOnce()>>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -72,6 +79,10 @@ pub struct Model {
     pub showing_editor: Signal<bool>,
     pub rename: Signal<Option<RenameTarget>>,
     pub rename_text: Signal<TextBuffer>,
+    /// Live caret and selection reported by the editor, in character units.
+    pub caret: Signal<TextFieldCaretState>,
+    /// One-shot focus/caret requests the editor applies after formatting.
+    pub navigation: Signal<TextFieldNavigationRequest>,
 }
 
 fn markdown_filter() -> FilePickerFilter {
@@ -160,6 +171,8 @@ impl Model {
         self.buffer.set(TextBuffer::new(&text));
         self.stats.set(count(&text));
         self.preview.set(text);
+        self.caret.set(TextFieldCaretState::INITIAL);
+        self.navigation.set(TextFieldNavigationRequest::default());
         self.document.update(|value| *value += 1);
     }
 
@@ -186,6 +199,44 @@ impl Model {
             }
             Err(error) => self.notice.set(error),
         }
+    }
+
+    /// The editor reports its caret and selection after every move.
+    pub fn on_caret(&self, state: TextFieldCaretState) {
+        self.caret.set_if_changed(state);
+    }
+
+    /// Applies a Markdown formatting command at the last reported caret or
+    /// selection, saves the result and puts the caret where the edit lands.
+    pub fn format(&self, command: Command) {
+        let buffer = self.buffer.get_untracked();
+        let state = self.caret.get_untracked();
+        let len = buffer.character_count();
+        let selection = state
+            .selected_range
+            .map(|(low, high)| (low.min(len), high.min(len)));
+        let edit = formatting::apply(
+            &buffer.string_value(),
+            state.caret_index.min(len),
+            selection,
+            command,
+        );
+        let next = TextBuffer::new(&edit.text);
+        self.buffer.set(next.clone());
+        self.on_change(&next);
+        self.caret
+            .set(TextFieldCaretState::new(edit.caret, edit.selection));
+        let request = self
+            .navigation
+            .get_untracked()
+            .caret_request_id
+            .unwrap_or(0)
+            + 1;
+        self.navigation.set(TextFieldNavigationRequest {
+            focus_request_id: Some(request),
+            caret_request_id: Some(request),
+            caret_request_index: Some(edit.caret),
+        });
     }
 
     /// Files changed on disk. Ruwriter's own last write is recognised and
@@ -402,9 +453,8 @@ impl Model {
             Box::new(move |folder| {
                 if let Some(folder) = folder {
                     let folder = PathBuf::from(folder);
-                    model.structural(move |session, current| {
-                        session.open_library(&folder, current)
-                    });
+                    model
+                        .structural(move |session, current| session.open_library(&folder, current));
                     model.showing_editor.set(true);
                 }
             }),
@@ -430,13 +480,10 @@ impl Model {
     pub fn begin_rename(&self, target: RenameTarget) {
         let current = self
             .read(|session| match &target {
-                RenameTarget::Folder(id) => session
-                    .library
-                    .folder(id)
-                    .map(|folder| folder.name.clone()),
-                RenameTarget::Document(id) => {
-                    session.library.find(id).map(Document::stem)
+                RenameTarget::Folder(id) => {
+                    session.library.folder(id).map(|folder| folder.name.clone())
                 }
+                RenameTarget::Document(id) => session.library.find(id).map(Document::stem),
             })
             .flatten()
             .unwrap_or_default();
@@ -458,9 +505,8 @@ impl Model {
             RenameTarget::Folder(id) => self.structural(move |session, current| {
                 session.rename_folder(&id, &name, current).map(drop)
             }),
-            RenameTarget::Document(id) => self.structural(move |session, current| {
-                session.rename_document(&id, &name, current)
-            }),
+            RenameTarget::Document(id) => self
+                .structural(move |session, current| session.rename_document(&id, &name, current)),
         }
     }
 
@@ -472,6 +518,14 @@ impl Model {
             Ok(())
         });
         self.showing_editor.set(false);
+        self.bump();
+    }
+
+    pub fn set_sort(&self, sort: SortOrder) {
+        let _ = self.with_session(|session| {
+            session.set_sort(sort);
+            Ok(())
+        });
         self.bump();
     }
 

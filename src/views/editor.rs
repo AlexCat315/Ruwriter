@@ -20,9 +20,11 @@ use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
 use cove_ui::compose::{FrameDimension, ScrollAxis, ScrollView};
 use cove_ui::composition::{AnyView, BoxView, EmptyView, LayoutDebugExt, Scope, View, ViewExt};
 use cove_ui::core::scene::{Align, FlexDirection, Justify, Wrap};
+use cove_ui::imaging::BundleImageResource;
 
 use super::root::Layout;
 use super::ui::{ProseFieldStyle, full_size, hstack, icon_button, spacer, vstack};
+use crate::formatting::Command;
 use crate::markdown_syntax;
 use crate::model::Model;
 use crate::theme::{Mode, SyntaxColors, editor_font, measure};
@@ -33,6 +35,8 @@ type Action = Rc<dyn Fn(&Model)>;
 const MARGIN: f32 = 28.0;
 /// Panes narrower than this show the preview instead of beside the editor.
 const SPLIT_WIDTH: f32 = 880.0;
+/// Below this width the formatting buttons fold into one menu.
+const FORMAT_BAR_WIDTH: f32 = 620.0;
 
 pub struct EditorPane {
     pub model: Model,
@@ -167,6 +171,9 @@ impl EditorPane {
         ));
 
         let mut children = leading;
+        if !options.focus {
+            children.extend(self.formatting_controls());
+        }
         children.push(spacer());
         children.extend(trailing);
         AnyView::new(hstack(4.0, Align::Center, children).padding_insets(
@@ -178,6 +185,75 @@ impl EditorPane {
             },
         ))
     }
+
+    /// The formatting commands: inline buttons on a wide pane, one menu on
+    /// a narrow one. Focus mode hides them all.
+    fn formatting_controls(&self) -> Vec<AnyView> {
+        let model = &self.model;
+        if self.layout.editor_width < FORMAT_BAR_WIDTH {
+            return vec![AnyView::new(
+                MenuButton::new(
+                    format_menu(model),
+                    ButtonIcon::new(
+                        ButtonIconSource::resource(icons::text::type_()),
+                        Some(16.0),
+                        None,
+                    ),
+                )
+                .ghost()
+                .accessibility_label("格式")
+                .tooltip("格式"),
+            )];
+        }
+        let buttons: [(BundleImageResource, &str, Command); 8] = [
+            (icons::text::bold(), "加粗 ⌘B", Command::Bold),
+            (icons::text::italic(), "斜体 ⌘I", Command::Italic),
+            (icons::text::heading(), "标题 ⇧⌘H", Command::Heading),
+            (icons::text::list(), "无序列表 ⇧⌘8", Command::BulletList),
+            (
+                icons::text::list_ordered(),
+                "有序列表 ⇧⌘7",
+                Command::NumberedList,
+            ),
+            (icons::shape::message_square(), "引用 ⇧⌘9", Command::Quote),
+            (icons::editor::code(), "行内代码 ⌘E", Command::Code),
+            (icons::action::link(), "链接 ⇧⌘K", Command::Link),
+        ];
+        buttons
+            .into_iter()
+            .map(|(icon, label, command)| {
+                let target = model.clone();
+                icon_button(icon, label, false, move || target.format(command))
+            })
+            .collect()
+    }
+}
+
+/// Every formatting command with its shortcut, for the narrow-pane menu.
+fn format_menu(model: &Model) -> Vec<MenuEntry> {
+    let actions: [(&str, &str, Command); 9] = [
+        ("加粗", "⌘B", Command::Bold),
+        ("斜体", "⌘I", Command::Italic),
+        ("删除线", "⇧⌘X", Command::Strikethrough),
+        ("行内代码", "⌘E", Command::Code),
+        ("链接", "⇧⌘K", Command::Link),
+        ("标题", "⇧⌘H", Command::Heading),
+        ("无序列表", "⇧⌘8", Command::BulletList),
+        ("有序列表", "⇧⌘7", Command::NumberedList),
+        ("引用", "⇧⌘9", Command::Quote),
+    ];
+    let mut entries = Vec::new();
+    for (index, (title, shortcut, command)) in actions.into_iter().enumerate() {
+        let target = model.clone();
+        entries.push(MenuEntry::Item(
+            MenuItem::new(index as u64 + 1, title, move || target.format(command))
+                .shortcut(shortcut),
+        ));
+        if index == 4 {
+            entries.push(MenuEntry::separator(50));
+        }
+    }
+    entries
 }
 
 fn document_menu(model: &Model) -> Vec<MenuEntry> {
@@ -237,10 +313,12 @@ struct EditorField {
 impl View for EditorField {
     fn body(&self, _cx: &Scope) -> AnyView {
         let document = self.model.document.get();
+        let navigation = self.model.navigation.get();
         let change = self.model.clone();
         let blur = self.model.clone();
+        let caret = self.model.clone();
         let colors = SyntaxColors::for_theme(&self.mode.theme());
-        let field = TextField::new("开始写作…", self.model.buffer.binding())
+        let mut field = TextField::new("开始写作…", self.model.buffer.binding())
             .layout(TextFieldLayout {
                 axis: TextFieldAxis::Vertical,
                 max_visible_lines: 400,
@@ -259,8 +337,10 @@ impl View for EditorField {
             .events(TextFieldEvents {
                 on_change: Some(Rc::new(move |buffer| change.on_change(buffer))),
                 on_blur: Some(Rc::new(move || blur.save())),
+                on_caret_change: Some(Rc::new(move |state| caret.on_caret(state))),
                 ..Default::default()
             });
+        field.navigation = navigation;
         AnyView::new(
             full_size(
                 AnyView::new(field)
@@ -301,7 +381,8 @@ impl View for PreviewPane {
     }
 }
 
-/// Word count and save problems; nothing else competes with the text.
+/// Word count, selection size and save problems; nothing else competes
+/// with the text.
 struct StatusLine {
     model: Model,
     bottom_inset: f32,
@@ -311,16 +392,34 @@ impl View for StatusLine {
     fn body(&self, _cx: &Scope) -> AnyView {
         let stats = self.model.stats.get();
         let notice = self.model.notice.get();
-        let text = if notice.is_empty() {
-            let minutes = if stats.reading_minutes == 0 {
-                String::new()
-            } else {
-                format!(" · 约 {} 分钟", stats.reading_minutes)
-            };
-            Text::new(format!("{} 字{minutes}", stats.characters))
-                .semantic_foreground(SemanticColorRef::on_surface_muted())
+        let caret = self.model.caret.get();
+        let content: AnyView = if !notice.is_empty() {
+            AnyView::new(Text::new(notice).semantic_foreground(SemanticColorRef::error()))
         } else {
-            Text::new(notice).semantic_foreground(SemanticColorRef::error())
+            let mut parts: Vec<AnyView> = Vec::new();
+            if let Some((low, high)) = caret.selected_range {
+                let buffer = self.model.buffer.get_untracked();
+                let len = buffer.character_count();
+                let (low, high) = (low.min(len), high.min(len));
+                if high > low {
+                    let selected = buffer.substring(low..high).chars().count();
+                    parts.push(AnyView::new(
+                        Text::new(format!("已选 {selected} 字 · "))
+                            .semantic_foreground(SemanticColorRef::accent()),
+                    ));
+                }
+            }
+            let mut summary = format!("{} 字", stats.characters);
+            if stats.words != stats.characters {
+                summary.push_str(&format!(" · {} 词", stats.words));
+            }
+            if stats.reading_minutes > 0 {
+                summary.push_str(&format!(" · 约 {} 分钟", stats.reading_minutes));
+            }
+            parts.push(AnyView::new(
+                Text::new(summary).semantic_foreground(SemanticColorRef::on_surface_muted()),
+            ));
+            AnyView::new(hstack(0.0, Align::Center, parts))
         };
         AnyView::new(
             hstack(
@@ -328,7 +427,7 @@ impl View for StatusLine {
                 Align::Center,
                 vec![
                     spacer(),
-                    AnyView::new(text.semantic_font(SemanticFontRef::caption())),
+                    AnyView::new(content.semantic_font(SemanticFontRef::caption())),
                 ],
             )
             .padding_insets(cove_ui::compose::modifiers::layout::EdgeInsets {

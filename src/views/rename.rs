@@ -29,13 +29,12 @@ impl View for RenameDialog {
         };
         let submit = self.model.clone();
         let cancel = self.model.clone();
-        let mut field = TextField::new("名称", self.model.rename_text.binding()).events(
-            TextFieldEvents {
+        let mut field =
+            TextField::new("名称", self.model.rename_text.binding()).events(TextFieldEvents {
                 on_submit: Some(Rc::new(move || submit.commit_rename())),
                 on_cancel: Some(Rc::new(move || cancel.cancel_rename())),
                 ..Default::default()
-            },
-        );
+            });
         field.navigation = TextFieldNavigationRequest {
             focus_request_id: Some(1),
             ..Default::default()

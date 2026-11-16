@@ -5,6 +5,7 @@ use cove_ui::compose::modifiers::layout::{FlexExt, LayoutFrameExt, PaddingExt};
 use cove_ui::compose::modifiers::style::SemanticStyleViewExt;
 use cove_ui::compose::primitives::controls::fields::SearchField;
 use cove_ui::compose::primitives::controls::{Button, ButtonIcon, ButtonIconSource, MenuButton};
+use cove_ui::compose::primitives::media::Icon;
 use cove_ui::compose::primitives::media::ui_icon_catalog as icons;
 use cove_ui::compose::primitives::overlays::{
     ContextMenuExt, MenuEntry, MenuItem, MenuItemRole, MenuSubmenu,
@@ -15,7 +16,7 @@ use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
 use cove_ui::compose::{FrameDimension, ScrollAxis, ScrollView};
 use cove_ui::composition::{AnyView, Scope, View, ViewExt};
 use cove_ui::core::scene::Align;
-use ruwriter_core::{Collection, Document};
+use ruwriter_core::{Collection, Document, SortOrder};
 
 use super::root::Layout;
 use super::sidebar::appearance_label;
@@ -127,9 +128,22 @@ impl ListPane {
                 create.create()
             })
         };
+        let sort = AnyView::new(
+            MenuButton::new(
+                sort_menu(model),
+                ButtonIcon::new(
+                    ButtonIconSource::resource(icons::navigation::chevrons_up_down()),
+                    Some(16.0),
+                    None,
+                ),
+            )
+            .ghost()
+            .accessibility_label("排序")
+            .tooltip("排序"),
+        );
 
         AnyView::new(
-            hstack(8.0, Align::Center, vec![heading, spacer(), action]).padding_insets(
+            hstack(8.0, Align::Center, vec![heading, spacer(), sort, action]).padding_insets(
                 cove_ui::compose::modifiers::layout::EdgeInsets {
                     top: self.layout.top_inset + 12.0,
                     // The collection menu's ghost chrome brings its own inset.
@@ -190,6 +204,24 @@ fn collections_menu(model: &Model) -> Vec<MenuEntry> {
     entries
 }
 
+fn sort_menu(model: &Model) -> Vec<MenuEntry> {
+    let current = model.settings().sort;
+    SortOrder::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, order)| {
+            let choose = model.clone();
+            let order = *order;
+            MenuEntry::Item(
+                MenuItem::new(index as u64 + 1, order.title(), move || {
+                    choose.set_sort(order)
+                })
+                .selected(order == current),
+            )
+        })
+        .collect()
+}
+
 /// The rows alone, so typing refreshes them without rebuilding the header
 /// and the search field.
 struct DocumentRows {
@@ -204,21 +236,29 @@ impl View for DocumentRows {
         let query = self.model.query.get().string_value();
         let (documents, active, settings) = self
             .model
-            .read(|session| (session.list(&query), session.active_id(), session.settings()))
+            .read(|session| {
+                (
+                    session.list(&query),
+                    session.active_id(),
+                    session.settings(),
+                )
+            })
             .unwrap_or_default();
         let collection = settings.collection;
         if documents.is_empty() {
             return empty_state(
+                &self.model,
                 collection,
                 settings.folder.is_some(),
                 !query.trim().is_empty(),
             );
         }
+        let show_folder = settings.folder.is_none();
         let rows: Vec<AnyView> = documents
             .into_iter()
             .map(|document| {
                 let selected = active.as_deref() == Some(document.id.as_str());
-                row(&self.model, document, selected, collection)
+                row(&self.model, document, selected, collection, show_folder)
             })
             .collect();
         AnyView::new(ScrollView::new(
@@ -235,29 +275,62 @@ impl View for DocumentRows {
     }
 }
 
-fn empty_state(collection: Collection, in_folder: bool, searching: bool) -> AnyView {
-    let message = if searching {
-        "没有匹配的文稿"
+fn empty_state(model: &Model, collection: Collection, in_folder: bool, searching: bool) -> AnyView {
+    let (icon, message) = if searching {
+        (icons::action::search(), "没有匹配的文稿")
     } else if in_folder {
-        "文件夹是空的"
+        (icons::file::folder_open(), "文件夹是空的")
     } else {
         match collection {
-            Collection::Trash => "废纸篓是空的",
-            Collection::Pinned => "右键文稿即可置顶",
-            _ => "还没有文稿",
+            Collection::Trash => (icons::action::trash(), "废纸篓是空的"),
+            Collection::Pinned => (icons::shape::pin(), "右键文稿即可置顶"),
+            _ => (icons::file::file_text(), "还没有文稿"),
         }
     };
-    AnyView::new(
+    let mut children = vec![
+        AnyView::new(Icon::with_semantic(
+            icon,
+            30.0,
+            SemanticColorRef::on_surface_muted(),
+        )),
         AnyView::new(
             Text::new(message)
-                .semantic_font(SemanticFontRef::caption())
+                .semantic_font(SemanticFontRef::body())
                 .semantic_foreground(SemanticColorRef::on_surface_muted()),
-        )
-        .padding_edges(18.0, 24.0),
+        ),
+    ];
+    if !searching && !matches!(collection, Collection::Trash | Collection::Pinned) {
+        let create = model.clone();
+        children.push(AnyView::new(Button::title("新建文稿", move || {
+            create.create()
+        })));
+    }
+    AnyView::new(
+        AnyView::new(vstack(12.0, Align::Center, children))
+            .frame(
+                Some(FrameDimension::Percent(100.0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .padding_insets(cove_ui::compose::modifiers::layout::EdgeInsets {
+                top: 64.0,
+                leading: 18.0,
+                bottom: 24.0,
+                trailing: 18.0,
+            }),
     )
 }
 
-fn row(model: &Model, document: Document, selected: bool, collection: Collection) -> AnyView {
+fn row(
+    model: &Model,
+    document: Document,
+    selected: bool,
+    collection: Collection,
+    show_folder: bool,
+) -> AnyView {
     let mut title_line = vec![AnyView::new(
         AnyView::new(
             Text::new(document.display_title())
@@ -282,7 +355,25 @@ fn row(model: &Model, document: Document, selected: bool, collection: Collection
                 .semantic_foreground(SemanticColorRef::on_surface_variant()),
         ));
     }
-    let meta = format!("{} · {} 字", relative(document.updated_at), document.words);
+    let folder_name = if show_folder && !document.trashed {
+        document.folder.as_deref().and_then(|id| {
+            model
+                .read(|session| session.library.folder(id).map(|folder| folder.name.clone()))
+                .flatten()
+        })
+    } else {
+        None
+    };
+    let mut meta = String::new();
+    if let Some(name) = folder_name {
+        meta.push_str(&name);
+        meta.push_str(" · ");
+    }
+    meta.push_str(&format!(
+        "{} · {} 字",
+        relative(document.updated_at),
+        document.words
+    ));
     lines.push(AnyView::new(
         Text::new(meta)
             .semantic_font(SemanticFontRef::caption())
@@ -350,9 +441,11 @@ fn row_menu(model: &Model, document: &Document, collection: Collection) -> Vec<M
     ];
     let rename = model.clone();
     let rename_id = id.clone();
-    entries.push(MenuEntry::Item(MenuItem::new(6, "重命名…", move || {
-        rename.begin_rename(RenameTarget::Document(rename_id.clone()))
-    })));
+    entries.push(MenuEntry::Item(MenuItem::new(
+        6,
+        "重命名…",
+        move || rename.begin_rename(RenameTarget::Document(rename_id.clone())),
+    )));
     if !document.external {
         entries.push(MenuEntry::Submenu(MenuSubmenu::new(
             7,
@@ -364,7 +457,11 @@ fn row_menu(model: &Model, document: &Document, collection: Collection) -> Vec<M
     entries.push(MenuEntry::Item(
         MenuItem::new(
             5,
-            if document.external { "从列表中移除" } else { "移到废纸篓" },
+            if document.external {
+                "从列表中移除"
+            } else {
+                "移到废纸篓"
+            },
             move || trash.trash(&id),
         )
         .role(MenuItemRole::Destructive),

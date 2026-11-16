@@ -2,12 +2,16 @@
 //! macOS the native menu bar claims the same keys first; this table covers
 //! every other platform and the in-window fallback. No command animates.
 
+use crate::formatting::Command;
 use crate::model::Model;
 use cove_ui::composition::Scancode;
 use cove_ui::platform::KeyEvent;
 use ruwriter_core::Collection;
 
 const BACKSLASH: u32 = 49;
+// USB HID codes Cove's Scancode table does not name yet.
+const H: u32 = 11;
+const I: u32 = 12;
 
 pub fn handle(event: &KeyEvent, model: &Model) -> bool {
     if event.is_repeat {
@@ -28,9 +32,18 @@ pub fn handle(event: &KeyEvent, model: &Model) -> bool {
         Scancode::O if !shift => model.open_picker(),
         Scancode::S if !shift => model.save(),
         Scancode::E if shift => model.export(),
+        Scancode::E => model.format(Command::Code),
         Scancode::P if !shift => model.toggle_preview(),
         Scancode::F if shift => model.toggle_focus(),
-        Scancode::K if !shift => model.toggle_palette(),
+        Scancode::K if shift => model.format(Command::Link),
+        Scancode::K => model.toggle_palette(),
+        Scancode::B if !shift => model.format(Command::Bold),
+        I if !shift => model.format(Command::Italic),
+        Scancode::X if shift => model.format(Command::Strikethrough),
+        H if shift => model.format(Command::Heading),
+        Scancode::DIGIT7 if shift => model.format(Command::NumberedList),
+        Scancode::DIGIT8 if shift => model.format(Command::BulletList),
+        Scancode::DIGIT9 if shift => model.format(Command::Quote),
         BACKSLASH => model.toggle_sidebar(),
         Scancode::EQUALS => model.adjust_font_size(1),
         Scancode::MINUS => model.adjust_font_size(-1),

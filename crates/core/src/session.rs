@@ -17,7 +17,7 @@ use crate::document::{
 };
 use crate::files::{Stamp, move_path, read_document, stamp, unique_path, write_document};
 use crate::library::{
-    AppearancePreference, Collection, Library, Meta, Settings, name_of, parent_of,
+    AppearancePreference, Collection, Library, Meta, Settings, SortOrder, name_of, parent_of,
 };
 use crate::paths;
 use serde::{Deserialize, Serialize};
@@ -135,7 +135,10 @@ impl Session {
             .active
             .clone()
             .filter(|id| session.library.find(id).is_some_and(|d| !d.trashed));
-        let first = session.documents().first().map(|document| document.id.clone());
+        let first = session
+            .documents()
+            .first()
+            .map(|document| document.id.clone());
         match remembered.or(first) {
             Some(id) => session.open_document(&id),
             None => {
@@ -207,14 +210,19 @@ impl Session {
 
     /// Every document that is not in the trash, most recent first.
     pub fn documents(&self) -> Vec<Document> {
-        self.library.list(Collection::All, None, "")
+        self.library
+            .list(Collection::All, None, "", SortOrder::Edited)
     }
 
     /// The selected folder or collection, filtered by `query`.
     pub fn list(&self, query: &str) -> Vec<Document> {
         let settings = &self.app.settings;
-        self.library
-            .list(settings.collection, settings.folder.as_deref(), query)
+        self.library.list(
+            settings.collection,
+            settings.folder.as_deref(),
+            query,
+            settings.sort,
+        )
     }
 
     pub fn count(&self, collection: Collection) -> usize {
@@ -304,6 +312,11 @@ impl Session {
 
     pub fn set_appearance(&mut self, appearance: AppearancePreference) {
         self.app.settings.appearance = appearance;
+        self.persist_app();
+    }
+
+    pub fn set_sort(&mut self, sort: SortOrder) {
+        self.app.settings.sort = sort;
         self.persist_app();
     }
 
@@ -619,7 +632,12 @@ impl Session {
             return Ok(());
         }
         let directory = self.folder_path(folder);
-        let target = unique_path(&directory, &document.stem(), &extension(&document.path), None);
+        let target = unique_path(
+            &directory,
+            &document.stem(),
+            &extension(&document.path),
+            None,
+        );
         self.relocate(id, &document.path, &target)?;
         self.persist();
         Ok(())

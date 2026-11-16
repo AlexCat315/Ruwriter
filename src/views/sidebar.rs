@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use cove_ui::compose::FrameDimension;
 use cove_ui::compose::modifiers::layout::{FlexExt, LayoutFrameExt, PaddingExt};
 use cove_ui::compose::modifiers::style::SemanticStyleViewExt;
 use cove_ui::compose::primitives::controls::{Button, ButtonIcon, ButtonIconSource};
@@ -18,13 +19,10 @@ use cove_ui::compose::primitives::layout::sidebar::{
 };
 use cove_ui::compose::primitives::media::Icon;
 use cove_ui::compose::primitives::media::ui_icon_catalog as icons;
-use cove_ui::compose::primitives::overlays::{
-    ContextMenuExt, MenuEntry, MenuItem, MenuItemRole,
-};
+use cove_ui::compose::primitives::overlays::{ContextMenuExt, MenuEntry, MenuItem, MenuItemRole};
 use cove_ui::compose::primitives::text::Text;
 use cove_ui::compose::theme::styles::buttons::ButtonStyleViewExt;
 use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
-use cove_ui::compose::FrameDimension;
 use cove_ui::composition::{AnyView, LayoutDebugExt, Scope, View};
 use cove_ui::core::Binding;
 use cove_ui::core::scene::Align;
@@ -34,8 +32,8 @@ use ruwriter_core::{AppearancePreference, Collection, Library};
 
 use super::root::Layout;
 use super::ui::{SidebarTreeRowStyle, hstack, icon_button, spacer, vstack};
-use cove_ui::compose::theme::styles::components::tree_row_style::TreeRowStyleViewExt;
 use crate::model::{Model, RenameTarget};
+use cove_ui::compose::theme::styles::components::tree_row_style::TreeRowStyleViewExt;
 
 pub fn collection_icon(collection: Collection) -> BundleImageResource {
     match collection {
@@ -66,7 +64,8 @@ impl View for LibrarySidebar {
     fn body(&self, _cx: &Scope) -> AnyView {
         let _ = self.model.revision.get();
         let _ = self.model.listing.get();
-        let header = vstack(0.0, Align::Stretch, Vec::new()).frame_height(self.layout.top_inset + 10.0);
+        let header =
+            vstack(0.0, Align::Stretch, Vec::new()).frame_height(self.layout.top_inset + 10.0);
         vstack(
             0.0,
             Align::Stretch,
@@ -133,7 +132,11 @@ fn collections(model: &Model) -> AnyView {
         vstack(
             0.0,
             Align::Stretch,
-            vec![AnyView::new(AnyView::new(sidebar).flex_with(1.0, 1.0, Some(0.0)))],
+            vec![AnyView::new(AnyView::new(sidebar).flex_with(
+                1.0,
+                1.0,
+                Some(0.0),
+            ))],
         )
         .frame_height(height),
     )
@@ -156,12 +159,18 @@ fn folders_header(model: &Model) -> AnyView {
                     )
                     .flex_with(1.0, 1.0, Some(0.0)),
                 ),
-                icon_button(icons::file::folder_open(), "打开文件夹…", false, move || {
-                    open.open_library_picker()
-                }),
-                icon_button(icons::file::folder_plus(), "新建文件夹", false, move || {
-                    create.new_folder("")
-                }),
+                icon_button(
+                    icons::file::folder_open(),
+                    "打开文件夹…",
+                    false,
+                    move || open.open_library_picker(),
+                ),
+                icon_button(
+                    icons::file::folder_plus(),
+                    "新建文件夹",
+                    false,
+                    move || create.new_folder(""),
+                ),
             ],
         )
         .padding_edges(14.0, 2.0)
@@ -248,16 +257,21 @@ impl View for FolderTree {
 
         let drop_model = model.clone();
         let drag = TreeDragOperations {
-            can_drop: Some(Rc::new(|source: &FolderNode, target: &FolderNode, position| {
-                let parent = match position {
-                    TreeDropPosition::Inside => target.id.as_str(),
-                    _ => parent_of(&target.id),
-                };
-                source.id != target.id && !(!parent.is_empty() && Library::is_within(parent, &source.id))
-            })),
-            on_drop: Some(Rc::new(move |source: FolderNode, target: FolderNode, position| {
-                match position {
-                    TreeDropPosition::Inside => drop_model.move_folder(&source.id, &target.id, None),
+            can_drop: Some(Rc::new(
+                |source: &FolderNode, target: &FolderNode, position| {
+                    let parent = match position {
+                        TreeDropPosition::Inside => target.id.as_str(),
+                        _ => parent_of(&target.id),
+                    };
+                    source.id != target.id
+                        && !(!parent.is_empty() && Library::is_within(parent, &source.id))
+                },
+            )),
+            on_drop: Some(Rc::new(
+                move |source: FolderNode, target: FolderNode, position| match position {
+                    TreeDropPosition::Inside => {
+                        drop_model.move_folder(&source.id, &target.id, None)
+                    }
                     TreeDropPosition::Before => drop_model.move_folder(
                         &source.id,
                         parent_of(&target.id),
@@ -278,8 +292,8 @@ impl View for FolderTree {
                             .flatten();
                         drop_model.move_folder(&source.id, &parent, next.as_deref());
                     }
-                }
-            })),
+                },
+            )),
             ..TreeDragOperations::default()
         };
 
@@ -398,8 +412,10 @@ fn appearance_row(model: &Model) -> AnyView {
     let cycle = model.clone();
     AnyView::new(
         AnyView::new(
-            Button::new(label.padding_edges(10.0, 0.0), move || cycle.cycle_appearance())
-                .accessibility_text("切换外观"),
+            Button::new(label.padding_edges(10.0, 0.0), move || {
+                cycle.cycle_appearance()
+            })
+            .accessibility_text("切换外观"),
         )
         .button_style(SidebarItemStyle {
             minimum_height: ROW,

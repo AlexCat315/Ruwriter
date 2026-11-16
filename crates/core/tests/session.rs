@@ -173,7 +173,9 @@ fn folders_rename_move_and_carry_their_documents() {
     session.save("# 开端").expect("save");
     assert_eq!(session.active_id().as_deref(), Some("书/第一卷/开端.md"));
 
-    let renamed = session.rename_folder(&book, "长篇", "# 开端").expect("rename");
+    let renamed = session
+        .rename_folder(&book, "长篇", "# 开端")
+        .expect("rename");
     assert_eq!(renamed, "长篇");
     assert_eq!(session.active_id().as_deref(), Some("长篇/第一卷/开端.md"));
     assert_eq!(session.settings().folder.as_deref(), Some("长篇/第一卷"));
@@ -195,7 +197,9 @@ fn moving_a_document_between_folders() {
     let mut session = Session::at(root.path());
     session.save("# 便签").expect("save");
     let notes = session.create_folder("", "笔记").expect("folder");
-    session.move_document("便签.md", &notes, "# 便签").expect("move");
+    session
+        .move_document("便签.md", &notes, "# 便签")
+        .expect("move");
     assert_eq!(session.active_id().as_deref(), Some("笔记/便签.md"));
     assert!(library(&session).join("笔记/便签.md").exists());
 }
@@ -208,7 +212,9 @@ fn trashed_folders_restore_document_by_document() {
     session.set_folder(&folder);
     session.create("").expect("create");
     session.save("# 片段").expect("save");
-    session.trash_folder(&folder, "# 片段").expect("trash folder");
+    session
+        .trash_folder(&folder, "# 片段")
+        .expect("trash folder");
     assert!(session.library.folders.is_empty());
     assert_eq!(session.settings().folder, None);
     assert_eq!(session.count(Collection::Trash), 1);
@@ -281,7 +287,9 @@ fn another_library_folder_can_be_opened() {
     let vault = tempfile::tempdir().expect("vault");
     write_document(&vault.path().join("笔记/想法.md"), "# 想法").expect("write");
     let mut session = Session::at(root.path());
-    session.open_library(vault.path(), "").expect("open library");
+    session
+        .open_library(vault.path(), "")
+        .expect("open library");
     assert_eq!(session.library_root(), vault.path());
     assert_eq!(session.active_id().as_deref(), Some("笔记/想法.md"));
     let reopened = Session::at(root.path());
@@ -326,4 +334,34 @@ fn own_writes_do_not_need_a_rescan() {
     let other = library(&session).join("other.md");
     write_document(&other, "x").expect("write");
     assert!(session.needs_rescan(&[path, other]));
+}
+
+#[test]
+fn sort_choice_orders_rows_and_survives_reload() {
+    use ruwriter_core::SortOrder;
+
+    let root = tempfile::tempdir().expect("temp root");
+    let mut session = Session::at(root.path());
+    session.save("# 丙\n\n一二三四五").expect("save 丙");
+    session.create("# 丙\n\n一二三四五").expect("create");
+    session.save("# 甲\n\n一二三四五六七八").expect("save 甲");
+    session.create("# 甲\n\n一二三四五六七八").expect("create");
+    session.save("# 乙\n\n一二三").expect("save 乙");
+
+    session.set_sort(SortOrder::Title);
+    let titles: Vec<String> = session.list("").into_iter().map(|d| d.title).collect();
+    assert_eq!(titles, ["丙", "乙", "甲"]);
+
+    session.set_sort(SortOrder::Words);
+    let titles: Vec<String> = session.list("").into_iter().map(|d| d.title).collect();
+    assert_eq!(titles, ["甲", "丙", "乙"]);
+
+    session.set_pinned("乙.md", true).expect("pin");
+    let titles: Vec<String> = session.list("").into_iter().map(|d| d.title).collect();
+    assert_eq!(titles, ["乙", "甲", "丙"]);
+
+    let reopened = Session::at(root.path());
+    assert_eq!(reopened.settings().sort, SortOrder::Words);
+    let titles: Vec<String> = reopened.list("").into_iter().map(|d| d.title).collect();
+    assert_eq!(titles, ["乙", "甲", "丙"]);
 }

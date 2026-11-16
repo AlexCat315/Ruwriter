@@ -100,6 +100,12 @@ impl View for RootView {
             showing_editor: cx.state(|| true),
             rename: cx.state(|| None),
             rename_text: cx.state(TextBuffer::empty),
+            caret: cx.state(|| {
+                cove_ui::compose::primitives::text::text_field::TextFieldCaretState::INITIAL
+            }),
+            navigation: cx.state(
+                cove_ui::compose::primitives::text::text_field::TextFieldNavigationRequest::default,
+            ),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file
@@ -126,12 +132,11 @@ impl View for RootView {
             .is_none_or(|current| current.root() != library_root);
         if stale {
             let poster = ThreadPoster::current();
-            *watcher.borrow_mut() = DirectoryWatcher::new(
-                &library_root,
-                WatchOptions::default(),
-                move |paths| poster.post(move || deliver_disk_change(paths)),
-            )
-            .ok();
+            *watcher.borrow_mut() =
+                DirectoryWatcher::new(&library_root, WatchOptions::default(), move |paths| {
+                    poster.post(move || deliver_disk_change(paths))
+                })
+                .ok();
         }
 
         let environment = cx.composition_value(&SurfaceEnvironment::key());

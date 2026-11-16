@@ -55,6 +55,30 @@ impl Collection {
 
 const RECENT_SECONDS: u64 = 7 * 24 * 60 * 60;
 
+/// How the document list orders its rows. Pinned documents stay first
+/// outside the trash regardless of the choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortOrder {
+    #[default]
+    Edited,
+    Created,
+    Title,
+    Words,
+}
+
+impl SortOrder {
+    pub const ALL: [Self; 4] = [Self::Edited, Self::Created, Self::Title, Self::Words];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Edited => "按编辑时间",
+            Self::Created => "按创建时间",
+            Self::Title => "按标题",
+            Self::Words => "按字数",
+        }
+    }
+}
+
 /// Light / dark choice. `System` follows the platform when the host reports it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AppearancePreference {
@@ -76,6 +100,8 @@ pub struct Settings {
     pub folder: Option<String>,
     /// Editor body size in points.
     pub font_size: u8,
+    /// Row order in the document list.
+    pub sort: SortOrder,
 }
 
 impl Default for Settings {
@@ -87,6 +113,7 @@ impl Default for Settings {
             collection: Collection::All,
             folder: None,
             font_size: 17,
+            sort: SortOrder::Edited,
         }
     }
 }
@@ -208,9 +235,15 @@ impl Library {
     // MARK: - Queries
 
     /// Documents in `folder` (direct children) or, without one, in
-    /// `collection`; filtered by `query` over title and excerpt; pinned first,
-    /// then most recently edited.
-    pub fn list(&self, collection: Collection, folder: Option<&str>, query: &str) -> Vec<Document> {
+    /// `collection`; filtered by `query` over title and excerpt; pinned
+    /// first, then ordered by `sort`.
+    pub fn list(
+        &self,
+        collection: Collection,
+        folder: Option<&str>,
+        query: &str,
+        sort: SortOrder,
+    ) -> Vec<Document> {
         let now = crate::document::now();
         let needle = query.trim().to_lowercase();
         let mut documents: Vec<Document> = self
@@ -232,8 +265,25 @@ impl Library {
             let pinned = |document: &Document| !trash && document.pinned;
             pinned(right)
                 .cmp(&pinned(left))
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-                .then_with(|| right.created_at.cmp(&left.created_at))
+                .then_with(|| match sort {
+                    SortOrder::Edited => right
+                        .updated_at
+                        .cmp(&left.updated_at)
+                        .then_with(|| right.created_at.cmp(&left.created_at)),
+                    SortOrder::Created => right
+                        .created_at
+                        .cmp(&left.created_at)
+                        .then_with(|| right.updated_at.cmp(&left.updated_at)),
+                    SortOrder::Title => left
+                        .display_title()
+                        .to_lowercase()
+                        .cmp(&right.display_title().to_lowercase())
+                        .then_with(|| right.updated_at.cmp(&left.updated_at)),
+                    SortOrder::Words => right
+                        .words
+                        .cmp(&left.words)
+                        .then_with(|| right.updated_at.cmp(&left.updated_at)),
+                })
                 .then_with(|| left.id.cmp(&right.id))
         });
         documents
@@ -275,9 +325,7 @@ impl Library {
         let root = self.root.clone();
         self.walk(&root, "", false, &mut seen, &mut documents, &mut tree);
         self.state.entries.retain(|id, _| seen.contains(id));
-        self.state
-            .trash_origins
-            .retain(|id, _| seen.contains(id));
+        self.state.trash_origins.retain(|id, _| seen.contains(id));
 
         let mut external = std::mem::take(&mut self.external);
         for (path, meta) in &mut external {

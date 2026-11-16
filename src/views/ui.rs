@@ -168,12 +168,9 @@ impl cove_ui::compose::theme::styles::components::tree_row_style::TreeRowStyle
         let row = hstack(
             0.0,
             Align::Center,
-            vec![
-                AnyView::new(
-                    AnyView::new(configuration.content.clone())
-                        .flex_with(1.0, 1.0, Some(0.0)),
-                ),
-            ],
+            vec![AnyView::new(
+                AnyView::new(configuration.content.clone()).flex_with(1.0, 1.0, Some(0.0)),
+            )],
         )
         .padding_edges(8.0, 0.0)
         .frame(

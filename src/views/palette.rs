@@ -6,9 +6,10 @@ use cove_ui::compose::primitives::media::ui_icon_catalog as icons;
 use cove_ui::compose::primitives::overlays::{CommandPalette, PaletteCommand};
 use cove_ui::composition::{AnyView, EmptyView, Scope, View};
 use cove_ui::imaging::BundleImageResource;
-use ruwriter_core::{AppearancePreference, Collection};
+use ruwriter_core::{AppearancePreference, Collection, SortOrder};
 
 use super::sidebar::{appearance_label, collection_icon};
+use crate::formatting::Command;
 use crate::model::Model;
 
 pub struct Palette {
@@ -104,6 +105,84 @@ impl View for Palette {
             )
             .keywords(["smaller", "font"]),
         ];
+        for sort in SortOrder::ALL {
+            items.push(
+                command(
+                    &format!("排序：{}", sort.title()),
+                    "显示",
+                    icons::navigation::chevrons_up_down(),
+                    Rc::new(move |model: &Model| model.set_sort(sort)),
+                )
+                .keywords(["sort", "paixu"]),
+            );
+        }
+        let formats: [(&str, BundleImageResource, Command, [&str; 2]); 9] = [
+            (
+                "加粗",
+                icons::text::bold(),
+                Command::Bold,
+                ["bold", "jiacu"],
+            ),
+            (
+                "斜体",
+                icons::text::italic(),
+                Command::Italic,
+                ["italic", "xieti"],
+            ),
+            (
+                "删除线",
+                icons::text::type_(),
+                Command::Strikethrough,
+                ["strikethrough", "shanchuxian"],
+            ),
+            (
+                "行内代码",
+                icons::editor::code(),
+                Command::Code,
+                ["code", "daima"],
+            ),
+            (
+                "链接",
+                icons::action::link(),
+                Command::Link,
+                ["link", "lianjie"],
+            ),
+            (
+                "标题",
+                icons::text::heading(),
+                Command::Heading,
+                ["heading", "biaoti"],
+            ),
+            (
+                "无序列表",
+                icons::text::list(),
+                Command::BulletList,
+                ["list", "liebiao"],
+            ),
+            (
+                "有序列表",
+                icons::text::list_ordered(),
+                Command::NumberedList,
+                ["numbered", "youxu"],
+            ),
+            (
+                "引用",
+                icons::shape::message_square(),
+                Command::Quote,
+                ["quote", "yinyong"],
+            ),
+        ];
+        for (title, icon, format_command, keywords) in formats {
+            items.push(
+                command(
+                    title,
+                    "格式",
+                    icon,
+                    Rc::new(move |model: &Model| model.format(format_command)),
+                )
+                .keywords(keywords),
+            );
+        }
         for appearance in [
             AppearancePreference::System,
             AppearancePreference::Light,
