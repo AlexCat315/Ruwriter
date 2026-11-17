@@ -20,7 +20,15 @@ use crate::formatting::Command;
 use crate::model::Model;
 
 /// Everything a menu title or check mark depends on.
-type MenuKey = (bool, bool, bool, AppearancePreference, Collection, bool);
+type MenuKey = (
+    bool,
+    bool,
+    bool,
+    AppearancePreference,
+    Collection,
+    bool,
+    bool,
+);
 
 pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
     let options = model.options();
@@ -33,6 +41,7 @@ pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
         settings.appearance,
         settings.collection,
         pinned,
+        settings.markdown_syntax,
     );
     if installed.borrow().as_ref() == Some(&key) {
         return;
@@ -71,7 +80,7 @@ fn item(
 }
 
 fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
-    let (preview, focus, sidebar, appearance, collection, pinned) = key;
+    let (preview, focus, sidebar, appearance, collection, pinned, syntax) = key;
     let file = NativeMenu::new(
         "文件",
         vec![
@@ -181,6 +190,19 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
         "显示",
         vec![
             item(
+                action(model, "查找和替换…", Model::open_find),
+                Some(primary("f")),
+            ),
+            item(
+                action(model, "下一个匹配", |model| model.find_step(1)),
+                Some(primary("g")),
+            ),
+            item(
+                action(model, "上一个匹配", |model| model.find_step(-1)),
+                Some(primary_shift("g")),
+            ),
+            NativeMenuItem::Separator,
+            item(
                 action(model, "侧栏", Model::toggle_sidebar).with_selected(sidebar && !focus),
                 Some(primary("\\")),
             ),
@@ -191,6 +213,10 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
             item(
                 action(model, "专注模式", Model::toggle_focus).with_selected(focus),
                 Some(primary_shift("f")),
+            ),
+            item(
+                action(model, "Markdown 高亮", Model::toggle_syntax).with_selected(syntax),
+                None,
             ),
             NativeMenuItem::Separator,
             item(

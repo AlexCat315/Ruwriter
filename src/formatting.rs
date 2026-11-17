@@ -160,6 +160,44 @@ fn wrap(chars: &[char], low: usize, high: usize, marker: &str) -> Edit {
     }
 }
 
+/// Enter inside a list or quote: the next line continues the prefix (ordered
+/// items count up), and an empty item ends the list instead. `None` keeps the
+/// field's default newline.
+pub fn continue_line(text: &str, caret: usize, selection: Option<(usize, usize)>) -> Option<Edit> {
+    if selection.is_some_and(|(low, high)| low != high) {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let caret = caret.min(chars.len());
+    let start = line_start(&chars, caret);
+    let end = line_end(&chars, caret);
+    let line = &chars[start..end];
+    let (width, next): (usize, Vec<char>) = if let Some(n) = prefix_len(line, LineStyle::Numbered) {
+        let number: usize = line[..n - 2].iter().collect::<String>().parse().ok()?;
+        (n, format!("{}. ", number + 1).chars().collect())
+    } else {
+        let n =
+            prefix_len(line, LineStyle::Bullet).or_else(|| prefix_len(line, LineStyle::Quote))?;
+        (n, line[..n].to_vec())
+    };
+    let mut out = chars.clone();
+    if line[width..].iter().all(|c| c.is_whitespace()) {
+        out.drain(start..end);
+        return Some(Edit {
+            text: string(&out),
+            caret: start,
+            selection: None,
+        });
+    }
+    let insert: Vec<char> = std::iter::once('\n').chain(next).collect();
+    out.splice(caret..caret, insert.iter().copied());
+    Some(Edit {
+        text: string(&out),
+        caret: caret + insert.len(),
+        selection: None,
+    })
+}
+
 fn link(chars: &[char], low: usize, high: usize) -> Edit {
     let selected = &chars[low..high];
     // A complete link in the selection unwraps to its text.
@@ -544,6 +582,34 @@ mod tests {
         let result = edit("## 标题", 1, None, Command::Heading);
         assert_eq!(result.text, "### 标题");
         assert_eq!(result.caret, 4);
+    }
+
+    #[test]
+    fn enter_continues_lists_and_quotes() {
+        let bullet = continue_line("- 甲", 3, None).expect("bullet");
+        assert_eq!(bullet.text, "- 甲\n- ");
+        assert_eq!(bullet.caret, 6);
+        let numbered = continue_line("1. 甲\n2. 乙", 9, None).expect("numbered");
+        assert_eq!(numbered.text, "1. 甲\n2. 乙\n3. ");
+        let quote = continue_line("> 引", 3, None).expect("quote");
+        assert_eq!(quote.text, "> 引\n> ");
+        assert!(continue_line("普通一行", 2, None).is_none());
+        assert!(continue_line("# 标题", 3, None).is_none());
+        assert!(continue_line("- 甲", 2, Some((0, 2))).is_none());
+    }
+
+    #[test]
+    fn enter_on_empty_item_ends_the_list() {
+        let result = continue_line("- 甲\n- ", 6, None).expect("empty item");
+        assert_eq!(result.text, "- 甲\n");
+        assert_eq!(result.caret, 4);
+    }
+
+    #[test]
+    fn enter_splits_mid_item_and_keeps_the_prefix() {
+        let result = continue_line("- 甲乙", 3, None).expect("split");
+        assert_eq!(result.text, "- 甲\n- 乙");
+        assert_eq!(result.caret, 6);
     }
 
     #[test]

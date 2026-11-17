@@ -106,6 +106,12 @@ impl View for RootView {
             navigation: cx.state(
                 cove_ui::compose::primitives::text::text_field::TextFieldNavigationRequest::default,
             ),
+            edit: cx.state(|| None),
+            find_open: cx.state(|| false),
+            find_query: cx.state(cove_ui::compose::primitives::text::TextBuffer::empty),
+            find_replacement: cx.state(cove_ui::compose::primitives::text::TextBuffer::empty),
+            find_index: cx.state(|| 0),
+            find_focus: cx.state(|| 0),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file

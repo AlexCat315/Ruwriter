@@ -102,6 +102,8 @@ pub struct Settings {
     pub font_size: u8,
     /// Row order in the document list.
     pub sort: SortOrder,
+    /// Colour Markdown syntax in the editor; off for plain prose writing.
+    pub markdown_syntax: bool,
 }
 
 impl Default for Settings {
@@ -114,6 +116,7 @@ impl Default for Settings {
             folder: None,
             font_size: 17,
             sort: SortOrder::Edited,
+            markdown_syntax: true,
         }
     }
 }

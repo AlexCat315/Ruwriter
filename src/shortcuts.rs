@@ -10,6 +10,7 @@ use ruwriter_core::Collection;
 
 const BACKSLASH: u32 = 49;
 // USB HID codes Cove's Scancode table does not name yet.
+const G: u32 = 10;
 const H: u32 = 11;
 const I: u32 = 12;
 
@@ -19,7 +20,7 @@ pub fn handle(event: &KeyEvent, model: &Model) -> bool {
     }
     let modifiers = event.modifiers;
     if event.scancode == Scancode::ESCAPE && !modifiers.has_gui() && !modifiers.has_ctrl() {
-        return model.leave_focus();
+        return model.escape();
     }
     if !(modifiers.has_gui() || modifiers.has_ctrl()) {
         return false;
@@ -35,6 +36,9 @@ pub fn handle(event: &KeyEvent, model: &Model) -> bool {
         Scancode::E => model.format(Command::Code),
         Scancode::P if !shift => model.toggle_preview(),
         Scancode::F if shift => model.toggle_focus(),
+        Scancode::F => model.open_find(),
+        G if !shift => model.find_step(1),
+        G => model.find_step(-1),
         Scancode::K if shift => model.format(Command::Link),
         Scancode::K => model.toggle_palette(),
         Scancode::B if !shift => model.format(Command::Bold),

@@ -6,11 +6,11 @@ use std::rc::Rc;
 
 use cove_ui::compose::modifiers::layout::{FlexExt, LayoutFrameExt, PaddingExt};
 use cove_ui::compose::modifiers::style::SemanticStyleViewExt;
-use cove_ui::compose::primitives::controls::{ButtonIcon, ButtonIconSource, MenuButton};
+use cove_ui::compose::primitives::controls::{Button, ButtonIcon, ButtonIconSource, MenuButton};
 use cove_ui::compose::primitives::media::ui_icon_catalog as icons;
 use cove_ui::compose::primitives::overlays::{MenuEntry, MenuItem, MenuItemRole};
 use cove_ui::compose::primitives::text::text_field::{
-    TextFieldCodeEditing, TextFieldContentPadding, TextFieldDecoration,
+    TextFieldCodeEditing, TextFieldContentPadding, TextFieldDecoration, TextFieldNavigationRequest,
 };
 use cove_ui::compose::primitives::text::{
     Divider, MarkdownView, Text, TextField, TextFieldAxis, TextFieldEvents, TextFieldLayout,
@@ -102,18 +102,18 @@ impl View for EditorPane {
             )
         };
 
-        full_size(vstack(
-            0.0,
-            Align::Stretch,
-            vec![
-                self.toolbar(),
-                AnyView::new(body.flex_with(1.0, 1.0, Some(0.0))),
-                AnyView::new(StatusLine {
-                    model: self.model.clone(),
-                    bottom_inset: self.layout.bottom_inset,
-                }),
-            ],
-        ))
+        let mut children = vec![self.toolbar()];
+        if self.model.find_open.get() {
+            children.push(AnyView::new(FindBar {
+                model: self.model.clone(),
+            }));
+        }
+        children.push(AnyView::new(body.flex_with(1.0, 1.0, Some(0.0))));
+        children.push(AnyView::new(StatusLine {
+            model: self.model.clone(),
+            bottom_inset: self.layout.bottom_inset,
+        }));
+        full_size(vstack(0.0, Align::Stretch, children))
     }
 }
 
@@ -314,10 +314,19 @@ impl View for EditorField {
     fn body(&self, _cx: &Scope) -> AnyView {
         let document = self.model.document.get();
         let navigation = self.model.navigation.get();
+        let edit = self.model.edit.get();
         let change = self.model.clone();
         let blur = self.model.clone();
         let caret = self.model.clone();
+        let keys = self.model.clone();
         let colors = SyntaxColors::for_theme(&self.mode.theme());
+        let mut code = TextFieldCodeEditing {
+            occurrences: self.find_occurrences(),
+            ..Default::default()
+        };
+        if self.model.settings().markdown_syntax {
+            code.syntax_color_at_utf8_offset = Some(markdown_syntax::highlighter(colors));
+        }
         let mut field = TextField::new("开始写作…", self.model.buffer.binding())
             .layout(TextFieldLayout {
                 axis: TextFieldAxis::Vertical,
@@ -329,18 +338,17 @@ impl View for EditorField {
                 content_padding: Some(TextFieldContentPadding::new(self.horizontal, 24.0)),
                 ..Default::default()
             })
-            .code_editing(TextFieldCodeEditing {
-                syntax_color_at_utf8_offset: Some(markdown_syntax::highlighter(colors)),
-                ..Default::default()
-            })
+            .code_editing(code)
             .style(AnyTextFieldStyle::new(ProseFieldStyle))
             .events(TextFieldEvents {
                 on_change: Some(Rc::new(move |buffer| change.on_change(buffer))),
                 on_blur: Some(Rc::new(move || blur.save())),
                 on_caret_change: Some(Rc::new(move |state| caret.on_caret(state))),
+                on_key_down: Some(Rc::new(move |event| keys.on_return_key(event))),
                 ..Default::default()
             });
         field.navigation = navigation;
+        field.edit_request = edit;
         AnyView::new(
             full_size(
                 AnyView::new(field)
@@ -348,6 +356,122 @@ impl View for EditorField {
                     .debug_name("editor"),
             )
             .id(("editor", document)),
+        )
+    }
+}
+
+impl EditorField {
+    /// While the find bar is open, every match carries the same highlight the
+    /// editor uses for repeated symbols.
+    fn find_occurrences(&self) -> Vec<std::ops::Range<usize>> {
+        if !self.model.find_open.get() {
+            return Vec::new();
+        }
+        let _ = self.model.find_query.get();
+        let buffer = self.model.buffer.get();
+        self.model
+            .find_matches()
+            .into_iter()
+            .map(|(low, high)| {
+                buffer.utf8_offset_for_character_index(low)
+                    ..buffer.utf8_offset_for_character_index(high)
+            })
+            .collect()
+    }
+}
+
+/// Find and replace over the open document, above the writing surface.
+struct FindBar {
+    model: Model,
+}
+
+impl View for FindBar {
+    fn body(&self, _cx: &Scope) -> AnyView {
+        let model = &self.model;
+        let _ = model.buffer.get();
+        let query = model.find_query.get();
+        let matches = model.find_matches();
+        let count = matches.len();
+        let index = model.find_index.get().min(count.saturating_sub(1));
+        let label = if query.string_value().is_empty() {
+            String::new()
+        } else if count == 0 {
+            "无结果".to_owned()
+        } else {
+            format!("{}/{}", index + 1, count)
+        };
+        let typing = model.clone();
+        let submit = model.clone();
+        let previous = model.clone();
+        let next = model.clone();
+        let replace = model.clone();
+        let all = model.clone();
+        let close = model.clone();
+        let mut query_field = TextField::new("查找", model.find_query.binding()).events(
+            TextFieldEvents {
+                on_change: Some(Rc::new(move |buffer| typing.set_find_query(buffer))),
+                on_submit: Some(Rc::new(move || submit.find_step(1))),
+                ..Default::default()
+            },
+        );
+        query_field.navigation = TextFieldNavigationRequest {
+            focus_request_id: Some(model.find_focus.get()),
+            ..Default::default()
+        };
+        let query_field = query_field.frame(
+            Some(FrameDimension::Points(200.0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let replacement_field = TextField::new("替换", model.find_replacement.binding()).frame(
+            Some(FrameDimension::Points(160.0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        AnyView::new(
+            hstack(
+                6.0,
+                Align::Center,
+                vec![
+                    AnyView::new(query_field),
+                    AnyView::new(
+                        Text::new(label)
+                            .semantic_font(SemanticFontRef::caption())
+                            .semantic_foreground(SemanticColorRef::on_surface_muted()),
+                    ),
+                    icon_button(
+                        icons::navigation::chevron_up(),
+                        "上一个匹配",
+                        false,
+                        move || previous.find_step(-1),
+                    ),
+                    icon_button(
+                        icons::navigation::chevron_down(),
+                        "下一个匹配",
+                        false,
+                        move || next.find_step(1),
+                    ),
+                    AnyView::new(replacement_field),
+                    AnyView::new(Button::title("替换", move || replace.replace_one())),
+                    AnyView::new(Button::title("全部替换", move || all.replace_all())),
+                    spacer(),
+                    icon_button(icons::action::x(), "关闭查找", false, move || {
+                        close.close_find()
+                    }),
+                ],
+            )
+            .padding_insets(cove_ui::compose::modifiers::layout::EdgeInsets {
+                top: 2.0,
+                leading: 10.0,
+                bottom: 6.0,
+                trailing: 10.0,
+            }),
         )
     }
 }

@@ -320,6 +320,11 @@ impl Session {
         self.persist_app();
     }
 
+    pub fn toggle_syntax(&mut self) {
+        self.app.settings.markdown_syntax = !self.app.settings.markdown_syntax;
+        self.persist_app();
+    }
+
     /// Steps the editor size by `delta` points within the supported range.
     pub fn adjust_font_size(&mut self, delta: i8) {
         let current = i16::from(self.app.settings.font_size);

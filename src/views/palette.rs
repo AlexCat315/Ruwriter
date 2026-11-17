@@ -22,8 +22,10 @@ impl View for Palette {
             return AnyView::new(EmptyView);
         }
         let _ = self.model.revision.get();
+        let _ = self.model.buffer.get();
         let model = &self.model;
         let options = model.options();
+        let syntax = model.settings().markdown_syntax;
         let command =
             |title: &str, group: &str, icon: BundleImageResource, action: Rc<dyn Fn(&Model)>| {
                 let target = model.clone();
@@ -62,6 +64,13 @@ impl View for Palette {
             )
             .keywords(["delete", "trash", "shanchu"]),
             command(
+                "查找和替换…",
+                "编辑",
+                icons::action::search(),
+                Rc::new(Model::open_find),
+            )
+            .keywords(["find", "search", "replace", "chazhao", "tihuan"]),
+            command(
                 if options.preview {
                     "关闭预览"
                 } else {
@@ -90,6 +99,17 @@ impl View for Palette {
                 Rc::new(Model::toggle_sidebar),
             )
             .keywords(["sidebar", "cebian"]),
+            command(
+                if syntax {
+                    "关闭 Markdown 高亮（纯文本）"
+                } else {
+                    "开启 Markdown 高亮"
+                },
+                "显示",
+                icons::editor::code(),
+                Rc::new(Model::toggle_syntax),
+            )
+            .keywords(["syntax", "markdown", "plain", "gaoliang", "chunwenben"]),
             command(
                 "放大文字",
                 "显示",
@@ -232,6 +252,18 @@ impl View for Palette {
                 )
                 .id(format!("folder-{}", folder.id))
                 .subtitle(path),
+            );
+        }
+        for (offset, title) in model.outline() {
+            items.push(
+                command(
+                    &title,
+                    "跳转到大纲",
+                    icons::text::heading(),
+                    Rc::new(move |model: &Model| model.navigate(offset, None, true)),
+                )
+                .id(format!("outline-{offset}"))
+                .subtitle(format!("第 {} 字", offset + 1)),
             );
         }
         for collection in Collection::ALL {

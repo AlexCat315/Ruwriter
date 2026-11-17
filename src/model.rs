@@ -16,12 +16,14 @@ use std::rc::Rc;
 
 use cove_ui::compose::primitives::text::TextBuffer;
 use cove_ui::compose::primitives::text::text_field::{
-    TextFieldCaretState, TextFieldNavigationRequest,
+    TextFieldCaretState, TextFieldEditRequest, TextFieldNavigationRequest,
 };
+use cove_ui::composition::Scancode;
 use cove_ui::core::Signal;
 use cove_ui::core::scene::{
     FilePicker, FilePickerFilter, FileSaveOutcome, FileSaveRequest, FileSaver,
 };
+use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
 use ruwriter_core::{
     AppearancePreference, Collection, Document, Rescan, Session, SortOrder, WritingStats, count,
@@ -83,6 +85,15 @@ pub struct Model {
     pub caret: Signal<TextFieldCaretState>,
     /// One-shot focus/caret requests the editor applies after formatting.
     pub navigation: Signal<TextFieldNavigationRequest>,
+    /// One-shot undoable edit the editor applies (formatting, replace, Enter).
+    pub edit: Signal<Option<TextFieldEditRequest>>,
+    pub find_open: Signal<bool>,
+    pub find_query: Signal<TextBuffer>,
+    pub find_replacement: Signal<TextBuffer>,
+    /// Which match the caret currently sits on.
+    pub find_index: Signal<usize>,
+    /// One-shot request that moves typing into the find bar's query field.
+    pub find_focus: Signal<u64>,
 }
 
 fn markdown_filter() -> FilePickerFilter {
@@ -173,6 +184,9 @@ impl Model {
         self.preview.set(text);
         self.caret.set(TextFieldCaretState::INITIAL);
         self.navigation.set(TextFieldNavigationRequest::default());
+        self.edit.set(None);
+        self.find_open.set(false);
+        self.find_index.set(0);
         self.document.update(|value| *value += 1);
     }
 
@@ -207,7 +221,8 @@ impl Model {
     }
 
     /// Applies a Markdown formatting command at the last reported caret or
-    /// selection, saves the result and puts the caret where the edit lands.
+    /// selection. The edit goes through the field's undoable edit request, so
+    /// Ctrl+Z steps back over it and the selection survives the wrap.
     pub fn format(&self, command: Command) {
         let buffer = self.buffer.get_untracked();
         let state = self.caret.get_untracked();
@@ -221,11 +236,60 @@ impl Model {
             selection,
             command,
         );
-        let next = TextBuffer::new(&edit.text);
-        self.buffer.set(next.clone());
-        self.on_change(&next);
-        self.caret
-            .set(TextFieldCaretState::new(edit.caret, edit.selection));
+        self.request_edit(
+            0..len,
+            edit.text,
+            edit.caret,
+            edit.selection.map(|(low, _)| low),
+        );
+    }
+
+    /// Queues one undoable edit for the editor to apply on its next pass.
+    fn request_edit(
+        &self,
+        range: std::ops::Range<usize>,
+        replacement: String,
+        caret: usize,
+        anchor: Option<usize>,
+    ) {
+        let id = self.edit.get_untracked().as_ref().map_or(0, |edit| edit.id) + 1;
+        self.edit.set(Some(TextFieldEditRequest {
+            id,
+            range,
+            replacement,
+            caret,
+            anchor,
+        }));
+    }
+
+    /// Plain Return continues lists and quotes; other keys keep the field's
+    /// own handling.
+    pub fn on_return_key(&self, event: &KeyEvent) -> bool {
+        if !matches!(event.scancode, Scancode::RETURN | Scancode::KEYPAD_ENTER)
+            || event.modifiers.has_shift()
+            || event.modifiers.has_ctrl()
+            || event.modifiers.has_gui()
+            || event.modifiers.has_alt()
+        {
+            return false;
+        }
+        let buffer = self.buffer.get_untracked();
+        let state = self.caret.get_untracked();
+        let len = buffer.character_count();
+        let Some(edit) = formatting::continue_line(
+            &buffer.string_value(),
+            state.caret_index.min(len),
+            state.selected_range,
+        ) else {
+            return false;
+        };
+        self.request_edit(0..len, edit.text, edit.caret, None);
+        true
+    }
+
+    /// Moves the caret (and optional selection anchor) without editing.
+    /// `focus` also hands keyboard focus to the editor.
+    pub fn navigate(&self, index: usize, anchor: Option<usize>, focus: bool) {
         let request = self
             .navigation
             .get_untracked()
@@ -233,10 +297,183 @@ impl Model {
             .unwrap_or(0)
             + 1;
         self.navigation.set(TextFieldNavigationRequest {
-            focus_request_id: Some(request),
+            focus_request_id: focus.then_some(request),
             caret_request_id: Some(request),
-            caret_request_index: Some(edit.caret),
+            caret_request_index: Some(index),
+            caret_request_anchor: anchor,
         });
+    }
+
+    // MARK: - Find and replace
+
+    pub fn find_matches(&self) -> Vec<(usize, usize)> {
+        Self::matches_in(
+            &self.buffer.get_untracked().string_value(),
+            &self.find_query.get_untracked().string_value(),
+        )
+    }
+
+    fn matches_in(text: &str, query: &str) -> Vec<(usize, usize)> {
+        let needle: Vec<char> = query.chars().collect();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let hay: Vec<char> = text.chars().collect();
+        let mut matches = Vec::new();
+        let mut at = 0;
+        while at + needle.len() <= hay.len() {
+            let hit = hay[at..at + needle.len()]
+                .iter()
+                .zip(&needle)
+                .all(|(a, b)| a == b || a.eq_ignore_ascii_case(b));
+            if hit {
+                matches.push((at, at + needle.len()));
+                at += needle.len();
+            } else {
+                at += 1;
+            }
+        }
+        matches
+    }
+
+    pub fn open_find(&self) {
+        let state = self.caret.get_untracked();
+        if let Some((low, high)) = state.selected_range {
+            let buffer = self.buffer.get_untracked();
+            let len = buffer.character_count();
+            let (low, high) = (low.min(len), high.min(len));
+            if high > low && high - low <= 80 {
+                self.find_query
+                    .set(TextBuffer::new(&buffer.substring(low..high)));
+            }
+        }
+        self.find_open.set(true);
+        self.find_index.set(0);
+        self.find_focus.set(self.find_focus.get_untracked() + 1);
+        if let Some(&(low, high)) = self.find_matches().first() {
+            self.navigate(low, Some(high), false);
+        }
+    }
+
+    pub fn close_find(&self) {
+        self.find_open.set(false);
+        let caret = self.caret.get_untracked().caret_index;
+        self.navigate(caret, None, true);
+    }
+
+    /// Escape closes the find bar first, then leaves focus mode.
+    pub fn escape(&self) -> bool {
+        if self.find_open.get_untracked() {
+            self.close_find();
+            return true;
+        }
+        self.leave_focus()
+    }
+
+    pub fn set_find_query(&self, query: &TextBuffer) {
+        self.find_query.set(query.clone());
+        self.find_index.set(0);
+    }
+
+    pub fn find_step(&self, delta: i64) {
+        if !self.find_open.get_untracked() {
+            return;
+        }
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let count = matches.len() as i64;
+        let index = (self.find_index.get_untracked() as i64 + delta).rem_euclid(count) as usize;
+        self.find_index.set(index);
+        let (low, high) = matches[index];
+        self.navigate(low, Some(high), false);
+    }
+
+    pub fn replace_one(&self) {
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let index = self.find_index.get_untracked().min(matches.len() - 1);
+        let (low, high) = matches[index];
+        let replacement = self.find_replacement.get_untracked().string_value();
+        let buffer = self.buffer.get_untracked();
+        let mut text = buffer.string_value();
+        let chars: Vec<char> = text.chars().collect();
+        text = chars[..low]
+            .iter()
+            .copied()
+            .chain(replacement.chars())
+            .chain(chars[high..].iter().copied())
+            .collect();
+        let caret = low + replacement.chars().count();
+        self.request_edit(low..high, replacement, caret, None);
+        let next = Self::matches_in(&text, &self.find_query.get_untracked().string_value());
+        let index = next
+            .iter()
+            .position(|&(start, _)| start >= caret)
+            .unwrap_or(0);
+        self.find_index.set(index);
+        if let Some(&(low, high)) = next.get(index) {
+            self.navigate(low, Some(high), false);
+        }
+    }
+
+    pub fn replace_all(&self) {
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let replacement = self.find_replacement.get_untracked().string_value();
+        let buffer = self.buffer.get_untracked();
+        let len = buffer.character_count();
+        let mut text = buffer.string_value();
+        for &(low, high) in matches.iter().rev() {
+            let chars: Vec<char> = text.chars().collect();
+            text = chars[..low]
+                .iter()
+                .copied()
+                .chain(replacement.chars())
+                .chain(chars[high..].iter().copied())
+                .collect();
+        }
+        let caret = self
+            .caret
+            .get_untracked()
+            .caret_index
+            .min(text.chars().count());
+        self.request_edit(0..len, text, caret, None);
+        self.find_index.set(0);
+    }
+
+    // MARK: - Outline and plain prose
+
+    /// Headings of the open document with their character offsets, for the
+    /// palette's jump list.
+    pub fn outline(&self) -> Vec<(usize, String)> {
+        let text = self.buffer.get_untracked().string_value();
+        let mut out = Vec::new();
+        let mut offset = 0;
+        for line in text.split('\n') {
+            let hashes = line.chars().take_while(|&c| c == '#').count();
+            if (1..=6).contains(&hashes) && line.chars().nth(hashes) == Some(' ') {
+                let title: String = line.chars().skip(hashes + 1).collect();
+                if !title.trim().is_empty() {
+                    out.push((offset, title.trim().to_owned()));
+                }
+            }
+            offset += line.chars().count() + 1;
+        }
+        out
+    }
+
+    pub fn toggle_syntax(&self) {
+        let _ = self.with_session(|session| {
+            session.toggle_syntax();
+            Ok(())
+        });
+        self.bump();
     }
 
     /// Files changed on disk. Ruwriter's own last write is recognised and
