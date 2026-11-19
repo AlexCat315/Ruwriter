@@ -357,6 +357,7 @@ impl View for EditorField {
                 } else {
                     TextFieldIndentSkip::default()
                 },
+                typewriter_scrolling: settings.typewriter_scrolling,
                 ..Default::default()
             })
             .decoration(TextFieldDecoration {
@@ -378,7 +379,7 @@ impl View for EditorField {
             full_size(
                 AnyView::new(field)
                     .semantic_font(if novel {
-                        novel_font(self.font_size)
+                        novel_font(self.font_size, settings.line_spacing.factor())
                     } else {
                         editor_font(self.font_size)
                     })

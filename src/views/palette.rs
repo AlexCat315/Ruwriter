@@ -95,6 +95,50 @@ impl View for Palette {
             )
             .keywords(["indent", "suojin", "duanshou", "paragraph"]),
             command(
+                if model.line_spacing() == ruwriter_core::LineSpacing::Compact {
+                    "标准行距"
+                } else {
+                    "紧凑行距"
+                },
+                "排版",
+                icons::layout::columns_2(),
+                Rc::new(|model: &Model| {
+                    model.set_line_spacing(ruwriter_core::LineSpacing::Compact)
+                }),
+            )
+            .keywords(["line", "spacing", "hangju", "jin cou"]),
+            command(
+                if model.line_spacing() == ruwriter_core::LineSpacing::Loose {
+                    "标准行距"
+                } else {
+                    "宽松行距"
+                },
+                "排版",
+                icons::layout::columns_2(),
+                Rc::new(|model: &Model| {
+                    model.set_line_spacing(ruwriter_core::LineSpacing::Loose)
+                }),
+            )
+            .keywords(["line", "spacing", "hangju", "kuansong"]),
+            command(
+                if model.typewriter_scrolling() {
+                    "关闭打字机滚动"
+                } else {
+                    "开启打字机滚动"
+                },
+                "排版",
+                icons::layout::columns_2(),
+                Rc::new(Model::toggle_typewriter_scrolling),
+            )
+            .keywords([
+                "typewriter",
+                "scroll",
+                "center",
+                "daziji",
+                "gundong",
+                "juzhong",
+            ]),
+            command(
                 if model.writing_mode() == ruwriter_core::WritingMode::Novel {
                     "导出文稿…"
                 } else {

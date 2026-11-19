@@ -256,6 +256,38 @@ impl Model {
         self.settings_revision.update(|value| *value += 1);
     }
 
+    pub fn line_spacing(&self) -> ruwriter_core::LineSpacing {
+        self.settings().line_spacing
+    }
+
+    pub fn set_line_spacing(&self, spacing: ruwriter_core::LineSpacing) {
+        let _ = self.with_session(|session| {
+            session.set_line_spacing(spacing);
+            Ok(())
+        });
+        self.settings_revision.update(|value| *value += 1);
+        let caret = self.caret.get();
+        let anchor = caret.selected_range.map(|(start, _)| start);
+        self.navigate(caret.caret_index, anchor, true);
+    }
+
+    pub fn typewriter_scrolling(&self) -> bool {
+        self.settings().typewriter_scrolling
+    }
+
+    pub fn toggle_typewriter_scrolling(&self) {
+        let _ = self.with_session(|session| {
+            session.toggle_typewriter_scrolling();
+            Ok(())
+        });
+        self.settings_revision.update(|value| *value += 1);
+        // Re-issue the caret so the new layout takes effect at once: turning
+        // the mode on centres the current line, turning it off leaves it put.
+        let caret = self.caret.get();
+        let anchor = caret.selected_range.map(|(start, _)| start);
+        self.navigate(caret.caret_index, anchor, true);
+    }
+
     // MARK: - Editing
 
     /// Called by the editor after every accepted edit.

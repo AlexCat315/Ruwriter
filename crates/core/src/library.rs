@@ -101,6 +101,35 @@ pub enum WritingMode {
     Markdown,
 }
 
+/// Line spacing for manuscript prose. The values are line-height multiples
+/// applied to the body font size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineSpacing {
+    Compact,
+    #[default]
+    Normal,
+    Loose,
+}
+
+impl LineSpacing {
+    pub fn factor(self) -> f32 {
+        match self {
+            Self::Compact => 1.75,
+            Self::Normal => 2.0,
+            Self::Loose => 2.35,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Compact => "紧凑",
+            Self::Normal => "标准",
+            Self::Loose => "宽松",
+        }
+    }
+}
+
 impl WritingMode {
     pub fn title(self) -> &'static str {
         match self {
@@ -135,6 +164,10 @@ pub struct Settings {
     pub writing_mode: WritingMode,
     /// Indent the first row of each paragraph, as novels and Chinese prose do.
     pub paragraph_indent: bool,
+    /// Keep the caret row near the middle of the editor as the page scrolls.
+    pub typewriter_scrolling: bool,
+    /// Line spacing for the manuscript body.
+    pub line_spacing: LineSpacing,
     /// Colour Markdown syntax in the editor; off for plain prose writing.
     pub markdown_syntax: bool,
     /// Show the outline pane beside the editor on wide windows.
@@ -153,6 +186,8 @@ impl Default for Settings {
             sort: SortOrder::Edited,
             writing_mode: WritingMode::Novel,
             paragraph_indent: true,
+            typewriter_scrolling: false,
+            line_spacing: LineSpacing::Normal,
             markdown_syntax: true,
             outline: true,
         }

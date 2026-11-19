@@ -30,6 +30,8 @@ type MenuKey = (
     bool,
     ruwriter_core::WritingMode,
     bool,
+    bool,
+    ruwriter_core::LineSpacing,
 );
 
 pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
@@ -46,6 +48,8 @@ pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
         settings.markdown_syntax,
         settings.writing_mode,
         settings.paragraph_indent,
+        settings.typewriter_scrolling,
+        settings.line_spacing,
     );
     if installed.borrow().as_ref() == Some(&key) {
         return;
@@ -84,7 +88,19 @@ fn item(
 }
 
 fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
-    let (preview, focus, sidebar, appearance, collection, pinned, syntax, writing, indent) = key;
+    let (
+        preview,
+        focus,
+        sidebar,
+        appearance,
+        collection,
+        pinned,
+        syntax,
+        writing,
+        indent,
+        typewriter,
+        spacing,
+    ) = key;
     let markdown = writing == ruwriter_core::WritingMode::Markdown;
     let file = NativeMenu::new(
         "文件",
@@ -249,6 +265,11 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                 action(model, "段首缩进", Model::toggle_paragraph_indent).with_selected(indent),
                 None,
             ),
+            item(
+                action(model, "打字机滚动", Model::toggle_typewriter_scrolling)
+                    .with_selected(typewriter),
+                None,
+            ),
             NativeMenuItem::Separator,
             item(
                 action(model, "放大文字", |model| model.adjust_font_size(1)),
@@ -261,6 +282,34 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
             item(
                 action(model, "实际大小", Model::reset_font_size),
                 Some(primary("0")),
+            ),
+            NativeMenuItem::Separator,
+            item(
+                action(model, "紧凑行距", |model| {
+                    model.set_line_spacing(ruwriter_core::LineSpacing::Compact)
+                })
+                .with_selected(
+                    spacing == ruwriter_core::LineSpacing::Compact,
+                ),
+                None,
+            ),
+            item(
+                action(model, "标准行距", |model| {
+                    model.set_line_spacing(ruwriter_core::LineSpacing::Normal)
+                })
+                .with_selected(
+                    spacing == ruwriter_core::LineSpacing::Normal,
+                ),
+                None,
+            ),
+            item(
+                action(model, "宽松行距", |model| {
+                    model.set_line_spacing(ruwriter_core::LineSpacing::Loose)
+                })
+                .with_selected(
+                    spacing == ruwriter_core::LineSpacing::Loose,
+                ),
+                None,
             ),
             NativeMenuItem::Separator,
             NativeMenuItem::Submenu(appearance_menu),

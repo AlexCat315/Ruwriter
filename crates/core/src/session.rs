@@ -289,6 +289,16 @@ impl Session {
         self.persist_app();
     }
 
+    pub fn set_line_spacing(&mut self, spacing: crate::LineSpacing) {
+        self.app.settings.line_spacing = spacing;
+        self.persist_app();
+    }
+
+    pub fn toggle_typewriter_scrolling(&mut self) {
+        self.app.settings.typewriter_scrolling = !self.app.settings.typewriter_scrolling;
+        self.persist_app();
+    }
+
     // MARK: - View settings
 
     pub fn toggle_preview(&mut self) {

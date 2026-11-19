@@ -12,7 +12,8 @@ pub mod stats;
 
 pub use document::{DocStatus, Document, normalize_tags, parse_tags, title_from_text};
 pub use library::{
-    AppearancePreference, Collection, Folder, Library, Settings, SortOrder, WritingMode,
+    AppearancePreference, Collection, Folder, Library, LineSpacing, Settings, SortOrder,
+    WritingMode,
 };
 pub use outline::{Heading, heading_at, headings, is_chapter_line};
 pub use session::{Rescan, Session, ViewOptions};

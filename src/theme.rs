@@ -147,13 +147,13 @@ const SERIF_FAMILY: Option<&str> = None;
 
 /// Novel mode: a serif face with roomier lines. The glyphs stay plain text;
 /// no markup is coloured or shown beyond what the author typed.
-pub fn novel_font(size: u8) -> SemanticFontRef {
+pub fn novel_font(size: u8, line_spacing: f32) -> SemanticFontRef {
     let size = f32::from(size);
     SemanticFontRef::new(move |_| {
         let font = SERIF_FAMILY
             .map(|family| Font::named(family, size, FontWeight::Regular))
             .unwrap_or_else(|| Font::system(size, FontWeight::Regular));
-        TextStyleToken::new(font, (size * 2.0).round(), 0.0)
+        TextStyleToken::new(font, (size * line_spacing).round(), 0.0)
     })
 }
 
