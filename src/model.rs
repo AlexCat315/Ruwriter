@@ -26,8 +26,8 @@ use cove_ui::core::scene::{
 use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
 use ruwriter_core::{
-    AppearancePreference, Collection, DocStatus, Document, Rescan, Session, SortOrder,
-    WritingStats, count, parse_tags,
+    AppearancePreference, Collection, DocStatus, Document, Heading, Rescan, Session, SortOrder,
+    WritingStats, count, heading_at, headings, parse_tags,
 };
 
 use crate::formatting::{self, Command};
@@ -461,21 +461,31 @@ impl Model {
 
     /// Headings of the open document with their character offsets, for the
     /// palette's jump list.
-    pub fn outline(&self) -> Vec<(usize, String)> {
-        let text = self.buffer.get_untracked().string_value();
-        let mut out = Vec::new();
-        let mut offset = 0;
-        for line in text.split('\n') {
-            let hashes = line.chars().take_while(|&c| c == '#').count();
-            if (1..=6).contains(&hashes) && line.chars().nth(hashes) == Some(' ') {
-                let title: String = line.chars().skip(hashes + 1).collect();
-                if !title.trim().is_empty() {
-                    out.push((offset, title.trim().to_owned()));
-                }
-            }
-            offset += line.chars().count() + 1;
-        }
-        out
+    pub fn outline(&self) -> Vec<Heading> {
+        headings(&self.buffer.get_untracked().string_value())
+    }
+
+    /// The heading tree plus the index of the section holding the caret.
+    /// Reads both signals so the outline pane refreshes as you type and move.
+    pub fn outline_at_caret(&self) -> (Vec<Heading>, Option<usize>) {
+        let text = self.buffer.get().string_value();
+        let heads = headings(&text);
+        let caret = self.caret.get().caret_index;
+        let current = heading_at(&heads, caret);
+        (heads, current)
+    }
+
+    /// Moves the caret to a heading and hands focus back to the editor.
+    pub fn jump_to_heading(&self, offset: usize) {
+        self.navigate(offset, None, true);
+    }
+
+    pub fn toggle_outline(&self) {
+        let _ = self.with_session(|session| {
+            session.toggle_outline();
+            Ok(())
+        });
+        self.bump();
     }
 
     pub fn toggle_syntax(&self) {

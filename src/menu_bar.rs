@@ -208,6 +208,10 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                 Some(primary("\\")),
             ),
             item(
+                action(model, "大纲", Model::toggle_outline),
+                Some(primary_shift("l")),
+            ),
+            item(
                 action(model, "预览", Model::toggle_preview).with_selected(preview),
                 Some(primary("p")),
             ),

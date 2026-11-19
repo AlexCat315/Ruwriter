@@ -104,6 +104,8 @@ pub struct Settings {
     pub sort: SortOrder,
     /// Colour Markdown syntax in the editor; off for plain prose writing.
     pub markdown_syntax: bool,
+    /// Show the outline pane beside the editor on wide windows.
+    pub outline: bool,
 }
 
 impl Default for Settings {
@@ -117,6 +119,7 @@ impl Default for Settings {
             font_size: 17,
             sort: SortOrder::Edited,
             markdown_syntax: true,
+            outline: true,
         }
     }
 }

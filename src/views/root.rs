@@ -24,6 +24,7 @@ use ruwriter_core::{Session, count};
 use super::editor::EditorPane;
 use super::info::InfoDialog;
 use super::list::ListPane;
+use super::outline::OutlinePane;
 use super::palette::Palette;
 use super::rename::RenameDialog;
 use super::sidebar::LibrarySidebar;
@@ -35,10 +36,13 @@ use crate::theme::Mode;
 
 pub const SIDEBAR_WIDTH: f32 = 216.0;
 pub const LIST_WIDTH: f32 = 300.0;
+pub const OUTLINE_WIDTH: f32 = 240.0;
 /// Below this width one pane shows at a time.
 pub const SINGLE_PANE_WIDTH: f32 = 640.0;
 /// Below this width the sidebar folds into the list's title menu.
 pub const SIDEBAR_MIN_WINDOW: f32 = 900.0;
+/// Below this width the outline collapses so the page keeps a readable column.
+pub const OUTLINE_MIN_WINDOW: f32 = 1180.0;
 
 /// Which panes are on screen and how wide the editor is.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +50,7 @@ pub struct Layout {
     pub sidebar: bool,
     pub list: bool,
     pub editor: bool,
+    pub outline: bool,
     pub single_pane: bool,
     pub editor_width: f32,
     pub top_inset: f32,
@@ -62,6 +67,11 @@ impl Layout {
             !single_pane && !options.focus && options.sidebar && width >= SIDEBAR_MIN_WINDOW;
         let list = !options.focus && (!single_pane || !showing_editor);
         let editor = !single_pane || showing_editor || options.focus;
+        let outline = editor
+            && !single_pane
+            && !options.focus
+            && options.outline
+            && width >= OUTLINE_MIN_WINDOW;
         let mut editor_width = width;
         if sidebar {
             editor_width -= SIDEBAR_WIDTH;
@@ -69,10 +79,14 @@ impl Layout {
         if list && editor {
             editor_width -= LIST_WIDTH + 1.0;
         }
+        if outline {
+            editor_width -= OUTLINE_WIDTH + 1.0;
+        }
         Self {
             sidebar,
             list,
             editor,
+            outline,
             single_pane,
             editor_width: editor_width.max(0.0),
             top_inset,
@@ -214,6 +228,26 @@ impl View for RootView {
             AnyView::new(EmptyView)
         };
 
+        let outline_divider: AnyView = if layout.outline {
+            full_height(Divider::vertical())
+        } else {
+            AnyView::new(EmptyView)
+        };
+
+        let outline: AnyView = if layout.outline {
+            full_height(
+                AnyView::new(OutlinePane {
+                    model: model.clone(),
+                    top_inset: layout.top_inset,
+                    bottom_inset: layout.bottom_inset,
+                })
+                .frame_width(OUTLINE_WIDTH)
+                .semantic_background(SemanticColorRef::background()),
+            )
+        } else {
+            AnyView::new(EmptyView)
+        };
+
         let shortcut_model = model.clone();
         let shortcut_host =
             ShortcutHost::new(move |event| shortcuts::handle(event, &shortcut_model));
@@ -221,7 +255,7 @@ impl View for RootView {
         let shell = full_size(hstack(
             0.0,
             Align::Stretch,
-            vec![sidebar, list, divider, editor],
+            vec![sidebar, list, divider, editor, outline_divider, outline],
         ));
         let content = full_size(vstack(
             0.0,

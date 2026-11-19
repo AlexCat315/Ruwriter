@@ -109,6 +109,17 @@ impl View for Palette {
             )
             .keywords(["sidebar", "cebian"]),
             command(
+                if options.outline {
+                    "隐藏大纲"
+                } else {
+                    "显示大纲"
+                },
+                "显示",
+                icons::layout::panel_right(),
+                Rc::new(Model::toggle_outline),
+            )
+            .keywords(["outline", "dagang", "structure"]),
+            command(
                 if syntax {
                     "关闭 Markdown 高亮（纯文本）"
                 } else {
@@ -263,16 +274,19 @@ impl View for Palette {
                 .subtitle(path),
             );
         }
-        for (offset, title) in model.outline() {
+        for heading in model.outline() {
+            let offset = heading.offset;
+            let title = heading.title;
+            let level = heading.level;
             items.push(
                 command(
                     &title,
                     "跳转到大纲",
                     icons::text::heading(),
-                    Rc::new(move |model: &Model| model.navigate(offset, None, true)),
+                    Rc::new(move |model: &Model| model.jump_to_heading(offset)),
                 )
                 .id(format!("outline-{offset}"))
-                .subtitle(format!("第 {} 字", offset + 1)),
+                .subtitle(format!("H{level} · 第 {} 字", offset + 1)),
             );
         }
         for collection in Collection::ALL {

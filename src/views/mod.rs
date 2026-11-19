@@ -4,6 +4,7 @@
 mod editor;
 mod info;
 mod list;
+mod outline;
 mod palette;
 mod rename;
 mod root;

@@ -34,6 +34,7 @@ pub struct ViewOptions {
     pub preview: bool,
     pub focus: bool,
     pub sidebar: bool,
+    pub outline: bool,
 }
 
 /// What a rescan did to the open document.
@@ -117,6 +118,7 @@ impl Session {
                 preview: settings.preview,
                 focus: false,
                 sidebar: settings.sidebar,
+                outline: settings.outline,
             },
         };
         if !legacy.is_empty() {
@@ -283,6 +285,12 @@ impl Session {
     pub fn toggle_sidebar(&mut self) {
         self.options.sidebar = !self.options.sidebar;
         self.app.settings.sidebar = self.options.sidebar;
+        self.persist_app();
+    }
+
+    pub fn toggle_outline(&mut self) {
+        self.options.outline = !self.options.outline;
+        self.app.settings.outline = self.options.outline;
         self.persist_app();
     }
 

@@ -13,6 +13,7 @@ const BACKSLASH: u32 = 49;
 const G: u32 = 10;
 const H: u32 = 11;
 const I: u32 = 12;
+const L: u32 = 15;
 
 pub fn handle(event: &KeyEvent, model: &Model) -> bool {
     if event.is_repeat {
@@ -41,6 +42,7 @@ pub fn handle(event: &KeyEvent, model: &Model) -> bool {
         G => model.find_step(-1),
         Scancode::K if shift => model.format(Command::Link),
         Scancode::K => model.toggle_palette(),
+        L if shift => model.toggle_outline(),
         Scancode::B if !shift => model.format(Command::Bold),
         I if !shift => model.format(Command::Italic),
         Scancode::X if shift => model.format(Command::Strikethrough),

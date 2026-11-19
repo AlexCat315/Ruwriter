@@ -142,7 +142,17 @@ impl EditorPane {
 
         let preview = model.clone();
         let focus = model.clone();
-        let mut trailing = vec![
+        let outline = model.clone();
+        let mut trailing = vec![];
+        if !self.layout.single_pane {
+            trailing.push(icon_button(
+                icons::layout::panel_right(),
+                "显示或隐藏大纲",
+                options.outline && self.layout.outline,
+                move || outline.toggle_outline(),
+            ));
+        }
+        trailing.extend([
             icon_button(
                 icons::layout::columns_2(),
                 "预览",
@@ -155,7 +165,7 @@ impl EditorPane {
                 options.focus,
                 move || focus.toggle_focus(),
             ),
-        ];
+        ]);
         trailing.push(AnyView::new(
             MenuButton::new(
                 document_menu(model),
