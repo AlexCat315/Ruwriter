@@ -407,13 +407,12 @@ impl View for FindBar {
         let replace = model.clone();
         let all = model.clone();
         let close = model.clone();
-        let mut query_field = TextField::new("查找", model.find_query.binding()).events(
-            TextFieldEvents {
+        let mut query_field =
+            TextField::new("查找", model.find_query.binding()).events(TextFieldEvents {
                 on_change: Some(Rc::new(move |buffer| typing.set_find_query(buffer))),
                 on_submit: Some(Rc::new(move || submit.find_step(1))),
                 ..Default::default()
-            },
-        );
+            });
         query_field.navigation = TextFieldNavigationRequest {
             focus_request_id: Some(model.find_focus.get()),
             ..Default::default()

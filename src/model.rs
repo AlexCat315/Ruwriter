@@ -301,6 +301,7 @@ impl Model {
             caret_request_id: Some(request),
             caret_request_index: Some(index),
             caret_request_anchor: anchor,
+            caret_request_focus: focus,
         });
     }
 
@@ -373,6 +374,9 @@ impl Model {
     pub fn set_find_query(&self, query: &TextBuffer) {
         self.find_query.set(query.clone());
         self.find_index.set(0);
+        if let Some(&(low, high)) = self.find_matches().first() {
+            self.navigate(low, Some(high), false);
+        }
     }
 
     pub fn find_step(&self, delta: i64) {
