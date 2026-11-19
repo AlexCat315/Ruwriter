@@ -26,6 +26,17 @@ pub fn relative_to(timestamp: u64, now: u64, offset: i64) -> String {
     }
 }
 
+/// Full local clock time for version history.
+pub fn stamp(timestamp: u64) -> String {
+    let offset = local_offset_seconds();
+    let seconds = timestamp as i64 + offset;
+    let (year, month, day) = civil(seconds);
+    let seconds = seconds.rem_euclid(86_400);
+    let hour = seconds / 3600;
+    let minute = (seconds % 3600) / 60;
+    format!("{year}年{month}月{day}日 {hour:02}:{minute:02}")
+}
+
 /// Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant).
 fn civil(seconds: i64) -> (i64, u32, u32) {
     let days = seconds.div_euclid(86_400);

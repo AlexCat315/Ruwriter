@@ -59,6 +59,20 @@ impl View for Palette {
                 "synopsis", "status", "tag", "tags", "gaojian", "zhuyao", "biaoti",
             ]),
             command(
+                "保存快照",
+                "文稿",
+                icons::action::pencil(),
+                Rc::new(Model::snapshot_now),
+            )
+            .keywords(["snapshot", "history", "version", "kuaizhao", "lishi"]),
+            command(
+                "历史版本…",
+                "文稿",
+                icons::data::clock(),
+                Rc::new(Model::open_history),
+            )
+            .keywords(["history", "version", "snapshot", "lishi", "huifu", "kuaizhao"]),
+            command(
                 if model.writing_mode() == ruwriter_core::WritingMode::Novel {
                     "切换为 Markdown 模式"
                 } else {

@@ -365,3 +365,34 @@ fn sort_choice_orders_rows_and_survives_reload() {
     let titles: Vec<String> = reopened.list("").into_iter().map(|d| d.title).collect();
     assert_eq!(titles, ["乙", "甲", "丙"]);
 }
+
+#[test]
+fn snapshots_capture_before_restore_and_survive_a_rename() {
+    let root = tempfile::tempdir().expect("temp root");
+    let mut session = Session::at(root.path());
+    session.autosave("第一版").expect("autosave");
+    let before = session.snapshots();
+    assert!(!before.is_empty(), "a snapshot is taken while writing");
+
+    session.autosave("第二版").expect("autosave");
+    let name = before[0].name.clone();
+    let restored = session.restore_snapshot(&name, "第二版").expect("restore");
+    assert_eq!(restored, "第一版");
+    assert_eq!(session.text(), "第一版");
+    assert_eq!(read_document(&active_path(&session)).unwrap(), "第一版");
+    assert!(
+        session
+            .snapshots()
+            .iter()
+            .any(|snapshot| snapshot.excerpt.contains("第二版")),
+        "the replaced text is kept as a snapshot"
+    );
+
+    session.save("第一版").expect("save");
+    let renamed = session.active_id().unwrap();
+    assert!(renamed.ends_with("第一版.txt"));
+    assert!(
+        !session.snapshots().is_empty(),
+        "snapshots follow the document after its file is renamed"
+    );
+}

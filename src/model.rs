@@ -27,7 +27,7 @@ use cove_ui::core::scene::{
 use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
 use ruwriter_core::{
-    AppearancePreference, Collection, DocStatus, Document, Heading, Rescan, Session, SortOrder,
+    AppearancePreference, Collection, DocStatus, Document, Heading, Rescan, Session, Snapshot, SortOrder,
     WritingStats, count, heading_at, headings, parse_tags,
 };
 
@@ -116,6 +116,10 @@ pub struct Model {
     /// Bumped by every edit that arms the autosave timer; a later edit makes
     /// the previous timer stale.
     pub save_revision: Signal<u64>,
+    /// Whether the version-history dialog is open, and the snapshot list it
+    /// shows. Loaded when opened, not on every keystroke.
+    pub history_open: Signal<bool>,
+    pub history_entries: Signal<Vec<Snapshot>>,
 }
 
 fn markdown_filter() -> FilePickerFilter {
@@ -646,6 +650,50 @@ impl Model {
             Ok(()) => {
                 self.notice.set_if_changed(String::new());
                 self.listing.update(|value| *value += 1);
+            }
+            Err(error) => self.notice.set(error),
+        }
+    }
+
+    // MARK: - Version history
+
+    fn refresh_history(&self) {
+        let entries = self.read(Session::snapshots).unwrap_or_default();
+        self.history_entries.set(entries);
+    }
+
+    pub fn open_history(&self) {
+        self.refresh_history();
+        self.history_open.set(true);
+    }
+
+    pub fn close_history(&self) {
+        self.history_open.set(false);
+    }
+
+    pub fn snapshot_now(&self) {
+        let text = self.current_text();
+        match self.with_session(|session| session.create_snapshot(&text)) {
+            Ok(Some(_)) => self.notice.set("已保存当前版本".to_owned()),
+            Ok(None) => self.notice.set("内容未变化，无需重复保存".to_owned()),
+            Err(error) => self.notice.set(error),
+        }
+        self.refresh_history();
+    }
+
+    pub fn restore_snapshot(&self, name: &str) {
+        let name = name.to_owned();
+        let current = self.current_text();
+        match self.with_session(|session| session.restore_snapshot(&name, &current)) {
+            Ok(text) => {
+                let length = current.chars().count();
+                // An undoable whole-document edit keeps ⌘Z working after a
+                // restore.
+                self.request_edit(0..length, text, 0, None);
+                self.notice.set("已恢复历史版本，刚才的内容也存为快照".to_owned());
+                self.refresh_history();
+                self.history_open.set(false);
+                self.bump();
             }
             Err(error) => self.notice.set(error),
         }

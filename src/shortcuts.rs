@@ -32,6 +32,7 @@ pub fn handle(event: &KeyEvent, model: &Model) -> bool {
         Scancode::N => model.new_folder_here(),
         Scancode::O if shift => model.open_library_picker(),
         Scancode::O if !shift => model.open_picker(),
+        Scancode::S if shift => model.snapshot_now(),
         Scancode::S if !shift => model.save(),
         Scancode::E if shift => model.export(),
         Scancode::E => model.format(Command::Code),

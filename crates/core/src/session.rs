@@ -22,6 +22,7 @@ use crate::library::{
     parent_of,
 };
 use crate::paths;
+use crate::snapshots;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -86,7 +87,13 @@ pub struct Session {
     /// Where the last write that found the file changed kept the user's text.
     pub conflict: Option<PathBuf>,
     pub options: ViewOptions,
+    /// Document id and last snapshot time, so autosave only snapshots when the
+    /// interval has actually elapsed instead of reading the folder per key.
+    snapshot_at: Option<(String, u64)>,
 }
+
+/// Minimum gap between automatic snapshots of one document.
+const SNAPSHOT_INTERVAL: u64 = 10 * 60;
 
 impl Session {
     pub fn load() -> Self {
@@ -115,6 +122,7 @@ impl Session {
             saved_stamp: None,
             reloads: 0,
             conflict: None,
+            snapshot_at: None,
             options: ViewOptions {
                 preview: settings.preview,
                 focus: false,
@@ -382,6 +390,57 @@ impl Session {
         self.persist_app();
     }
 
+    // MARK: - Snapshots
+
+    fn snapshot_root(&self, id: &str) -> &Path {
+        if self.library.find(id).is_some_and(|document| !document.external) {
+            &self.library.root
+        } else {
+            &self.data_root
+        }
+    }
+
+    pub fn snapshots(&self) -> Vec<snapshots::Snapshot> {
+        let Some(id) = self.active.as_deref() else {
+            return Vec::new();
+        };
+        snapshots::list(self.snapshot_root(id), id)
+    }
+
+    /// Manual snapshot of the text currently in the editor.
+    pub fn create_snapshot(&mut self, text: &str) -> Result<Option<snapshots::Snapshot>, String> {
+        let id = self
+            .active
+            .clone()
+            .ok_or_else(|| "没有打开的文档".to_owned())?;
+        let root = self.snapshot_root(&id).to_path_buf();
+        let created = snapshots::create(&root, &id, text, now()).map_err(|error| error.to_string())?;
+        if created.is_some() {
+            self.snapshot_at = Some((id, now()));
+        }
+        Ok(created)
+    }
+
+    pub fn snapshot_text(&self, name: &str) -> Option<String> {
+        let id = self.active.as_deref()?;
+        snapshots::read(self.snapshot_root(id), id, name).ok()
+    }
+
+    /// Restores a snapshot into the document. The text being replaced is
+    /// snapshotted first, so a restore is itself recoverable.
+    pub fn restore_snapshot(&mut self, name: &str, current: &str) -> Result<String, String> {
+        let id = self
+            .active
+            .clone()
+            .ok_or_else(|| "没有打开的文档".to_owned())?;
+        let root = self.snapshot_root(&id).to_path_buf();
+        let text = snapshots::read(&root, &id, name).map_err(|error| error.to_string())?;
+        let _ = snapshots::create(&root, &id, current, now());
+        self.write(&text)?;
+        self.persist();
+        Ok(text)
+    }
+
     // MARK: - Writing
 
     /// Writes every accepted edit. No debounce: quitting right after typing
@@ -417,6 +476,7 @@ impl Session {
         let written = stamp(&path);
         self.saved = text.to_owned();
         self.saved_stamp = written;
+        self.maybe_snapshot(&id, text);
         let stem = file_stem(&path);
         if let Some(meta) = self.library.meta_mut(&id) {
             let derived = derive(text, &stem, meta.auto_named);
@@ -433,6 +493,22 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn maybe_snapshot(&mut self, id: &str, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let due = match &self.snapshot_at {
+            Some((known, at)) if known == id => now() >= at.saturating_add(SNAPSHOT_INTERVAL),
+            _ => true,
+        };
+        if !due {
+            return;
+        }
+        let root = self.snapshot_root(id).to_path_buf();
+        let _ = snapshots::create(&root, id, text, now());
+        self.snapshot_at = Some((id.to_owned(), now()));
     }
 
     /// The file changed since Ruwriter read it: the user's text goes to a
@@ -493,6 +569,13 @@ impl Session {
         self.saved = read_document(&path).unwrap_or_default();
         self.saved_stamp = stamp(&path);
         self.active = Some(id.to_owned());
+        let root = self.snapshot_root(id).to_path_buf();
+        let latest = snapshots::latest_time(&root, id);
+        self.snapshot_at = Some((id.to_owned(), latest.unwrap_or(0)));
+        if latest.is_none() && !self.saved.trim().is_empty() {
+            let _ = snapshots::create(&root, id, &self.saved, now());
+            self.snapshot_at = Some((id.to_owned(), now()));
+        }
     }
 
     pub fn select(&mut self, id: &str, current: &str) -> Result<String, String> {
@@ -720,6 +803,8 @@ impl Session {
             if let Some(meta) = self.library.external.remove(id) {
                 self.library.external.insert(new_id.clone(), meta);
             }
+            let root = self.data_root.clone();
+            snapshots::move_on_rename(&root, id, &new_id);
             self.follow(id, &new_id);
             new_id
         } else {
@@ -987,6 +1072,8 @@ impl Session {
             .id_for(to)
             .ok_or_else(|| "目标不在资料库中".to_owned())?;
         self.library.rekey(id, &new_id);
+        let root = self.library.root.clone();
+        snapshots::move_on_rename(&root, id, &new_id);
         self.follow(id, &new_id);
         self.library.scan();
         Ok(new_id)

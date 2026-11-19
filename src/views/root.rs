@@ -22,6 +22,7 @@ use cove_ui::watch::{DirectoryWatcher, WatchOptions};
 use ruwriter_core::{Session, count};
 
 use super::editor::EditorPane;
+use super::history::HistoryDialog;
 use super::info::InfoDialog;
 use super::list::ListPane;
 use super::outline::OutlinePane;
@@ -134,6 +135,8 @@ impl View for RootView {
             settings_revision: cx.state(|| 0),
             pending_save: cx.state(|| None),
             save_revision: cx.state(|| 0),
+            history_open: cx.state(|| false),
+            history_entries: cx.state(Vec::new),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file
@@ -273,6 +276,9 @@ impl View for RootView {
                     model: model.clone(),
                 }),
                 AnyView::new(InfoDialog {
+                    model: model.clone(),
+                }),
+                AnyView::new(HistoryDialog {
                     model: model.clone(),
                 }),
             ],

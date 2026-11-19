@@ -2,6 +2,7 @@
 //! the views that show what it changed.
 
 mod editor;
+mod history;
 mod info;
 mod list;
 mod outline;

@@ -105,6 +105,11 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
             NativeMenuItem::Separator,
             item(action(model, "保存", Model::save), Some(primary("s"))),
             item(
+                action(model, "保存快照", Model::snapshot_now),
+                Some(primary_shift("s")),
+            ),
+            item(action(model, "历史版本…", Model::open_history), None),
+            item(
                 action(
                     model,
                     if markdown {
