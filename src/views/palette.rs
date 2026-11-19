@@ -59,7 +59,33 @@ impl View for Palette {
                 "synopsis", "status", "tag", "tags", "gaojian", "zhuyao", "biaoti",
             ]),
             command(
-                "导出 Markdown…",
+                if model.writing_mode() == ruwriter_core::WritingMode::Novel {
+                    "切换为 Markdown 模式"
+                } else {
+                    "切换为小说模式（纯文本）"
+                },
+                "写作模式",
+                icons::text::type_(),
+                Rc::new(Model::toggle_writing_mode),
+            )
+            .keywords(["novel", "markdown", "xiaoshuo", "moshi", "mode"]),
+            command(
+                if model.paragraph_indent() {
+                    "关闭段首缩进"
+                } else {
+                    "开启段首缩进"
+                },
+                "排版",
+                icons::text::type_(),
+                Rc::new(Model::toggle_paragraph_indent),
+            )
+            .keywords(["indent", "suojin", "duanshou", "paragraph"]),
+            command(
+                if model.writing_mode() == ruwriter_core::WritingMode::Novel {
+                    "导出文稿…"
+                } else {
+                    "导出 Markdown…"
+                },
                 "文稿",
                 icons::action::share(),
                 Rc::new(Model::export),

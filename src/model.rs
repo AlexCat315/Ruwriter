@@ -21,7 +21,8 @@ use cove_ui::compose::primitives::text::text_field::{
 use cove_ui::composition::Scancode;
 use cove_ui::core::Signal;
 use cove_ui::core::scene::{
-    FilePicker, FilePickerFilter, FileSaveOutcome, FileSaveRequest, FileSaver,
+    AnimatorScheduler, AnyAnimationController, FilePicker, FilePickerFilter, FileSaveOutcome,
+    FileSaveRequest, FileSaver, wake_scene_thread,
 };
 use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
@@ -31,6 +32,12 @@ use ruwriter_core::{
 };
 
 use crate::formatting::{self, Command};
+
+/// Documents longer than this save on a pause instead of on every keystroke;
+/// rewriting a 200k-character file per key is what makes typing stutter.
+const LARGE_DOCUMENT: usize = 40_000;
+/// Quiet period before that write, in seconds.
+const AUTOSAVE_DELAY: f64 = 0.3;
 
 /// What the rename dialog is renaming.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +107,15 @@ pub struct Model {
     pub info_synopsis: Signal<TextBuffer>,
     pub info_tags: Signal<TextBuffer>,
     pub info_status: Signal<DocStatus>,
+    /// Bumped when a setting that changes the editor's look changed, so the
+    /// field re-styles without being rebuilt (rebuilding would lose the
+    /// caret and undo history).
+    pub settings_revision: Signal<u64>,
+    /// Text waiting for the debounced autosave of a long document.
+    pub pending_save: Signal<Option<String>>,
+    /// Bumped by every edit that arms the autosave timer; a later edit makes
+    /// the previous timer stale.
+    pub save_revision: Signal<u64>,
 }
 
 fn markdown_filter() -> FilePickerFilter {
@@ -107,6 +123,10 @@ fn markdown_filter() -> FilePickerFilter {
         "Markdown / 文本",
         ["md".to_owned(), "markdown".to_owned(), "txt".to_owned()],
     )
+}
+
+fn text_filter() -> FilePickerFilter {
+    FilePickerFilter::new("文本文件", ["txt".to_owned()])
 }
 
 impl Model {
@@ -147,6 +167,7 @@ impl Model {
     /// Runs a structural operation, reloading the editor when it opened
     /// another document or the file's text replaced it.
     fn structural(&self, action: impl FnOnce(&mut Session, &str) -> Result<(), String>) {
+        self.pending_save.set(None);
         let before = self.editor_identity();
         let current = self.current_text();
         match self.with_session(|session| action(session, &current)) {
@@ -196,13 +217,65 @@ impl Model {
         self.document.update(|value| *value += 1);
     }
 
+    // MARK: - Writing mode
+
+    pub fn writing_mode(&self) -> ruwriter_core::WritingMode {
+        self.settings().writing_mode
+    }
+
+    pub fn set_writing_mode(&self, mode: ruwriter_core::WritingMode) {
+        let _ = self.with_session(|session| {
+            session.set_writing_mode(mode);
+            Ok(())
+        });
+        self.settings_revision.update(|value| *value += 1);
+        self.listing.update(|value| *value += 1);
+    }
+
+    pub fn toggle_writing_mode(&self) {
+        let mode = match self.writing_mode() {
+            ruwriter_core::WritingMode::Novel => ruwriter_core::WritingMode::Markdown,
+            ruwriter_core::WritingMode::Markdown => ruwriter_core::WritingMode::Novel,
+        };
+        self.set_writing_mode(mode);
+    }
+
+    pub fn paragraph_indent(&self) -> bool {
+        self.settings().paragraph_indent
+    }
+
+    pub fn toggle_paragraph_indent(&self) {
+        let _ = self.with_session(|session| {
+            session.toggle_paragraph_indent();
+            Ok(())
+        });
+        self.settings_revision.update(|value| *value += 1);
+    }
+
     // MARK: - Editing
 
     /// Called by the editor after every accepted edit.
     pub fn on_change(&self, buffer: &TextBuffer) {
         let text = buffer.string_value();
-        self.stats.set_if_changed(count(&text));
+        let counted = count(&text);
+        let characters = counted.characters;
+        self.stats.set_if_changed(counted);
         self.preview.set_if_changed(text.clone());
+        if characters > LARGE_DOCUMENT {
+            // Writing a long manuscript: writing the whole file on every
+            // keystroke costs more than the keystroke itself. Save once the
+            // author pauses; blur and explicit save still write immediately.
+            self.pending_save.set(Some(text));
+            self.save_revision.update(|value| *value += 1);
+            self.schedule_save();
+            return;
+        }
+        self.pending_save.set(None);
+        self.write_text(text);
+    }
+
+    /// Writes the text and refreshes what depends on it.
+    fn write_text(&self, text: String) {
         match self.with_session(|session| session.autosave(&text)) {
             Ok(()) => {
                 if self.report_conflict() {
@@ -221,6 +294,34 @@ impl Model {
         }
     }
 
+    /// Writes the text the debounce has been holding, if any.
+    fn flush_to_disk(&self) {
+        let Some(text) = self.pending_save.get_untracked() else {
+            return;
+        };
+        self.pending_save.set(None);
+        self.write_text(text);
+    }
+
+    fn schedule_save(&self) {
+        let model = self.clone();
+        let revision = self.save_revision.get_untracked();
+        let validity = {
+            let model = model.clone();
+            move || {
+                model.save_revision.get_untracked() == revision
+                    && model.pending_save.get_untracked().is_some()
+            }
+        };
+        let timer = AutosaveTimer {
+            remaining: std::cell::Cell::new(AUTOSAVE_DELAY),
+            valid: Box::new(validity),
+            action: RefCell::new(Some(Box::new(move || model.flush_to_disk()))),
+        };
+        AnimatorScheduler::current().register(Rc::new(timer));
+        wake_scene_thread();
+    }
+
     /// The editor reports its caret and selection after every move.
     pub fn on_caret(&self, state: TextFieldCaretState) {
         self.caret.set_if_changed(state);
@@ -230,6 +331,11 @@ impl Model {
     /// selection. The edit goes through the field's undoable edit request, so
     /// Ctrl+Z steps back over it and the selection survives the wrap.
     pub fn format(&self, command: Command) {
+        // Novel mode is plain text: inserting `**` or `#` would put markup
+        // into the manuscript. Formatting is a Markdown-mode tool.
+        if self.writing_mode() == ruwriter_core::WritingMode::Novel {
+            return;
+        }
         let buffer = self.buffer.get_untracked();
         let state = self.caret.get_untracked();
         let len = buffer.character_count();
@@ -534,6 +640,7 @@ impl Model {
     }
 
     pub fn save(&self) {
+        self.pending_save.set(None);
         let text = self.current_text();
         match self.with_session(|session| session.save(&text)) {
             Ok(()) => {
@@ -615,10 +722,16 @@ impl Model {
             return;
         };
         let notice = self.notice;
+        let novel = self.writing_mode() == ruwriter_core::WritingMode::Novel;
+        let (suffix, filter) = if novel {
+            ("txt", text_filter())
+        } else {
+            ("md", markdown_filter())
+        };
         FileSaver::request(
             FileSaveRequest {
-                suggested_name: format!("{}.md", file_name_for(&title)),
-                filters: vec![markdown_filter()],
+                suggested_name: format!("{}.{suffix}", file_name_for(&title)),
+                filters: vec![filter],
                 contents: text.into_bytes(),
             },
             Box::new(move |outcome| match outcome {
@@ -928,5 +1041,46 @@ impl Model {
     pub fn active_document(&self) -> Option<Document> {
         self.read(|session| session.active_document().cloned())
             .flatten()
+    }
+}
+
+/// One-shot scene timer that writes a long document once typing pauses.
+struct AutosaveTimer {
+    remaining: std::cell::Cell<f64>,
+    valid: Box<dyn Fn() -> bool>,
+    action: RefCell<Option<Box<dyn FnOnce()>>>,
+}
+
+impl AnyAnimationController for AutosaveTimer {
+    fn is_finished(&self) -> bool {
+        self.action.borrow().is_none() || !(self.valid)()
+    }
+
+    fn tick(&self, delta_time: f64) {
+        if self.is_finished() {
+            self.action.borrow_mut().take();
+            return;
+        }
+        self.remaining.set(self.remaining.get() - delta_time);
+        if self.remaining.get() <= 0.0 {
+            self.finish_immediately();
+        }
+    }
+
+    fn finish_immediately(&self) {
+        let action = self.action.borrow_mut().take();
+        if (self.valid)()
+            && let Some(action) = action
+        {
+            action();
+        }
+    }
+
+    fn cancel(&self) {
+        self.action.borrow_mut().take();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

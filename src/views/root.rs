@@ -131,6 +131,9 @@ impl View for RootView {
             info_synopsis: cx.state(TextBuffer::empty),
             info_tags: cx.state(TextBuffer::empty),
             info_status: cx.state(ruwriter_core::DocStatus::default),
+            settings_revision: cx.state(|| 0),
+            pending_save: cx.state(|| None),
+            save_revision: cx.state(|| 0),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file

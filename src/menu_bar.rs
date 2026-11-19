@@ -28,6 +28,8 @@ type MenuKey = (
     Collection,
     bool,
     bool,
+    ruwriter_core::WritingMode,
+    bool,
 );
 
 pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
@@ -42,6 +44,8 @@ pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
         settings.collection,
         pinned,
         settings.markdown_syntax,
+        settings.writing_mode,
+        settings.paragraph_indent,
     );
     if installed.borrow().as_ref() == Some(&key) {
         return;
@@ -80,7 +84,8 @@ fn item(
 }
 
 fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
-    let (preview, focus, sidebar, appearance, collection, pinned, syntax) = key;
+    let (preview, focus, sidebar, appearance, collection, pinned, syntax, writing, indent) = key;
+    let markdown = writing == ruwriter_core::WritingMode::Markdown;
     let file = NativeMenu::new(
         "文件",
         vec![
@@ -100,7 +105,15 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
             NativeMenuItem::Separator,
             item(action(model, "保存", Model::save), Some(primary("s"))),
             item(
-                action(model, "导出 Markdown…", Model::export),
+                action(
+                    model,
+                    if markdown {
+                        "导出 Markdown…"
+                    } else {
+                        "导出文稿…"
+                    },
+                    Model::export,
+                ),
                 Some(primary_shift("e")),
             ),
             NativeMenuItem::Separator,
@@ -221,6 +234,14 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
             ),
             item(
                 action(model, "Markdown 高亮", Model::toggle_syntax).with_selected(syntax),
+                None,
+            ),
+            item(
+                action(model, "Markdown 模式", Model::toggle_writing_mode).with_selected(markdown),
+                None,
+            ),
+            item(
+                action(model, "段首缩进", Model::toggle_paragraph_indent).with_selected(indent),
                 None,
             ),
             NativeMenuItem::Separator,

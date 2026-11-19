@@ -71,9 +71,15 @@ impl View for OutlinePane {
                                 .semantic_foreground(SemanticColorRef::on_surface_muted()),
                         ),
                         AnyView::new(
-                            Text::new("用 # 或 ## 标记章节")
-                                .semantic_font(SemanticFontRef::caption())
-                                .semantic_foreground(SemanticColorRef::on_surface_muted()),
+                            Text::new(
+                                if self.model.writing_mode() == ruwriter_core::WritingMode::Novel {
+                                    "另起一行写「第一章 雨夜」"
+                                } else {
+                                    "用 # 或 ## 标记章节"
+                                },
+                            )
+                            .semantic_font(SemanticFontRef::caption())
+                            .semantic_foreground(SemanticColorRef::on_surface_muted()),
                         ),
                     ],
                 )

@@ -10,7 +10,9 @@ pub mod session;
 pub mod stats;
 
 pub use document::{DocStatus, Document, normalize_tags, parse_tags, title_from_text};
-pub use library::{AppearancePreference, Collection, Folder, Library, Settings, SortOrder};
-pub use outline::{Heading, heading_at, headings};
+pub use library::{
+    AppearancePreference, Collection, Folder, Library, Settings, SortOrder, WritingMode,
+};
+pub use outline::{Heading, heading_at, headings, is_chapter_line};
 pub use session::{Rescan, Session, ViewOptions};
 pub use stats::{WritingStats, count};

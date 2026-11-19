@@ -1,8 +1,10 @@
 //! Heading extraction for the outline pane and the command palette.
 //!
-//! Only ATX headings (`#` … `######`) count. Lines inside fenced code blocks,
-//! indented code blocks and escaped hashes are left alone: a `#` in a shell
-//! snippet is not a chapter title.
+//! Two kinds of lines count: ATX headings (`#` … `######`) and the chapter
+//! lines Chinese prose writers type without any markup (`第一章 雨夜`,
+//! `楔子`, `尾声`). Lines inside fenced code blocks, indented code blocks
+//! and escaped hashes are left alone: a `#` in a shell snippet is not a
+//! chapter title.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +52,16 @@ pub fn headings(text: &str) -> Vec<Heading> {
             }
         }
 
+        if let Some((level, title)) = chapter_line(rest.trim()) {
+            out.push(Heading {
+                offset,
+                level,
+                title: title.to_owned(),
+            });
+            offset += line.chars().count() + 1;
+            continue;
+        }
+
         // Four spaces indent the line as code; a heading cannot start there.
         if indent <= 3 {
             let hashes = rest.chars().take_while(|&c| c == '#').count();
@@ -72,6 +84,70 @@ pub fn headings(text: &str) -> Vec<Heading> {
         offset += line.chars().count() + 1;
     }
     out
+}
+
+/// A chapter line as novelists write it: `第3章 雨夜`, `第十二回 重逢`,
+/// `楔子`, `尾声`, `番外 其一`. Prose that merely starts with 第… is
+/// rejected by length and by sentence punctuation.
+/// True when the line is a Chinese chapter marker such as「第一章 雨夜」.
+/// The editor keeps these flush instead of indenting them like a paragraph.
+pub fn is_chapter_line(line: &str) -> bool {
+    chapter_line(line).is_some()
+}
+
+fn chapter_line(line: &str) -> Option<(u8, &str)> {
+    let count = line.chars().count();
+    if count == 0 || count > 30 {
+        return None;
+    }
+    if line.ends_with(['。', '！', '？', '；', '，', '：']) {
+        return None;
+    }
+    const SPECIAL: [&str; 7] = ["序章", "楔子", "引子", "尾声", "后记", "番外", "序言"];
+    if SPECIAL.iter().any(|prefix| line.starts_with(prefix)) {
+        return Some((1, line));
+    }
+    if !line.starts_with('第') {
+        return None;
+    }
+    let mut numerals = 0_usize;
+    let mut unit = None;
+    for character in line.chars().skip(1) {
+        match character {
+            '0'..='9'
+            | '零'
+            | '〇'
+            | '一'
+            | '二'
+            | '三'
+            | '四'
+            | '五'
+            | '六'
+            | '七'
+            | '八'
+            | '九'
+            | '十'
+            | '百'
+            | '千'
+            | '万'
+            | '两' => numerals += 1,
+            '卷' | '部' | '篇' | '章' | '节' | '回' | '话' => {
+                unit = Some(character);
+                break;
+            }
+            _ => return None,
+        }
+    }
+    let unit = unit?;
+    if numerals == 0 {
+        return None;
+    }
+    let level = if matches!(unit, '卷' | '部' | '篇') {
+        1
+    } else {
+        2
+    };
+    Some((level, line))
 }
 
 /// The heading whose section contains `caret` (character offset).

@@ -18,7 +18,8 @@ use crate::document::{
 };
 use crate::files::{Stamp, move_path, read_document, stamp, unique_path, write_document};
 use crate::library::{
-    AppearancePreference, Collection, Library, Meta, Settings, SortOrder, name_of, parent_of,
+    AppearancePreference, Collection, Library, Meta, Settings, SortOrder, WritingMode, name_of,
+    parent_of,
 };
 use crate::paths;
 use serde::{Deserialize, Serialize};
@@ -176,7 +177,7 @@ impl Session {
                 let destination = unique_path(
                     &self.library.trash_path(),
                     &file_stem(&document.path),
-                    DOCUMENT_EXTENSION,
+                    &extension(&document.path),
                     None,
                 );
                 if move_path(&document.path, &destination).is_ok()
@@ -264,6 +265,20 @@ impl Session {
         paths
             .iter()
             .any(|path| active.as_ref() != Some(path) || stamp(path) != self.saved_stamp)
+    }
+
+    pub fn writing_mode(&self) -> WritingMode {
+        self.app.settings.writing_mode
+    }
+
+    pub fn set_writing_mode(&mut self, mode: WritingMode) {
+        self.app.settings.writing_mode = mode;
+        self.persist_app();
+    }
+
+    pub fn toggle_paragraph_indent(&mut self) {
+        self.app.settings.paragraph_indent = !self.app.settings.paragraph_indent;
+        self.persist_app();
     }
 
     // MARK: - View settings
@@ -428,7 +443,7 @@ impl Session {
         let copy = unique_path(
             &directory,
             &format!("{} 冲突副本", file_stem(path)),
-            DOCUMENT_EXTENSION,
+            &extension(path),
             None,
         );
         write_document(&copy, text).map_err(|error| error.to_string())?;
@@ -463,7 +478,7 @@ impl Session {
         let target = unique_path(
             &directory,
             &file_name_for(&document.title),
-            DOCUMENT_EXTENSION,
+            &extension(&document.path),
             Some(&document.path),
         );
         if target != document.path {
@@ -513,7 +528,8 @@ impl Session {
 
     fn activate_new(&mut self, folder: &str) -> Result<(), String> {
         let directory = self.folder_path(folder);
-        let path = unique_path(&directory, UNTITLED, DOCUMENT_EXTENSION, None);
+        let extension = self.app.settings.writing_mode.extension();
+        let path = unique_path(&directory, UNTITLED, extension, None);
         write_document(&path, "").map_err(|error| error.to_string())?;
         let id = self
             .library

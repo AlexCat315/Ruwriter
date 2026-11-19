@@ -13,7 +13,8 @@ use cove_ui::compose::primitives::text::text_field::{
     TextFieldCodeEditing, TextFieldContentPadding, TextFieldDecoration, TextFieldNavigationRequest,
 };
 use cove_ui::compose::primitives::text::{
-    Divider, MarkdownView, Text, TextField, TextFieldAxis, TextFieldEvents, TextFieldLayout,
+    Divider, MarkdownView, Text, TextField, TextFieldAxis, TextFieldEvents, TextFieldIndentSkip,
+    TextFieldLayout,
 };
 use cove_ui::compose::theme::styles::components::text_field_style::AnyTextFieldStyle;
 use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
@@ -27,7 +28,7 @@ use super::ui::{ProseFieldStyle, full_size, hstack, icon_button, spacer, vstack}
 use crate::formatting::Command;
 use crate::markdown_syntax;
 use crate::model::Model;
-use crate::theme::{Mode, SyntaxColors, editor_font, measure};
+use crate::theme::{Mode, SyntaxColors, editor_font, measure, novel_font};
 
 type Action = Rc<dyn Fn(&Model)>;
 
@@ -47,8 +48,10 @@ pub struct EditorPane {
 impl View for EditorPane {
     fn body(&self, _cx: &Scope) -> AnyView {
         let _ = self.model.revision.get();
+        let _ = self.model.settings_revision.get();
         let options = self.model.options();
-        let font_size = self.model.settings().font_size;
+        let settings = self.model.settings();
+        let font_size = settings.font_size;
         let split = options.preview && self.layout.editor_width >= SPLIT_WIDTH;
         let pane_width = if split {
             (self.layout.editor_width - 1.0) / 2.0
@@ -181,7 +184,7 @@ impl EditorPane {
         ));
 
         let mut children = leading;
-        if !options.focus {
+        if !options.focus && self.model.writing_mode() != ruwriter_core::WritingMode::Novel {
             children.extend(self.formatting_controls());
         }
         children.push(spacer());
@@ -330,11 +333,13 @@ impl View for EditorField {
         let caret = self.model.clone();
         let keys = self.model.clone();
         let colors = SyntaxColors::for_theme(&self.mode.theme());
+        let settings = self.model.settings();
+        let novel = settings.writing_mode == ruwriter_core::WritingMode::Novel;
         let mut code = TextFieldCodeEditing {
             occurrences: self.find_occurrences(),
             ..Default::default()
         };
-        if self.model.settings().markdown_syntax {
+        if settings.markdown_syntax && !novel {
             code.syntax_color_at_utf8_offset = Some(markdown_syntax::highlighter(colors));
         }
         let mut field = TextField::new("开始写作…", self.model.buffer.binding())
@@ -342,6 +347,16 @@ impl View for EditorField {
                 axis: TextFieldAxis::Vertical,
                 max_visible_lines: 400,
                 wraps_lines: true,
+                first_line_indent: if novel && settings.paragraph_indent {
+                    f32::from(self.font_size) * 2.0
+                } else {
+                    0.0
+                },
+                first_line_indent_skip: if novel {
+                    TextFieldIndentSkip::new(ruwriter_core::is_chapter_line)
+                } else {
+                    TextFieldIndentSkip::default()
+                },
                 ..Default::default()
             })
             .decoration(TextFieldDecoration {
@@ -362,7 +377,11 @@ impl View for EditorField {
         AnyView::new(
             full_size(
                 AnyView::new(field)
-                    .semantic_font(editor_font(self.font_size))
+                    .semantic_font(if novel {
+                        novel_font(self.font_size)
+                    } else {
+                        editor_font(self.font_size)
+                    })
                     .debug_name("editor"),
             )
             .id(("editor", document)),
@@ -543,7 +562,11 @@ impl View for StatusLine {
                 }
             }
             let mut summary = format!("{} 字", stats.characters);
-            if stats.words != stats.characters {
+            // Chinese prose is measured in characters; the word split only
+            // helps Latin text, so novel mode leaves it out.
+            if stats.words != stats.characters
+                && self.model.writing_mode() != ruwriter_core::WritingMode::Novel
+            {
                 summary.push_str(&format!(" · {} 词", stats.words));
             }
             if stats.reading_minutes > 0 {

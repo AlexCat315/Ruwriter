@@ -17,7 +17,7 @@ fn first_launch_creates_one_blank_document() {
     assert_eq!(session.documents().len(), 1);
     assert_eq!(session.text(), "");
     assert_eq!(session.title(), "未命名");
-    assert!(library(&session).join("未命名.md").exists());
+    assert!(library(&session).join("未命名.txt").exists());
 }
 
 #[test]
@@ -29,9 +29,9 @@ fn autosave_persists_edits_and_save_names_the_file() {
     assert_eq!(session.title(), "章节");
     session.save("# 章节\n\n正文").expect("save");
     let path = active_path(&session);
-    assert_eq!(path.file_name().unwrap(), "章节.md");
+    assert_eq!(path.file_name().unwrap(), "章节.txt");
     assert_eq!(read_document(&path).unwrap(), "# 章节\n\n正文");
-    assert_eq!(session.active_id().as_deref(), Some("章节.md"));
+    assert_eq!(session.active_id().as_deref(), Some("章节.txt"));
 }
 
 #[test]
@@ -66,7 +66,7 @@ fn new_documents_go_into_the_selected_folder() {
     let folder = session.create_folder("", "小说").expect("folder");
     session.set_folder(&folder);
     session.create("").expect("create");
-    assert_eq!(session.active_id().as_deref(), Some("小说/未命名.md"));
+    assert_eq!(session.active_id().as_deref(), Some("小说/未命名.txt"));
     assert_eq!(session.list("").len(), 1);
 }
 
@@ -98,17 +98,17 @@ fn trashing_moves_files_and_restoring_puts_them_back() {
     session.create("").expect("create");
     session.save("# 一").expect("save");
     let id = session.active_id().unwrap();
-    assert_eq!(id, "草稿/一.md");
+    assert_eq!(id, "草稿/一.txt");
 
     session.trash(&id, "# 一").expect("trash");
-    assert!(!library(&session).join("草稿/一.md").exists());
-    assert!(library(&session).join(".trash/一.md").exists());
+    assert!(!library(&session).join("草稿/一.txt").exists());
+    assert!(library(&session).join(".trash/一.txt").exists());
     assert_eq!(session.count(Collection::Trash), 1);
-    assert_ne!(session.active_id().as_deref(), Some(".trash/一.md"));
+    assert_ne!(session.active_id().as_deref(), Some(".trash/一.txt"));
 
-    let restored = session.restore(".trash/一.md").expect("restore");
-    assert_eq!(restored, "草稿/一.md");
-    assert!(library(&session).join("草稿/一.md").exists());
+    let restored = session.restore(".trash/一.txt").expect("restore");
+    assert_eq!(restored, "草稿/一.txt");
+    assert!(library(&session).join("草稿/一.txt").exists());
 }
 
 #[test]
@@ -171,20 +171,20 @@ fn folders_rename_move_and_carry_their_documents() {
     session.set_folder(&part);
     session.create("").expect("create");
     session.save("# 开端").expect("save");
-    assert_eq!(session.active_id().as_deref(), Some("书/第一卷/开端.md"));
+    assert_eq!(session.active_id().as_deref(), Some("书/第一卷/开端.txt"));
 
     let renamed = session
         .rename_folder(&book, "长篇", "# 开端")
         .expect("rename");
     assert_eq!(renamed, "长篇");
-    assert_eq!(session.active_id().as_deref(), Some("长篇/第一卷/开端.md"));
+    assert_eq!(session.active_id().as_deref(), Some("长篇/第一卷/开端.txt"));
     assert_eq!(session.settings().folder.as_deref(), Some("长篇/第一卷"));
 
     let moved = session
         .move_folder("长篇/第一卷", "", None, "# 开端")
         .expect("move");
     assert_eq!(moved, "第一卷");
-    assert_eq!(session.active_id().as_deref(), Some("第一卷/开端.md"));
+    assert_eq!(session.active_id().as_deref(), Some("第一卷/开端.txt"));
     assert!(
         session.move_folder("长篇", "长篇", None, "").is_err(),
         "a folder cannot contain itself"
@@ -198,10 +198,10 @@ fn moving_a_document_between_folders() {
     session.save("# 便签").expect("save");
     let notes = session.create_folder("", "笔记").expect("folder");
     session
-        .move_document("便签.md", &notes, "# 便签")
+        .move_document("便签.txt", &notes, "# 便签")
         .expect("move");
-    assert_eq!(session.active_id().as_deref(), Some("笔记/便签.md"));
-    assert!(library(&session).join("笔记/便签.md").exists());
+    assert_eq!(session.active_id().as_deref(), Some("笔记/便签.txt"));
+    assert!(library(&session).join("笔记/便签.txt").exists());
 }
 
 #[test]
@@ -218,8 +218,8 @@ fn trashed_folders_restore_document_by_document() {
     assert!(session.library.folders.is_empty());
     assert_eq!(session.settings().folder, None);
     assert_eq!(session.count(Collection::Trash), 1);
-    let restored = session.restore(".trash/旧稿/片段.md").expect("restore");
-    assert_eq!(restored, "旧稿/片段.md");
+    let restored = session.restore(".trash/旧稿/片段.txt").expect("restore");
+    assert_eq!(restored, "旧稿/片段.txt");
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn sort_choice_orders_rows_and_survives_reload() {
     let titles: Vec<String> = session.list("").into_iter().map(|d| d.title).collect();
     assert_eq!(titles, ["甲", "丙", "乙"]);
 
-    session.set_pinned("乙.md", true).expect("pin");
+    session.set_pinned("乙.txt", true).expect("pin");
     let titles: Vec<String> = session.list("").into_iter().map(|d| d.title).collect();
     assert_eq!(titles, ["乙", "甲", "丙"]);
 

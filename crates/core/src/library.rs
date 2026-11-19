@@ -88,6 +88,35 @@ pub enum AppearancePreference {
     Dark,
 }
 
+/// What kind of document the author is writing.
+///
+/// `Novel` is plain prose: new drafts are `.txt`, the editor shows no markup,
+/// and chapter lines such as `第一章 雨夜` are the structure. `Markdown` keeps
+/// the syntax-coloured Markdown editor and `.md` drafts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WritingMode {
+    #[default]
+    Novel,
+    Markdown,
+}
+
+impl WritingMode {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Novel => "小说",
+            Self::Markdown => "Markdown",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Novel => "txt",
+            Self::Markdown => "md",
+        }
+    }
+}
+
 /// Window layout and appearance the user chose, restored on launch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -102,6 +131,10 @@ pub struct Settings {
     pub font_size: u8,
     /// Row order in the document list.
     pub sort: SortOrder,
+    /// Novel writing mode or the Markdown editor.
+    pub writing_mode: WritingMode,
+    /// Indent the first row of each paragraph, as novels and Chinese prose do.
+    pub paragraph_indent: bool,
     /// Colour Markdown syntax in the editor; off for plain prose writing.
     pub markdown_syntax: bool,
     /// Show the outline pane beside the editor on wide windows.
@@ -118,6 +151,8 @@ impl Default for Settings {
             folder: None,
             font_size: 17,
             sort: SortOrder::Edited,
+            writing_mode: WritingMode::Novel,
+            paragraph_indent: true,
             markdown_syntax: true,
             outline: true,
         }

@@ -56,3 +56,30 @@ fn finds_the_section_that_holds_the_caret() {
     assert_eq!(heading_at(&heads, 5), Some(0));
     assert_eq!(heading_at(&heads, heads[1].offset + 2), Some(1));
 }
+
+#[test]
+fn reads_chinese_chapter_lines_without_markup() {
+    let text = "第一卷 旧城\n\n第一章 雨夜\n\n雨落在旧城。\n\n第十二回 重逢\n\n尾声\n";
+    let heads = headings(text);
+    assert_eq!(levels(&heads), vec![1, 2, 2, 1]);
+    assert_eq!(
+        heads.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(),
+        vec!["第一卷 旧城", "第一章 雨夜", "第十二回 重逢", "尾声"]
+    );
+}
+
+#[test]
+fn prose_that_starts_like_a_chapter_is_not_a_heading() {
+    let text = "第三章讲的是他离开以后发生的事情，那一年冬天特别冷。\n第二天他没有来。\n第一章\n";
+    let heads = headings(text);
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].title, "第一章");
+}
+
+#[test]
+fn chapter_lines_inside_code_are_ignored() {
+    let text = "```\n第一章 假的\n```\n第一章 真的\n";
+    let heads = headings(text);
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].title, "第一章 真的");
+}

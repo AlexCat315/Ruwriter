@@ -134,6 +134,29 @@ pub fn measure(size: u8) -> f32 {
     f32::from(size) * 40.0
 }
 
+/// Serif family for manuscript prose, where the platform has one. Missing
+/// families fall back to the system face.
+#[cfg(target_os = "macos")]
+const SERIF_FAMILY: Option<&str> = Some("Songti SC");
+#[cfg(target_os = "windows")]
+const SERIF_FAMILY: Option<&str> = Some("SimSun");
+#[cfg(all(unix, not(target_os = "macos")))]
+const SERIF_FAMILY: Option<&str> = Some("Noto Serif CJK SC");
+#[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
+const SERIF_FAMILY: Option<&str> = None;
+
+/// Novel mode: a serif face with roomier lines. The glyphs stay plain text;
+/// no markup is coloured or shown beyond what the author typed.
+pub fn novel_font(size: u8) -> SemanticFontRef {
+    let size = f32::from(size);
+    SemanticFontRef::new(move |_| {
+        let font = SERIF_FAMILY
+            .map(|family| Font::named(family, size, FontWeight::Regular))
+            .unwrap_or_else(|| Font::system(size, FontWeight::Regular));
+        TextStyleToken::new(font, (size * 2.0).round(), 0.0)
+    })
+}
+
 /// Syntax colors for Markdown marks in the editor.
 #[derive(Clone, Copy)]
 pub struct SyntaxColors {
