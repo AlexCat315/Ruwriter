@@ -347,9 +347,9 @@ fn row(
         )));
     }
     let mut lines = vec![hstack(6.0, Align::Center, title_line)];
-    if !document.excerpt.is_empty() {
+    if !document.summary().is_empty() {
         lines.push(AnyView::new(
-            Text::new(document.excerpt.clone())
+            Text::new(document.summary().to_owned())
                 .line_limit(Some(2))
                 .semantic_font(SemanticFontRef::caption())
                 .semantic_foreground(SemanticColorRef::on_surface_variant()),
@@ -365,6 +365,20 @@ fn row(
         None
     };
     let mut meta = String::new();
+    if !document.trashed {
+        meta.push_str(document.status.title());
+        if !document.tags.is_empty() {
+            meta.push_str(" · ");
+            for (index, tag) in document.tags.iter().enumerate() {
+                if index > 0 {
+                    meta.push(' ');
+                }
+                meta.push('#');
+                meta.push_str(tag);
+            }
+        }
+        meta.push_str(" · ");
+    }
     if let Some(name) = folder_name {
         meta.push_str(&name);
         meta.push_str(" · ");
@@ -419,11 +433,13 @@ fn row_menu(model: &Model, document: &Document, collection: Collection) -> Vec<M
         ];
     }
     let pin = model.clone();
+    let info = model.clone();
     let open = model.clone();
     let export = model.clone();
     let trash = model.clone();
     let pinned = document.pinned;
     let pin_id = id.clone();
+    let info_id = id.clone();
     let open_id = id.clone();
     let export_id = id.clone();
     let mut entries = vec![
@@ -433,6 +449,9 @@ fn row_menu(model: &Model, document: &Document, collection: Collection) -> Vec<M
             if pinned { "取消置顶" } else { "置顶" },
             move || pin.set_pinned(&pin_id, !pinned),
         )),
+        MenuEntry::Item(MenuItem::new(9, "文稿信息…", move || {
+            info.begin_edit_info(&info_id)
+        })),
         MenuEntry::Item(MenuItem::new(3, "导出…", move || {
             export.select(&export_id);
             export.export();

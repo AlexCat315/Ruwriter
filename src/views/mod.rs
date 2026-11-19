@@ -2,6 +2,7 @@
 //! the views that show what it changed.
 
 mod editor;
+mod info;
 mod list;
 mod palette;
 mod rename;

@@ -104,6 +104,7 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                 Some(primary_shift("e")),
             ),
             NativeMenuItem::Separator,
+            item(action(model, "文稿信息…", Model::edit_active_info), None),
             item(
                 action(
                     model,

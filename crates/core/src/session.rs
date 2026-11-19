@@ -13,7 +13,8 @@
 //! file changed since it was read keeps both versions instead of overwriting.
 
 use crate::document::{
-    DOCUMENT_EXTENSION, Document, UNTITLED, derive, file_name_for, file_stem, now,
+    DOCUMENT_EXTENSION, DocStatus, Document, UNTITLED, derive, file_name_for, file_stem,
+    normalize_tags, now,
 };
 use crate::files::{Stamp, move_path, read_document, stamp, unique_path, write_document};
 use crate::library::{
@@ -621,6 +622,33 @@ impl Session {
         meta.pinned = pinned;
         if let Some(document) = self.library.documents.iter_mut().find(|d| d.id == id) {
             document.pinned = pinned;
+        }
+        self.persist();
+        Ok(())
+    }
+
+    /// Replaces the author's metadata for a document. The text on disk is
+    /// never touched: synopsis, status and tags live in the library state.
+    pub fn set_metadata(
+        &mut self,
+        id: &str,
+        synopsis: &str,
+        status: DocStatus,
+        tags: &[String],
+    ) -> Result<(), String> {
+        let tags = normalize_tags(tags);
+        let synopsis = synopsis.trim().to_owned();
+        let meta = self
+            .library
+            .meta_mut(id)
+            .ok_or_else(|| "文档不存在".to_owned())?;
+        meta.synopsis = synopsis.clone();
+        meta.status = status;
+        meta.tags = tags.clone();
+        if let Some(document) = self.library.documents.iter_mut().find(|d| d.id == id) {
+            document.synopsis = synopsis;
+            document.status = status;
+            document.tags = tags;
         }
         self.persist();
         Ok(())

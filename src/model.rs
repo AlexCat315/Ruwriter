@@ -26,7 +26,8 @@ use cove_ui::core::scene::{
 use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
 use ruwriter_core::{
-    AppearancePreference, Collection, Document, Rescan, Session, SortOrder, WritingStats, count,
+    AppearancePreference, Collection, DocStatus, Document, Rescan, Session, SortOrder,
+    WritingStats, count, parse_tags,
 };
 
 use crate::formatting::{self, Command};
@@ -94,6 +95,11 @@ pub struct Model {
     pub find_index: Signal<usize>,
     /// One-shot request that moves typing into the find bar's query field.
     pub find_focus: Signal<u64>,
+    /// The document whose synopsis, status and tags the info dialog edits.
+    pub info_document: Signal<Option<String>>,
+    pub info_synopsis: Signal<TextBuffer>,
+    pub info_tags: Signal<TextBuffer>,
+    pub info_status: Signal<DocStatus>,
 }
 
 fn markdown_filter() -> FilePickerFilter {
@@ -714,6 +720,53 @@ impl Model {
                 .unwrap_or_else(|| "资料库".to_owned())
         })
         .unwrap_or_default()
+    }
+
+    // MARK: - Author metadata
+
+    /// Opens the info dialog for `id`, pre-filled from the library state.
+    pub fn begin_edit_info(&self, id: &str) {
+        let (synopsis, tags, status) = self
+            .read(|session| {
+                session.library.find(id).map(|document| {
+                    (
+                        document.synopsis.clone(),
+                        document.tags.clone(),
+                        document.status,
+                    )
+                })
+            })
+            .flatten()
+            .unwrap_or_default();
+        self.info_synopsis.set(TextBuffer::new(&synopsis));
+        self.info_tags.set(TextBuffer::new(&tags.join(", ")));
+        self.info_status.set(status);
+        self.info_document.set(Some(id.to_owned()));
+    }
+
+    pub fn edit_active_info(&self) {
+        if let Some(id) = self.active_id() {
+            self.begin_edit_info(&id);
+        }
+    }
+
+    pub fn cancel_info(&self) {
+        self.info_document.set(None);
+    }
+
+    pub fn set_info_status(&self, status: DocStatus) {
+        self.info_status.set(status);
+    }
+
+    pub fn commit_info(&self) {
+        let Some(id) = self.info_document.get_untracked() else {
+            return;
+        };
+        let synopsis = self.info_synopsis.get_untracked().string_value();
+        let tags = parse_tags(&self.info_tags.get_untracked().string_value());
+        let status = self.info_status.get_untracked();
+        self.info_document.set(None);
+        self.structural(move |session, _| session.set_metadata(&id, &synopsis, status, &tags));
     }
 
     // MARK: - Renaming

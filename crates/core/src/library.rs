@@ -7,7 +7,7 @@
 //! The trash is the `.trash` folder. Hidden entries (names starting with `.`)
 //! are never listed, which also keeps other tools' folders out of the way.
 
-use crate::document::{Document, derive, file_stem, is_document_path};
+use crate::document::{DocStatus, Document, derive, file_stem, is_document_path};
 use crate::files::{Stamp, read_document, stamp, write_document};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub const STATE_DIRECTORY: &str = ".ruwriter";
 pub const STATE_FILE: &str = "state.json";
 pub const TRASH_DIRECTORY: &str = ".trash";
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 /// What the document list shows when no folder is selected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -133,6 +133,11 @@ pub struct Meta {
     pub pinned: bool,
     /// Ruwriter named the file (`未命名.md`); saving renames it after its title.
     pub auto_named: bool,
+    /// The author's own summary, kept in the library state rather than the
+    /// file so that Markdown stays clean and portable.
+    pub synopsis: String,
+    pub status: DocStatus,
+    pub tags: Vec<String>,
 }
 
 /// The state file inside the library folder.
@@ -260,6 +265,11 @@ impl Library {
                 needle.is_empty()
                     || document.title.to_lowercase().contains(&needle)
                     || document.excerpt.to_lowercase().contains(&needle)
+                    || document.synopsis.to_lowercase().contains(&needle)
+                    || document
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase().contains(&needle))
             })
             .cloned()
             .collect();
@@ -520,6 +530,9 @@ fn refresh(
         pinned: meta.pinned,
         trashed,
         excerpt: meta.excerpt.clone(),
+        synopsis: meta.synopsis.clone(),
+        status: meta.status,
+        tags: meta.tags.clone(),
         words: meta.words,
     })
 }

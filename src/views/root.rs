@@ -22,6 +22,7 @@ use cove_ui::watch::{DirectoryWatcher, WatchOptions};
 use ruwriter_core::{Session, count};
 
 use super::editor::EditorPane;
+use super::info::InfoDialog;
 use super::list::ListPane;
 use super::palette::Palette;
 use super::rename::RenameDialog;
@@ -112,6 +113,10 @@ impl View for RootView {
             find_replacement: cx.state(cove_ui::compose::primitives::text::TextBuffer::empty),
             find_index: cx.state(|| 0),
             find_focus: cx.state(|| 0),
+            info_document: cx.state(|| None),
+            info_synopsis: cx.state(TextBuffer::empty),
+            info_tags: cx.state(TextBuffer::empty),
+            info_status: cx.state(ruwriter_core::DocStatus::default),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file
@@ -228,6 +233,9 @@ impl View for RootView {
                     model: model.clone(),
                 }),
                 AnyView::new(RenameDialog {
+                    model: model.clone(),
+                }),
+                AnyView::new(InfoDialog {
                     model: model.clone(),
                 }),
             ],

@@ -3,6 +3,7 @@
 //! from elsewhere by their absolute path. Everything else is derived from the
 //! file and cached by the library.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,56 @@ pub const DOCUMENT_EXTENSIONS: [&str; 3] = ["md", "markdown", "txt"];
 pub const UNTITLED: &str = "未命名";
 const TITLE_LIMIT: usize = 48;
 const EXCERPT_LIMIT: usize = 120;
+
+/// Where a document sits in the writing process. Kept in the library state,
+/// never inside the Markdown file: text stays the single truth.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocStatus {
+    #[default]
+    Draft,
+    Revising,
+    Final,
+    Archived,
+}
+
+impl DocStatus {
+    pub const ALL: [Self; 4] = [Self::Draft, Self::Revising, Self::Final, Self::Archived];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Draft => "草稿",
+            Self::Revising => "修订中",
+            Self::Final => "定稿",
+            Self::Archived => "归档",
+        }
+    }
+}
+
+/// Splits user input on commas (ASCII or full-width) and the ideographic
+/// comma, then normalises each tag. English tags keep their spaces.
+pub fn parse_tags(text: &str) -> Vec<String> {
+    let parts: Vec<String> = text.split([',', '，', '、']).map(str::to_owned).collect();
+    normalize_tags(&parts)
+}
+
+/// Trims tags, drops empty ones and the leading `#`, and removes
+/// case-insensitive duplicates.
+pub fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim().trim_start_matches('#').trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if !out
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(tag))
+        {
+            out.push(tag.to_owned());
+        }
+    }
+    out
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
@@ -33,6 +84,10 @@ pub struct Document {
     pub trashed: bool,
     /// Plain-text preview of the body.
     pub excerpt: String,
+    /// The author's own summary; falls back to the excerpt when empty.
+    pub synopsis: String,
+    pub status: DocStatus,
+    pub tags: Vec<String>,
     pub words: usize,
 }
 
@@ -42,6 +97,16 @@ impl Document {
             UNTITLED
         } else {
             &self.title
+        }
+    }
+
+    /// The summary a list row shows: the author's synopsis when written,
+    /// otherwise the derived excerpt.
+    pub fn summary(&self) -> &str {
+        if self.synopsis.trim().is_empty() {
+            &self.excerpt
+        } else {
+            &self.synopsis
         }
     }
 

@@ -50,6 +50,15 @@ impl View for Palette {
             )
             .keywords(["open", "dakai"]),
             command(
+                "文稿信息…",
+                "文稿",
+                icons::file::file_text(),
+                Rc::new(Model::edit_active_info),
+            )
+            .keywords([
+                "synopsis", "status", "tag", "tags", "gaojian", "zhuyao", "biaoti",
+            ]),
+            command(
                 "导出 Markdown…",
                 "文稿",
                 icons::action::share(),

@@ -8,7 +8,7 @@ pub mod paths;
 pub mod session;
 pub mod stats;
 
-pub use document::{Document, title_from_text};
+pub use document::{DocStatus, Document, normalize_tags, parse_tags, title_from_text};
 pub use library::{AppearancePreference, Collection, Folder, Library, Settings, SortOrder};
 pub use session::{Rescan, Session, ViewOptions};
 pub use stats::{WritingStats, count};
