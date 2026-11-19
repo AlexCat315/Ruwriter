@@ -129,9 +129,10 @@ pub fn editor_font(size: u8) -> SemanticFontRef {
     })
 }
 
-/// Readable column width for a body size: about forty full-width glyphs.
-pub fn measure(size: u8) -> f32 {
-    f32::from(size) * 40.0
+/// Readable column width for a body size and the requested number of
+/// full-width glyphs.
+pub fn measure(size: u8, glyphs: f32) -> f32 {
+    f32::from(size) * glyphs
 }
 
 /// Serif family for manuscript prose, where the platform has one. Missing

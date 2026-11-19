@@ -32,6 +32,7 @@ type MenuKey = (
     bool,
     bool,
     ruwriter_core::LineSpacing,
+    ruwriter_core::ColumnWidth,
 );
 
 pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
@@ -50,6 +51,7 @@ pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
         settings.paragraph_indent,
         settings.typewriter_scrolling,
         settings.line_spacing,
+        settings.column_width,
     );
     if installed.borrow().as_ref() == Some(&key) {
         return;
@@ -100,6 +102,7 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
         indent,
         typewriter,
         spacing,
+        width,
     ) = key;
     let markdown = writing == ruwriter_core::WritingMode::Markdown;
     let file = NativeMenu::new(
@@ -309,6 +312,28 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                 .with_selected(
                     spacing == ruwriter_core::LineSpacing::Loose,
                 ),
+                None,
+            ),
+            NativeMenuItem::Separator,
+            item(
+                action(model, "窄栏", |model| {
+                    model.set_column_width(ruwriter_core::ColumnWidth::Narrow)
+                })
+                .with_selected(width == ruwriter_core::ColumnWidth::Narrow),
+                None,
+            ),
+            item(
+                action(model, "标准栏宽", |model| {
+                    model.set_column_width(ruwriter_core::ColumnWidth::Normal)
+                })
+                .with_selected(width == ruwriter_core::ColumnWidth::Normal),
+                None,
+            ),
+            item(
+                action(model, "宽栏", |model| {
+                    model.set_column_width(ruwriter_core::ColumnWidth::Wide)
+                })
+                .with_selected(width == ruwriter_core::ColumnWidth::Wide),
                 None,
             ),
             NativeMenuItem::Separator,

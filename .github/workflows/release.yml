@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  COVE_REF: 1717d0a57805b7a714439debc438f712a41dd7ba
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            os: macos-26
+            platform: mac
+            asset: macos-arm64.zip
+          - label: macOS x86_64
+            os: macos-26-intel
+            platform: mac
+            asset: macos-x86_64.zip
+          - label: Windows x64
+            os: windows-2025
+            platform: windows
+            asset: windows-x64.zip
+          - label: Linux x64
+            os: ubuntu-24.04
+            platform: linux
+            asset: linux-x64.tar.gz
+    defaults:
+      run:
+        shell: bash
+        working-directory: Ruwriter
+    steps:
+      - name: Check out Ruwriter
+        uses: actions/checkout@v4
+        with:
+          path: Ruwriter
+          fetch-depth: 0
+
+      - name: Check out Cove
+        uses: actions/checkout@v4
+        with:
+          repository: AlexCat315/Cove
+          ref: ${{ env.COVE_REF }}
+          path: Cove
+          submodules: recursive
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers glslc patchelf \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libasound2-dev libpulse-dev \
+            libpipewire-0.3-dev libxcb1-dev libclang-dev libdbus-1-dev libegl-dev libgbm-dev \
+            libssl-dev pkg-config nasm fonts-noto-cjk fonts-noto-color-emoji
+
+      - name: MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Pin MSVC linker
+        if: runner.os == 'Windows'
+        run: printf 'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=%sbin\\HostX64\\x64\\link.exe\n' "$VCToolsInstallDir" >> "$GITHUB_ENV"
+
+      - name: Read pinned Zig version
+        id: zig
+        run: |
+          version=$(sed -n 's/^const ZIG_VERSION: &str = "\([^"]*\)";/\1/p' ../Cove/crates/native-build/src/setup.rs)
+          test -n "$version" || { echo "ZIG_VERSION missing" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: Build desktop package
+        run: cargo xtask package ${{ matrix.platform }} --release --output dist
+
+      - name: Archive macOS app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/Ruwriter.app" "Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}"
+
+      - name: Archive Windows folder
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/Ruwriter -DestinationPath "Ruwriter-$env:RELEASE_TAG-${{ matrix.asset }}"
+
+      - name: Archive Linux folder
+        if: runner.os == 'Linux'
+        run: tar -C dist -czf "Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}" Ruwriter
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ruwriter-${{ matrix.label }}
+          path: Ruwriter/Ruwriter-${{ github.ref_name }}-${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Ruwriter $RELEASE_TAG" \
+              --generate-notes \
+              --verify-tag
+          fi

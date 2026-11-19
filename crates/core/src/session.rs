@@ -289,6 +289,11 @@ impl Session {
         self.persist_app();
     }
 
+    pub fn set_column_width(&mut self, width: crate::ColumnWidth) {
+        self.app.settings.column_width = width;
+        self.persist_app();
+    }
+
     pub fn set_line_spacing(&mut self, spacing: crate::LineSpacing) {
         self.app.settings.line_spacing = spacing;
         self.persist_app();

@@ -95,6 +95,33 @@ impl View for Palette {
             )
             .keywords(["indent", "suojin", "duanshou", "paragraph"]),
             command(
+                "窄栏",
+                "排版",
+                icons::layout::columns_2(),
+                Rc::new(|model: &Model| {
+                    model.set_column_width(ruwriter_core::ColumnWidth::Narrow)
+                }),
+            )
+            .keywords(["width", "column", "lan", "zhaian", "banxin"]),
+            command(
+                "标准栏宽",
+                "排版",
+                icons::layout::columns_2(),
+                Rc::new(|model: &Model| {
+                    model.set_column_width(ruwriter_core::ColumnWidth::Normal)
+                }),
+            )
+            .keywords(["width", "column", "biaozhun", "banxin"]),
+            command(
+                "宽栏",
+                "排版",
+                icons::layout::columns_2(),
+                Rc::new(|model: &Model| {
+                    model.set_column_width(ruwriter_core::ColumnWidth::Wide)
+                }),
+            )
+            .keywords(["width", "column", "kuan", "kuanlan", "banxin"]),
+            command(
                 if model.line_spacing() == ruwriter_core::LineSpacing::Compact {
                     "标准行距"
                 } else {

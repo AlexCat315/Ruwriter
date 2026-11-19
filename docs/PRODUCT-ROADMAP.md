@@ -44,7 +44,7 @@
 - 回车续行（列表、引用、有序编号）（Ruwriter）
 - 所见即所得（Typora）／源码标记（Ulysses）
 - 打字机滚动、当前行居中（Scrivener、Ulysses、iA Writer）
-- 字号/行距/字体（含无障碍字体）（Scrivener、Novelcrafter；Ruwriter 已有字号、三档行距与衬线正文）
+- 字号/行距/版心宽度/字体（含无障碍字体）（Scrivener、Novelcrafter；Ruwriter 已有字号、三档行距、三档栏宽与衬线正文）
 
 ### C. 长文结构（长篇写作的分水岭）
 - 卷 / 章 / 场景三级组织（Scrivener Binder、Novelcrafter Grid）

@@ -58,7 +58,7 @@ impl View for EditorPane {
         } else {
             self.layout.editor_width
         };
-        let column = measure(font_size);
+        let column = measure(font_size, settings.column_width.glyphs());
         let horizontal = ((pane_width - column) / 2.0).max(MARGIN);
 
         let editor = AnyView::new(EditorField {

@@ -261,6 +261,17 @@ impl Model {
         self.settings_revision.update(|value| *value += 1);
     }
 
+    pub fn set_column_width(&self, width: ruwriter_core::ColumnWidth) {
+        let _ = self.with_session(|session| {
+            session.set_column_width(width);
+            Ok(())
+        });
+        self.settings_revision.update(|value| *value += 1);
+        let caret = self.caret.get();
+        let anchor = caret.selected_range.map(|(start, _)| start);
+        self.navigate(caret.caret_index, anchor, true);
+    }
+
     pub fn line_spacing(&self) -> ruwriter_core::LineSpacing {
         self.settings().line_spacing
     }

@@ -101,6 +101,34 @@ pub enum WritingMode {
     Markdown,
 }
 
+/// Width of the centred reading column, in full-width body glyphs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnWidth {
+    Narrow,
+    #[default]
+    Normal,
+    Wide,
+}
+
+impl ColumnWidth {
+    pub fn glyphs(self) -> f32 {
+        match self {
+            Self::Narrow => 32.0,
+            Self::Normal => 40.0,
+            Self::Wide => 48.0,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Narrow => "窄",
+            Self::Normal => "标准",
+            Self::Wide => "宽",
+        }
+    }
+}
+
 /// Line spacing for manuscript prose. The values are line-height multiples
 /// applied to the body font size.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +196,8 @@ pub struct Settings {
     pub typewriter_scrolling: bool,
     /// Line spacing for the manuscript body.
     pub line_spacing: LineSpacing,
+    /// Width of the reading column.
+    pub column_width: ColumnWidth,
     /// Colour Markdown syntax in the editor; off for plain prose writing.
     pub markdown_syntax: bool,
     /// Show the outline pane beside the editor on wide windows.
@@ -188,6 +218,7 @@ impl Default for Settings {
             paragraph_indent: true,
             typewriter_scrolling: false,
             line_spacing: LineSpacing::Normal,
+            column_width: ColumnWidth::Normal,
             markdown_syntax: true,
             outline: true,
         }
