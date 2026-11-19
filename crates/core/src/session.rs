@@ -588,6 +588,27 @@ impl Session {
         }
     }
 
+    /// Remembers the active document's caret without touching the disk. The
+    /// shell persists it after typing settles and whenever it switches away.
+    pub fn remember_caret(&mut self, offset: usize) {
+        if let Some(id) = self.active.clone()
+            && let Some(meta) = self.library.meta_mut(&id)
+        {
+            meta.last_caret = offset;
+        }
+    }
+
+    pub fn active_caret(&self) -> usize {
+        self.active
+            .as_deref()
+            .and_then(|id| self.library.meta(id).map(|meta| meta.last_caret))
+            .unwrap_or(0)
+    }
+
+    pub fn persist_caret(&mut self) {
+        let _ = self.library.save_state();
+    }
+
     pub fn select(&mut self, id: &str, current: &str) -> Result<String, String> {
         self.autosave(current)?;
         if self.active.as_deref() == Some(id) {

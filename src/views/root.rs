@@ -135,6 +135,7 @@ impl View for RootView {
             settings_revision: cx.state(|| 0),
             pending_save: cx.state(|| None),
             save_revision: cx.state(|| 0),
+            caret_revision: cx.state(|| 0),
             history_open: cx.state(|| false),
             history_entries: cx.state(Vec::new),
         };
@@ -144,6 +145,7 @@ impl View for RootView {
         let installed = cx.remember(|| Rc::new(Cell::new(false)));
         if !installed.replace(true) {
             model.install_disk_handler();
+            model.restore_caret();
             let opener = model.clone();
             OpenedDocuments::set_handler(Some(Rc::new(move |paths: Vec<String>| {
                 for path in paths {

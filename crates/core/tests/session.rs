@@ -60,6 +60,27 @@ fn switching_documents_round_trips_each_text() {
 }
 
 #[test]
+fn caret_position_survives_switching_and_reload() {
+    let root = tempfile::tempdir().expect("temp root");
+    let mut session = Session::at(root.path());
+    session.save("第一行\n第二行").expect("save first");
+    let first = session.active_id().expect("first id");
+    session.remember_caret(4);
+    session.persist_caret();
+    assert_eq!(session.active_caret(), 4);
+
+    session.create("第一行\n第二行").expect("create second");
+    session.save("另一个文稿").expect("save second");
+    session
+        .select(&first, "另一个文稿")
+        .expect("switch back to first");
+    assert_eq!(session.active_caret(), 4);
+
+    let reloaded = Session::at(root.path());
+    assert_eq!(reloaded.active_caret(), 4);
+}
+
+#[test]
 fn new_documents_go_into_the_selected_folder() {
     let root = tempfile::tempdir().expect("temp root");
     let mut session = Session::at(root.path());

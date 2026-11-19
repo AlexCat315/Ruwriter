@@ -211,6 +211,9 @@ pub struct Meta {
     pub synopsis: String,
     pub status: DocStatus,
     pub tags: Vec<String>,
+    /// Caret character offset last seen in this document, so reopening puts
+    /// the author back where they stopped instead of at the top.
+    pub last_caret: usize,
 }
 
 /// The state file inside the library folder.
@@ -559,6 +562,13 @@ impl Library {
         let mut names = names;
         names.insert(index, name.to_owned());
         self.state.order.insert(parent.to_owned(), names);
+    }
+
+    pub fn meta(&self, id: &str) -> Option<&Meta> {
+        if let Some(meta) = self.external.get(id) {
+            return Some(meta);
+        }
+        self.state.entries.get(id)
     }
 
     pub fn meta_mut(&mut self, id: &str) -> Option<&mut Meta> {

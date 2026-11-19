@@ -38,6 +38,9 @@ use crate::formatting::{self, Command};
 const LARGE_DOCUMENT: usize = 40_000;
 /// Quiet period before that write, in seconds.
 const AUTOSAVE_DELAY: f64 = 0.3;
+/// Caret changes are frequent; persist the remembered position once the
+/// author pauses instead of writing `state.json` on every arrow key.
+const CARET_SAVE_DELAY: f64 = 1.2;
 
 /// What the rename dialog is renaming.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +119,8 @@ pub struct Model {
     /// Bumped by every edit that arms the autosave timer; a later edit makes
     /// the previous timer stale.
     pub save_revision: Signal<u64>,
+    /// Bumped by every caret movement; a timer persists once typing settles.
+    pub caret_revision: Signal<u64>,
     /// Whether the version-history dialog is open, and the snapshot list it
     /// shows. Loaded when opened, not on every keystroke.
     pub history_open: Signal<bool>,
@@ -339,6 +344,27 @@ impl Model {
         self.write_text(text);
     }
 
+    fn schedule_caret_save(&self) {
+        let model = self.clone();
+        let revision = self.caret_revision.get_untracked();
+        let validity = {
+            let model = model.clone();
+            move || model.caret_revision.get_untracked() == revision
+        };
+        let timer = AutosaveTimer {
+            remaining: std::cell::Cell::new(CARET_SAVE_DELAY),
+            valid: Box::new(validity),
+            action: RefCell::new(Some(Box::new(move || {
+                let _ = model.with_session(|session| {
+                    session.persist_caret();
+                    Ok(())
+                });
+            }))),
+        };
+        AnimatorScheduler::current().register(Rc::new(timer));
+        wake_scene_thread();
+    }
+
     fn schedule_save(&self) {
         let model = self.clone();
         let revision = self.save_revision.get_untracked();
@@ -360,7 +386,17 @@ impl Model {
 
     /// The editor reports its caret and selection after every move.
     pub fn on_caret(&self, state: TextFieldCaretState) {
-        self.caret.set_if_changed(state);
+        if self.caret.get_untracked() == state {
+            return;
+        }
+        self.caret.set(state);
+        let offset = state.caret_index;
+        let _ = self.with_session(|session| {
+            session.remember_caret(offset);
+            Ok(())
+        });
+        self.caret_revision.update(|value| *value += 1);
+        self.schedule_caret_save();
     }
 
     /// Applies a Markdown formatting command at the last reported caret or
@@ -741,14 +777,34 @@ impl Model {
 
     pub fn select(&self, id: &str) {
         let id = id.to_owned();
-        self.structural(move |session, current| session.select(&id, current).map(drop));
+        self.structural(move |session, current| {
+            session.select(&id, current).map(drop)
+        });
         self.showing_editor.set(true);
+        self.restore_caret();
     }
 
     pub fn open_path(&self, path: &Path) {
         let path = path.to_path_buf();
-        self.structural(move |session, current| session.open_path(&path, current).map(drop));
+        self.structural(move |session, current| {
+            session.open_path(&path, current).map(drop)
+        });
         self.showing_editor.set(true);
+        self.restore_caret();
+    }
+
+    /// Puts the caret back where the author stopped in this document. Applied
+    /// once when a document opens and once on launch; an empty document just
+    /// leaves the editor at its start.
+    pub fn restore_caret(&self) {
+        let characters = self.buffer.get_untracked().character_count();
+        let offset = self
+            .read(Session::active_caret)
+            .unwrap_or(0)
+            .min(characters);
+        if offset > 0 {
+            self.navigate(offset, None, true);
+        }
     }
 
     pub fn open_picker(&self) {
