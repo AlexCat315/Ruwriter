@@ -99,7 +99,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           chmod +x scripts/build-dmg.sh
-          bash scripts/build-dmg.sh "dist/Ruwriter.app" "Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}" "Ruwriter"
+          bash scripts/build-dmg.sh "dist/Ruwriter.app" "dist/Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}" "Ruwriter"
 
       - name: Build Windows installer
         if: runner.os == 'Windows'
