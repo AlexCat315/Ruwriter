@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  COVE_REF: 1717d0a57805b7a714439debc438f712a41dd7ba
+  COVE_REF: 8d4e82e399b9887b20947a39ed80c4dbf56682d8
   RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:

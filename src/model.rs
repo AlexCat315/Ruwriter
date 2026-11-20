@@ -759,6 +759,9 @@ impl Model {
             "尚未同步。首次同步会新建一个私有 Gist。".to_owned()
         });
         self.sync_open.set(true);
+        // The dialog lives outside the panes that normally re-render on
+        // revision changes, so ask the root for a frame explicitly.
+        self.bump();
     }
 
     pub fn close_sync(&self) {

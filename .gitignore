@@ -7,3 +7,5 @@ Platforms/Android/cove.properties
 *.keystore
 
 packaging/windows/Ruwriter.generated.iss
+
+/dist/

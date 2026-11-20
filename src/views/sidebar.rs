@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use cove_ui::compose::FrameDimension;
 use cove_ui::compose::modifiers::layout::{FlexExt, LayoutFrameExt, PaddingExt};
-use cove_ui::compose::modifiers::style::SemanticStyleViewExt;
+use cove_ui::compose::modifiers::style::{AppearanceExt, SemanticStyleViewExt};
 use cove_ui::compose::primitives::controls::{Button, ButtonIcon, ButtonIconSource};
 use cove_ui::compose::primitives::data::lists::tree::{
     TreeDragOperations, TreeDropPosition, TreeEvents, TreeLayout, TreeOptions, TreeSelection,
@@ -20,12 +20,14 @@ use cove_ui::compose::primitives::layout::sidebar::{
 use cove_ui::compose::primitives::media::Icon;
 use cove_ui::compose::primitives::media::ui_icon_catalog as icons;
 use cove_ui::compose::primitives::overlays::{ContextMenuExt, MenuEntry, MenuItem, MenuItemRole};
-use cove_ui::compose::primitives::text::Text;
-use cove_ui::compose::theme::styles::buttons::ButtonStyleViewExt;
+use cove_ui::compose::primitives::text::{Divider, Text};
+use cove_ui::compose::theme::styles::buttons::{
+    ButtonStyle, ButtonStyleConfiguration, ButtonStyleViewExt,
+};
 use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
 use cove_ui::composition::{AnyView, LayoutDebugExt, Scope, View};
-use cove_ui::core::Binding;
 use cove_ui::core::scene::Align;
+use cove_ui::core::{Binding, Signal};
 use cove_ui::imaging::BundleImageResource;
 use ruwriter_core::library::{name_of, parent_of};
 use ruwriter_core::{AppearancePreference, Collection, Library};
@@ -61,27 +63,29 @@ pub struct LibrarySidebar {
 }
 
 impl View for LibrarySidebar {
-    fn body(&self, _cx: &Scope) -> AnyView {
+    fn body(&self, cx: &Scope) -> AnyView {
         let _ = self.model.revision.get();
         let _ = self.model.listing.get();
+        let settings_open = cx.state(|| false);
+        let expanded = settings_open.get();
         let header =
             vstack(0.0, Align::Stretch, Vec::new()).frame_height(self.layout.top_inset + 10.0);
-        vstack(
-            0.0,
-            Align::Stretch,
-            vec![
-                AnyView::new(header),
-                collections(&self.model),
-                folders_header(&self.model),
-                AnyView::new(
-                    AnyView::new(FolderTree {
-                        model: self.model.clone(),
-                    })
-                    .flex_with(1.0, 1.0, Some(0.0)),
-                ),
-                appearance_row(&self.model),
-            ],
-        )
+        let mut children = vec![
+            AnyView::new(header),
+            collections(&self.model),
+            folders_header(&self.model),
+            AnyView::new(
+                AnyView::new(FolderTree {
+                    model: self.model.clone(),
+                })
+                .flex_with(1.0, 1.0, Some(0.0)),
+            ),
+        ];
+        if expanded {
+            children.push(settings_panel(&self.model, settings_open.clone()));
+        }
+        children.push(footer(&self.model, settings_open));
+        vstack(0.0, Align::Stretch, children)
     }
 }
 
@@ -389,38 +393,256 @@ fn folder_menu(model: &Model, id: &str) -> Vec<MenuEntry> {
     ]
 }
 
-fn appearance_row(model: &Model) -> AnyView {
-    let (title, icon) = appearance_label(model.settings().appearance);
-    let label = hstack(
-        10.0,
-        Align::Center,
-        vec![
-            AnyView::new(ButtonIcon::new(
-                ButtonIconSource::resource(icon),
-                Some(16.0),
-                None,
-            )),
-            AnyView::new(
-                Text::new(format!("外观：{title}"))
-                    .truncated()
-                    .semantic_font(SemanticFontRef::label())
-                    .semantic_foreground(SemanticColorRef::on_surface_variant()),
-            ),
-            spacer(),
-        ],
+fn footer(model: &Model, open: Signal<bool>) -> AnyView {
+    let _ = model.sync_status.get();
+    let expanded = open.get();
+    let status = sync_status_text(model);
+    let toggle = open.clone();
+    let toggle_model = model.clone();
+    let trigger_label = AnyView::new(
+        hstack(
+            8.0,
+            Align::Center,
+            vec![
+                AnyView::new(ButtonIcon::new(
+                    ButtonIconSource::resource(icons::device::cloud_upload()),
+                    Some(16.0),
+                    None,
+                )),
+                AnyView::new(
+                    Text::new("云同步")
+                        .semantic_font(SemanticFontRef::label())
+                        .semantic_foreground(SemanticColorRef::on_surface_variant()),
+                ),
+                spacer(),
+                AnyView::new(
+                    Text::new(status)
+                        .semantic_font(SemanticFontRef::caption())
+                        .semantic_foreground(SemanticColorRef::on_surface_muted()),
+                ),
+                AnyView::new(ButtonIcon::new(
+                    ButtonIconSource::resource(if expanded {
+                        icons::navigation::chevron_up()
+                    } else {
+                        icons::navigation::chevron_down()
+                    }),
+                    Some(12.0),
+                    None,
+                )),
+            ],
+        )
+        .frame_width(crate::views::root::SIDEBAR_WIDTH - 36.0)
+        .padding_edges(10.0, 0.0),
     );
-    let cycle = model.clone();
-    AnyView::new(
+    let trigger = AnyView::new(
         AnyView::new(
-            Button::new(label.padding_edges(10.0, 0.0), move || {
-                cycle.cycle_appearance()
+            Button::new(trigger_label, move || {
+                toggle.set(!toggle.get_untracked());
+                toggle_model.revision.update(|value| *value += 1);
             })
-            .accessibility_text("切换外观"),
+            .accessibility_text("云同步与设置"),
         )
         .button_style(SidebarItemStyle {
             minimum_height: ROW,
             presentation: SidebarPresentation::Expanded,
-        })
-        .padding_edges(8.0, 8.0),
+        }),
+    );
+
+    AnyView::new(
+        vstack(
+            0.0,
+            Align::Stretch,
+            vec![
+                AnyView::new(
+                    vstack(
+                        0.0,
+                        Align::Stretch,
+                        vec![AnyView::new(Divider::horizontal())],
+                    )
+                    .padding_edges(8.0, 6.0),
+                ),
+                trigger,
+            ],
+        )
+        .padding_insets(cove_ui::compose::modifiers::layout::EdgeInsets {
+            top: 0.0,
+            leading: 0.0,
+            bottom: 6.0,
+            trailing: 0.0,
+        }),
     )
+}
+
+fn sync_status_text(model: &Model) -> String {
+    let last = model
+        .read(|session| session.sync_config().last_synced_at)
+        .unwrap_or(0);
+    if last > 0 {
+        crate::dates::relative(last)
+    } else {
+        "未同步".to_owned()
+    }
+}
+
+fn settings_panel(model: &Model, open: cove_ui::core::Signal<bool>) -> AnyView {
+    let status = sync_status_text(model);
+    let current = model.settings().appearance;
+
+    let sync_model = model.clone();
+    let close_panel = open.clone();
+    let close_revision = model.clone();
+    let sync_row = panel_row(
+        hstack(
+            8.0,
+            Align::Center,
+            vec![
+                AnyView::new(ButtonIcon::new(
+                    ButtonIconSource::resource(icons::device::cloud_upload()),
+                    Some(15.0),
+                    None,
+                )),
+                AnyView::new(
+                    Text::new("打开云同步…")
+                        .semantic_font(SemanticFontRef::label())
+                        .semantic_foreground(SemanticColorRef::on_surface()),
+                ),
+                spacer(),
+                AnyView::new(
+                    Text::new(status)
+                        .semantic_font(SemanticFontRef::caption())
+                        .semantic_foreground(SemanticColorRef::on_surface_muted()),
+                ),
+                AnyView::new(ButtonIcon::new(
+                    ButtonIconSource::resource(icons::navigation::chevron_right()),
+                    Some(10.0),
+                    None,
+                )),
+            ],
+        ),
+        34.0,
+        "打开云同步",
+        move || {
+            sync_model.open_sync();
+            close_panel.set(false);
+            close_revision.revision.update(|value| *value += 1);
+        },
+    );
+
+    let mut rows = vec![
+        sync_row,
+        AnyView::new(vstack(0.0, Align::Stretch, vec![]).frame_height(3.0)),
+        AnyView::new(
+            hstack(
+                0.0,
+                Align::Center,
+                vec![AnyView::new(
+                    Text::new("外观")
+                        .semantic_font(SemanticFontRef::caption())
+                        .semantic_foreground(SemanticColorRef::on_surface_muted()),
+                )],
+            )
+            .frame_width(crate::views::root::SIDEBAR_WIDTH - 36.0)
+            .padding_edges(10.0, 0.0)
+            .frame_height(20.0),
+        ),
+    ];
+    for preference in [
+        AppearancePreference::System,
+        AppearancePreference::Light,
+        AppearancePreference::Dark,
+    ] {
+        let (label, _) = appearance_label(preference);
+        let close = open.clone();
+        let m = model.clone();
+        let rev = model.clone();
+        let selected = current == preference;
+        let leading = if selected {
+            AnyView::new(
+                Text::new("✓")
+                    .semantic_font(SemanticFontRef::label())
+                    .semantic_foreground(SemanticColorRef::accent()),
+            )
+        } else {
+            AnyView::new(vstack(0.0, Align::Stretch, vec![]).frame_width(11.0))
+        };
+        let row = panel_row(
+            hstack(
+                7.0,
+                Align::Center,
+                vec![
+                    leading,
+                    AnyView::new(
+                        Text::new(label)
+                            .semantic_font(SemanticFontRef::body())
+                            .semantic_foreground(if selected {
+                                SemanticColorRef::on_surface()
+                            } else {
+                                SemanticColorRef::on_surface_variant()
+                            }),
+                    ),
+                ],
+            ),
+            28.0,
+            label,
+            move || {
+                m.set_appearance(preference);
+                close.set(false);
+                rev.revision.update(|value| *value += 1);
+            },
+        );
+        rows.push(row);
+    }
+
+    AnyView::new(
+        AnyView::new(
+            vstack(0.0, Align::Stretch, rows)
+                .padding_insets(cove_ui::compose::modifiers::layout::EdgeInsets {
+                    top: 6.0,
+                    leading: 0.0,
+                    bottom: 6.0,
+                    trailing: 0.0,
+                })
+                .frame_width(crate::views::root::SIDEBAR_WIDTH - 16.0)
+                .semantic_background(SemanticColorRef::surface_floating())
+                .semantic_border(SemanticColorRef::surface_variant(), 1.0)
+                .corner_radius(10.0),
+        )
+        .padding_insets(cove_ui::compose::modifiers::layout::EdgeInsets {
+            top: 0.0,
+            leading: 8.0,
+            bottom: 8.0,
+            trailing: 8.0,
+        }),
+    )
+}
+
+fn panel_row(
+    content: AnyView,
+    height: f32,
+    accessibility: &'static str,
+    action: impl Fn() + 'static,
+) -> AnyView {
+    let label = content
+        .frame_width(crate::views::root::SIDEBAR_WIDTH - 36.0)
+        .frame_height(height)
+        .padding_edges(10.0, 0.0);
+    AnyView::new(
+        AnyView::new(Button::new(AnyView::new(label), action).accessibility_text(accessibility))
+            .button_style(PanelRowStyle),
+    )
+}
+
+struct PanelRowStyle;
+
+impl ButtonStyle for PanelRowStyle {
+    fn make_body(&self, configuration: ButtonStyleConfiguration) -> AnyView {
+        let fill = if configuration.is_pressed {
+            SemanticColorRef::state_layer_pressed()
+        } else if configuration.is_hovered {
+            SemanticColorRef::state_layer_hover()
+        } else {
+            SemanticColorRef::clear()
+        };
+        AnyView::new(AnyView::new(configuration.label.semantic_background(fill)).corner_radius(6.0))
+    }
 }

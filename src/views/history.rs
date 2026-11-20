@@ -99,7 +99,10 @@ impl View for HistoryDialog {
                     AnyView::new(
                         AnyView::new(
                             Button::new(label, move || model.restore_snapshot(&name))
-                                .accessibility_text(format!("恢复到 {}", dates::stamp(snapshot.created_at)))
+                                .accessibility_text(format!(
+                                    "恢复到 {}",
+                                    dates::stamp(snapshot.created_at)
+                                ))
                                 .tooltip("恢复到这个版本"),
                         )
                         .button_style(RowButtonStyle)
@@ -133,7 +136,9 @@ impl View for HistoryDialog {
                 ),
                 spacer(),
                 AnyView::new(Button::title("关闭", move || close_model.close_history())),
-                AnyView::new(Button::title("立即创建快照", move || create_model.snapshot_now())),
+                AnyView::new(Button::title("立即创建快照", move || {
+                    create_model.snapshot_now()
+                })),
             ],
         );
         let closer = self.model.clone();

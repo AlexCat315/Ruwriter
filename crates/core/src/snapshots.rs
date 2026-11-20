@@ -62,7 +62,10 @@ fn millis(seconds: u64) -> u64 {
 }
 
 fn seconds_from_name(name: &str) -> Option<u64> {
-    name.strip_suffix(".txt")?.parse::<u64>().ok().map(|value| value / 1000)
+    name.strip_suffix(".txt")?
+        .parse::<u64>()
+        .ok()
+        .map(|value| value / 1000)
 }
 
 fn names(root: &Path, id: &str) -> Vec<String> {
@@ -176,7 +179,11 @@ mod tests {
         let root = tempfile::tempdir().expect("root");
         create(root.path(), "a.txt", "first", 1_000).expect("first");
         create(root.path(), "a.txt", "second", 1_001).expect("second");
-        assert!(create(root.path(), "a.txt", "second", 1_002).expect("dup").is_none());
+        assert!(
+            create(root.path(), "a.txt", "second", 1_002)
+                .expect("dup")
+                .is_none()
+        );
         let listed = list(root.path(), "a.txt");
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].created_at, 1_001);
