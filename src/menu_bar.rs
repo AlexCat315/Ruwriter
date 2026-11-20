@@ -128,6 +128,7 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                 Some(primary_shift("s")),
             ),
             item(action(model, "历史版本…", Model::open_history), None),
+            item(action(model, "云同步…", Model::open_sync), None),
             item(
                 action(
                     model,
@@ -291,27 +292,21 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                 action(model, "紧凑行距", |model| {
                     model.set_line_spacing(ruwriter_core::LineSpacing::Compact)
                 })
-                .with_selected(
-                    spacing == ruwriter_core::LineSpacing::Compact,
-                ),
+                .with_selected(spacing == ruwriter_core::LineSpacing::Compact),
                 None,
             ),
             item(
                 action(model, "标准行距", |model| {
                     model.set_line_spacing(ruwriter_core::LineSpacing::Normal)
                 })
-                .with_selected(
-                    spacing == ruwriter_core::LineSpacing::Normal,
-                ),
+                .with_selected(spacing == ruwriter_core::LineSpacing::Normal),
                 None,
             ),
             item(
                 action(model, "宽松行距", |model| {
                     model.set_line_spacing(ruwriter_core::LineSpacing::Loose)
                 })
-                .with_selected(
-                    spacing == ruwriter_core::LineSpacing::Loose,
-                ),
+                .with_selected(spacing == ruwriter_core::LineSpacing::Loose),
                 None,
             ),
             NativeMenuItem::Separator,

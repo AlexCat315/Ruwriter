@@ -29,7 +29,9 @@ use super::outline::OutlinePane;
 use super::palette::Palette;
 use super::rename::RenameDialog;
 use super::sidebar::LibrarySidebar;
+use super::sync::SyncDialog;
 use super::ui::{full_height, full_size, hstack, vstack};
+use crate::dates;
 use crate::menu_bar;
 use crate::model::{Model, deliver_disk_change};
 use crate::shortcuts;
@@ -102,6 +104,12 @@ impl View for RootView {
     fn body(&self, cx: &Scope) -> AnyView {
         let session = cx.remember(|| Rc::new(RefCell::new(Session::load())));
         let initial = session.borrow().text();
+        let sync_last = session.borrow().sync_config().last_synced_at;
+        let sync_status = if sync_last > 0 {
+            format!("上次同步：{}", dates::relative(sync_last))
+        } else {
+            "尚未同步。首次同步会新建一个私有 Gist。".to_owned()
+        };
         let model = Model {
             session: session.clone(),
             revision: cx.state(|| 0_u64),
@@ -138,6 +146,11 @@ impl View for RootView {
             caret_revision: cx.state(|| 0),
             history_open: cx.state(|| false),
             history_entries: cx.state(Vec::new),
+            sync_open: cx.state(|| false),
+            sync_login: cx.state(|| "GitHub CLI：等待检查".to_owned()),
+            sync_status: cx.state(|| sync_status.clone()),
+            sync_busy: cx.state(|| false),
+            sync_failed: cx.state(|| false),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file
@@ -145,6 +158,7 @@ impl View for RootView {
         let installed = cx.remember(|| Rc::new(Cell::new(false)));
         if !installed.replace(true) {
             model.install_disk_handler();
+            model.install_sync_handler();
             model.restore_caret();
             let opener = model.clone();
             OpenedDocuments::set_handler(Some(Rc::new(move |paths: Vec<String>| {
@@ -281,6 +295,9 @@ impl View for RootView {
                     model: model.clone(),
                 }),
                 AnyView::new(HistoryDialog {
+                    model: model.clone(),
+                }),
+                AnyView::new(SyncDialog {
                     model: model.clone(),
                 }),
             ],

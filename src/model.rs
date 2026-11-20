@@ -26,9 +26,10 @@ use cove_ui::core::scene::{
 };
 use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
+use ruwriter_core::sync::SyncReport;
 use ruwriter_core::{
-    AppearancePreference, Collection, DocStatus, Document, Heading, Rescan, Session, Snapshot, SortOrder,
-    WritingStats, count, heading_at, headings, parse_tags,
+    AppearancePreference, Collection, DocStatus, Document, Heading, Rescan, Session, Snapshot,
+    SortOrder, WritingStats, count, heading_at, headings, parse_tags,
 };
 
 use crate::formatting::{self, Command};
@@ -50,10 +51,26 @@ pub enum RenameTarget {
 }
 
 type DiskHandler = Rc<dyn Fn(Vec<PathBuf>)>;
+type SyncHandler = Rc<dyn Fn(SyncEvent)>;
+
+#[derive(Clone, Debug)]
+pub enum SyncEvent {
+    Progress(String),
+    Finished(Result<SyncReport, String>),
+}
 
 thread_local! {
     static DISK_HANDLER: RefCell<Option<DiskHandler>> = const { RefCell::new(None) };
+    static SYNC_HANDLER: RefCell<Option<SyncHandler>> = const { RefCell::new(None) };
     static DEFERRED: RefCell<Vec<Box<dyn FnOnce()>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs on the UI thread with the result of a background Gist sync.
+pub fn deliver_sync_event(event: SyncEvent) {
+    let handler = SYNC_HANDLER.with(|slot| slot.borrow().clone());
+    if let Some(handler) = handler {
+        handler(event);
+    }
 }
 
 /// Runs on the UI thread with paths the library watcher saw change.
@@ -125,6 +142,12 @@ pub struct Model {
     /// shows. Loaded when opened, not on every keystroke.
     pub history_open: Signal<bool>,
     pub history_entries: Signal<Vec<Snapshot>>,
+    /// Cloud backup through a private GitHub Gist.
+    pub sync_open: Signal<bool>,
+    pub sync_login: Signal<String>,
+    pub sync_status: Signal<String>,
+    pub sync_busy: Signal<bool>,
+    pub sync_failed: Signal<bool>,
 }
 
 fn markdown_filter() -> FilePickerFilter {
@@ -712,6 +735,150 @@ impl Model {
         self.bump();
     }
 
+    /// Installs this model as the receiver of background sync results.
+    pub fn install_sync_handler(&self) {
+        let model = self.clone();
+        SYNC_HANDLER.with(|slot| {
+            *slot.borrow_mut() = Some(Rc::new(move |event: SyncEvent| {
+                model.on_sync_event(event);
+            }));
+        });
+    }
+
+    // MARK: - Cloud sync
+
+    pub fn open_sync(&self) {
+        let last = self
+            .read(|session| session.sync_config().last_synced_at)
+            .unwrap_or(0);
+        self.sync_login.set(crate::gist::gh_status());
+        self.sync_failed.set(false);
+        self.sync_status.set(if last > 0 {
+            format!("上次同步：{}", crate::dates::relative(last))
+        } else {
+            "尚未同步。首次同步会新建一个私有 Gist。".to_owned()
+        });
+        self.sync_open.set(true);
+    }
+
+    pub fn close_sync(&self) {
+        self.sync_open.set(false);
+    }
+
+    pub fn check_sync_login(&self) {
+        self.sync_login.set(crate::gist::gh_status());
+    }
+
+    pub fn sync_now(&self) {
+        if self.sync_busy.get_untracked() {
+            return;
+        }
+        let token = match crate::gist::gh_token() {
+            Ok(token) => token,
+            Err(error) => {
+                self.sync_login.set(crate::gist::gh_status());
+                self.sync_status.set(error);
+                self.sync_failed.set(true);
+                return;
+            }
+        };
+        self.pending_save.set(None);
+        let text = self.current_text();
+        if let Err(error) = self.with_session(|session| session.save(&text)) {
+            self.sync_status.set(format!("同步前保存失败：{error}"));
+            self.sync_failed.set(true);
+            return;
+        }
+        let token_for_request = token.clone();
+        let data = self.with_session(|session| {
+            ruwriter_core::sync::ensure_library_id(session);
+            let local = session.sync_snapshot();
+            let config = session.sync_config().clone();
+            let gist = config.gist_id.clone().unwrap_or_default();
+            let base = if gist.is_empty() {
+                Default::default()
+            } else {
+                config.base.clone()
+            };
+            Ok(crate::gist::SyncRequest {
+                token: token_for_request.clone(),
+                gist_id: (!gist.is_empty()).then_some(gist),
+                library_id: config.library_id,
+                device: ruwriter_core::sync::default_device(),
+                local,
+                base,
+            })
+        });
+        let request = match data {
+            Ok(request) => request,
+            Err(error) => {
+                self.sync_status.set(format!("无法准备同步：{error}"));
+                self.sync_failed.set(true);
+                return;
+            }
+        };
+        if request.token.is_empty() {
+            self.sync_status
+                .set("GitHub CLI 没有返回登录凭据。".to_owned());
+            self.sync_failed.set(true);
+            return;
+        }
+        self.sync_busy.set(true);
+        self.sync_failed.set(false);
+        self.sync_status.set("正在连接 GitHub…".to_owned());
+        let poster = cove_ui::core::ThreadPoster::current();
+        std::thread::spawn(move || {
+            let progress = poster.clone();
+            progress
+                .post(move || deliver_sync_event(SyncEvent::Progress("正在比对文稿…".to_owned())));
+            let result = crate::gist::sync_with_gist(&request);
+            poster.post(move || deliver_sync_event(SyncEvent::Finished(result)));
+        });
+    }
+
+    fn on_sync_event(&self, event: SyncEvent) {
+        match event {
+            SyncEvent::Progress(message) => {
+                self.sync_busy.set(true);
+                self.sync_status.set(message);
+            }
+            SyncEvent::Finished(Ok(report)) => {
+                self.sync_busy.set(false);
+                let applied = self.with_session(|session| session.apply_sync_report(&report));
+                match applied {
+                    Ok(outcome) => {
+                        self.sync_failed.set(false);
+                        let mut status = report.summary.clone();
+                        if !outcome.conflicts.is_empty() {
+                            let names: Vec<String> = outcome
+                                .conflicts
+                                .iter()
+                                .filter_map(|path| path.file_name())
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .collect();
+                            status.push_str(&format!("；已保留冲突副本：{}", names.join("、")));
+                        }
+                        self.sync_status.set(status);
+                        if outcome.active_changed {
+                            self.load_active();
+                        }
+                        self.revision.update(|value| *value += 1);
+                        self.listing.update(|value| *value += 1);
+                    }
+                    Err(error) => {
+                        self.sync_failed.set(true);
+                        self.sync_status.set(format!("同步结果写入失败：{error}"));
+                    }
+                }
+            }
+            SyncEvent::Finished(Err(error)) => {
+                self.sync_busy.set(false);
+                self.sync_failed.set(true);
+                self.sync_status.set(error);
+            }
+        }
+    }
+
     /// Installs this model as the receiver of library watcher reports.
     pub fn install_disk_handler(&self) {
         let model = self.clone();
@@ -769,7 +936,8 @@ impl Model {
                 // An undoable whole-document edit keeps ⌘Z working after a
                 // restore.
                 self.request_edit(0..length, text, 0, None);
-                self.notice.set("已恢复历史版本，刚才的内容也存为快照".to_owned());
+                self.notice
+                    .set("已恢复历史版本，刚才的内容也存为快照".to_owned());
                 self.refresh_history();
                 self.history_open.set(false);
                 self.bump();
@@ -788,18 +956,14 @@ impl Model {
 
     pub fn select(&self, id: &str) {
         let id = id.to_owned();
-        self.structural(move |session, current| {
-            session.select(&id, current).map(drop)
-        });
+        self.structural(move |session, current| session.select(&id, current).map(drop));
         self.showing_editor.set(true);
         self.restore_caret();
     }
 
     pub fn open_path(&self, path: &Path) {
         let path = path.to_path_buf();
-        self.structural(move |session, current| {
-            session.open_path(&path, current).map(drop)
-        });
+        self.structural(move |session, current| session.open_path(&path, current).map(drop));
         self.showing_editor.set(true);
         self.restore_caret();
     }

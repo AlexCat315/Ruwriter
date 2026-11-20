@@ -53,7 +53,7 @@ pub enum Rescan {
 /// user's settings. Version 1 also listed every document; it is migrated.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
-struct AppState {
+pub(crate) struct AppState {
     version: u32,
     library_folder: Option<PathBuf>,
     active: Option<String>,
@@ -61,6 +61,8 @@ struct AppState {
     external: BTreeMap<String, Meta>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     documents: Vec<LegacyDocument>,
+    /// Gist cloud backup settings and last-synced hashes.
+    pub(crate) sync: crate::sync::SyncConfig,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -76,12 +78,12 @@ struct LegacyDocument {
 
 pub struct Session {
     pub data_root: PathBuf,
-    app: AppState,
+    pub(crate) app: AppState,
     pub library: Library,
     pub active: Option<String>,
     /// Last text known to be on disk; the dirty baseline.
     pub saved: String,
-    saved_stamp: Option<Stamp>,
+    pub(crate) saved_stamp: Option<Stamp>,
     /// Counts replacements of the open document's text by its file.
     pub reloads: u64,
     /// Where the last write that found the file changed kept the user's text.
@@ -105,6 +107,9 @@ impl Session {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
+        if app.sync.library_id.is_empty() {
+            app.sync.library_id = crate::sync::new_library_id();
+        }
         let root = app
             .library_folder
             .clone()
@@ -133,6 +138,7 @@ impl Session {
         if !legacy.is_empty() {
             session.migrate(legacy);
         }
+        session.ensure_sync_uids();
         if session
             .app
             .settings
@@ -388,7 +394,7 @@ impl Session {
 
     // MARK: - Persistence
 
-    fn persist_app(&mut self) {
+    pub(crate) fn persist_app(&mut self) {
         self.app.version = APP_STATE_VERSION;
         self.app.active = self.active.clone();
         self.app.external = self.library.external.clone();
@@ -400,7 +406,7 @@ impl Session {
     }
 
     /// Writes both state files. Failing to persist a cache never blocks work.
-    fn persist(&mut self) {
+    pub(crate) fn persist(&mut self) {
         let _ = self.library.save_state();
         self.persist_app();
     }
@@ -408,7 +414,11 @@ impl Session {
     // MARK: - Snapshots
 
     fn snapshot_root(&self, id: &str) -> &Path {
-        if self.library.find(id).is_some_and(|document| !document.external) {
+        if self
+            .library
+            .find(id)
+            .is_some_and(|document| !document.external)
+        {
             &self.library.root
         } else {
             &self.data_root
@@ -429,7 +439,8 @@ impl Session {
             .clone()
             .ok_or_else(|| "没有打开的文档".to_owned())?;
         let root = self.snapshot_root(&id).to_path_buf();
-        let created = snapshots::create(&root, &id, text, now()).map_err(|error| error.to_string())?;
+        let created =
+            snapshots::create(&root, &id, text, now()).map_err(|error| error.to_string())?;
         if created.is_some() {
             self.snapshot_at = Some((id, now()));
         }
@@ -579,7 +590,7 @@ impl Session {
 
     // MARK: - Opening
 
-    fn open_document(&mut self, id: &str) {
+    pub(crate) fn open_document(&mut self, id: &str) {
         let path = self.library.path_for(id);
         self.saved = read_document(&path).unwrap_or_default();
         self.saved_stamp = stamp(&path);
@@ -645,7 +656,7 @@ impl Session {
         Ok(self.saved.clone())
     }
 
-    fn activate_new(&mut self, folder: &str) -> Result<(), String> {
+    pub(crate) fn activate_new(&mut self, folder: &str) -> Result<(), String> {
         let directory = self.folder_path(folder);
         let extension = self.app.settings.writing_mode.extension();
         let path = unique_path(&directory, UNTITLED, extension, None);

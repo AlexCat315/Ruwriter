@@ -245,6 +245,9 @@ pub struct Meta {
     /// Caret character offset last seen in this document, so reopening puts
     /// the author back where they stopped instead of at the top.
     pub last_caret: usize,
+    /// Stable identity for cloud sync. Generated from the path the first time
+    /// the file is seen, then carried by the metadata across renames.
+    pub uid: String,
 }
 
 /// The state file inside the library folder.
@@ -619,6 +622,9 @@ fn refresh(
     meta: &mut Meta,
 ) -> Option<Document> {
     let current = stamp(path)?;
+    if meta.uid.is_empty() {
+        meta.uid = crate::sync::uid_for(id, meta.created_at);
+    }
     if meta.stamp != current || (meta.title.is_empty() && current.size > 0) {
         let text = read_document(path).unwrap_or_default();
         let derived = derive(&text, &file_stem(path), meta.auto_named);

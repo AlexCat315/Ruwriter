@@ -10,6 +10,7 @@ mod palette;
 mod rename;
 mod root;
 mod sidebar;
+mod sync;
 mod ui;
 
 pub use root::RootView;

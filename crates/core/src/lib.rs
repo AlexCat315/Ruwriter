@@ -9,6 +9,7 @@ pub mod paths;
 pub mod session;
 pub mod snapshots;
 pub mod stats;
+pub mod sync;
 
 pub use document::{DocStatus, Document, normalize_tags, parse_tags, title_from_text};
 pub use library::{
@@ -19,3 +20,6 @@ pub use outline::{Heading, heading_at, headings, is_chapter_line};
 pub use session::{Rescan, Session, ViewOptions};
 pub use snapshots::Snapshot;
 pub use stats::{WritingStats, count};
+pub use sync::{
+    Manifest, ManifestDoc, SyncBase, SyncConfig, SyncDocument, SyncOutcome, SyncReport,
+};

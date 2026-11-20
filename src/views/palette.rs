@@ -50,6 +50,13 @@ impl View for Palette {
             )
             .keywords(["open", "dakai"]),
             command(
+                "云同步…",
+                "文稿",
+                icons::device::cloud_upload(),
+                Rc::new(Model::open_sync),
+            )
+            .keywords(["sync", "gist", "cloud", "beifen", "yun", "tongbu"]),
+            command(
                 "文稿信息…",
                 "文稿",
                 icons::file::file_text(),
@@ -71,7 +78,9 @@ impl View for Palette {
                 icons::data::clock(),
                 Rc::new(Model::open_history),
             )
-            .keywords(["history", "version", "snapshot", "lishi", "huifu", "kuaizhao"]),
+            .keywords([
+                "history", "version", "snapshot", "lishi", "huifu", "kuaizhao",
+            ]),
             command(
                 if model.writing_mode() == ruwriter_core::WritingMode::Novel {
                     "切换为 Markdown 模式"
@@ -98,27 +107,21 @@ impl View for Palette {
                 "窄栏",
                 "排版",
                 icons::layout::columns_2(),
-                Rc::new(|model: &Model| {
-                    model.set_column_width(ruwriter_core::ColumnWidth::Narrow)
-                }),
+                Rc::new(|model: &Model| model.set_column_width(ruwriter_core::ColumnWidth::Narrow)),
             )
             .keywords(["width", "column", "lan", "zhaian", "banxin"]),
             command(
                 "标准栏宽",
                 "排版",
                 icons::layout::columns_2(),
-                Rc::new(|model: &Model| {
-                    model.set_column_width(ruwriter_core::ColumnWidth::Normal)
-                }),
+                Rc::new(|model: &Model| model.set_column_width(ruwriter_core::ColumnWidth::Normal)),
             )
             .keywords(["width", "column", "biaozhun", "banxin"]),
             command(
                 "宽栏",
                 "排版",
                 icons::layout::columns_2(),
-                Rc::new(|model: &Model| {
-                    model.set_column_width(ruwriter_core::ColumnWidth::Wide)
-                }),
+                Rc::new(|model: &Model| model.set_column_width(ruwriter_core::ColumnWidth::Wide)),
             )
             .keywords(["width", "column", "kuan", "kuanlan", "banxin"]),
             command(
@@ -142,9 +145,7 @@ impl View for Palette {
                 },
                 "排版",
                 icons::layout::columns_2(),
-                Rc::new(|model: &Model| {
-                    model.set_line_spacing(ruwriter_core::LineSpacing::Loose)
-                }),
+                Rc::new(|model: &Model| model.set_line_spacing(ruwriter_core::LineSpacing::Loose)),
             )
             .keywords(["line", "spacing", "hangju", "kuansong"]),
             command(

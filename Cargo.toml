@@ -1,6 +1,6 @@
 [package]
 name = "ruwriter"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
@@ -8,7 +8,7 @@ publish = false
 [package.metadata.cove]
 id = "dev.cyke.ruwriter"
 name = "Ruwriter"
-build = 3
+build = 4
 
 [workspace]
 members = [".", "crates/core", "xtask"]
@@ -16,6 +16,8 @@ members = [".", "crates/core", "xtask"]
 [dependencies]
 cove-ui = { path = "../Cove" }
 ruwriter-core = { path = "crates/core" }
+cove-http = { path = "../Cove/crates/http" }
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -29,3 +31,6 @@ undocumented_unsafe_blocks = "deny"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"

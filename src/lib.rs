@@ -1,6 +1,7 @@
 mod app;
 mod dates;
 mod formatting;
+pub mod gist;
 mod markdown_syntax;
 mod menu_bar;
 mod model;
