@@ -144,7 +144,7 @@ jobs:
           NOTES="docs/release-notes-${RELEASE_TAG}.md"
           BODY=(--generate-notes)
           if [ -f "$NOTES" ]; then
-            BODY=(--body-file "$NOTES")
+            BODY=(--notes-file "$NOTES")
           fi
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
