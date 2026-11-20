@@ -1,0 +1,134 @@
+name: Installers
+
+# Re-packages the binaries from an existing release into native installers
+# without rebuilding the Rust app. Used when the release was first published
+# as zip/tar archives and needs dmg/exe/deb instead.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to repackage
+        required: true
+        default: v0.4.0
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: arm64
+            runner: macos-26
+          - suffix: x86_64
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download app archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p download/app
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*-macos-${{ matrix.suffix }}.zip" --dir download
+          unzip -q download/*.zip -d download/app
+      - name: Build dmg
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build-dmg.sh
+          bash scripts/build-dmg.sh "download/app/Ruwriter.app" "Ruwriter-${TAG}-macos-${{ matrix.suffix }}.dmg" "Ruwriter"
+      - name: Upload dmg
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "Ruwriter-${TAG}-macos-${{ matrix.suffix }}.dmg" --repo "$GITHUB_REPOSITORY" --clobber
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download app archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p download/app dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*-windows-x64.zip" --dir download
+          tar -xf download/*.zip -C download/app
+          mv download/app/Ruwriter dist/Ruwriter
+      - name: Build installer
+        run: |
+          set -euo pipefail
+          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "$iscc" ]; then
+            choco install innosetup --no-progress -y
+          fi
+          test -f "$iscc" || { echo "Inno Setup compiler not found" >&2; exit 1; }
+          "$iscc" packaging/windows/Ruwriter.iss \
+            "/DAppVersion=${TAG#v}" \
+            "/DOutputName=Ruwriter-${TAG}-windows-x64-setup"
+          test -f "dist/Ruwriter-${TAG}-windows-x64-setup.exe"
+      - name: Upload installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "dist/Ruwriter-${TAG}-windows-x64-setup.exe" --repo "$GITHUB_REPOSITORY" --clobber
+
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download app archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p download
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*-linux-x64.tar.gz" --dir download
+          tar -xzf download/*.tar.gz -C download
+      - name: Build deb
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build-deb.sh
+          bash scripts/build-deb.sh download/Ruwriter "${TAG#v}" amd64 "Ruwriter-${TAG}-linux-x64.deb"
+          dpkg-deb --info "Ruwriter-${TAG}-linux-x64.deb"
+      - name: Upload deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "Ruwriter-${TAG}-linux-x64.deb" --repo "$GITHUB_REPOSITORY" --clobber
+
+  finalize:
+    name: Replace archives with installers
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Remove archives and write checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release
+
+          for file in release/*.zip release/*.tar.gz; do
+            [ -e "$file" ] || continue
+            gh release delete-asset "$TAG" "$(basename "$file")" --repo "$GITHUB_REPOSITORY" -y
+            rm "$file"
+          done
+          gh release delete-asset "$TAG" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" -y || true
+          rm -f release/SHA256SUMS.txt
+
+          cd release
+          sha256sum Ruwriter-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" Ruwriter-* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber

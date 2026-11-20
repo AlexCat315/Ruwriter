@@ -25,16 +25,16 @@ gh auth login
 
 | 平台 | 文件 |
 | --- | --- |
-| macOS Apple 芯片 | `Ruwriter-v0.4.0-macos-arm64.zip` |
-| macOS Intel | `Ruwriter-v0.4.0-macos-x86_64.zip` |
-| Windows x64 | `Ruwriter-v0.4.0-windows-x64.zip` |
-| Linux x64 | `Ruwriter-v0.4.0-linux-x64.tar.gz` |
+| macOS Apple 芯片 | `Ruwriter-v0.4.0-macos-arm64.dmg` |
+| macOS Intel | `Ruwriter-v0.4.0-macos-x86_64.dmg` |
+| Windows x64 | `Ruwriter-v0.4.0-windows-x64-setup.exe` |
+| Linux x64 | `Ruwriter-v0.4.0-linux-x64.deb` |
 
 ### 安装说明
 
-- macOS：解压后把 `Ruwriter.app` 拖进「应用程序」。当前包没有 Apple 开发者签名与公证，首次打开请右键「打开」，或到「系统设置 → 隐私与安全性」允许。
-- Windows：解压整个文件夹后运行 `Ruwriter.exe`。未签名，SmartScreen 提示时选择「更多信息 → 仍要运行」。
-- Linux：解压后运行目录里的 `Ruwriter`，需要系统具备 Vulkan 与常用 X11 / Wayland 图形库。
+- macOS：打开 `.dmg`，把 `Ruwriter.app` 拖进「应用程序」。当前包没有 Apple 开发者签名与公证，首次打开请右键「打开」，或到「系统设置 → 隐私与安全性」允许。
+- Windows：运行 `Ruwriter-v0.4.0-windows-x64-setup.exe` 安装。未签名，SmartScreen 提示时选择「更多信息 → 仍要运行」。
+- Linux：`sudo apt install ./Ruwriter-v0.4.0-linux-x64.deb`，需要系统具备 Vulkan 与常用 X11 / Wayland 图形库。
 - iOS 与 Android 需要各自的签名材料，本次不提供移动端安装包。
 
 下载后可用同一 Release 里的 `SHA256SUMS.txt` 校验文件完整性。资料库默认位于用户数据目录，可用 `RUWRITER_DATA_DIR` 指定；正文是普通 `.txt` / `.md` 文件，`.ruwriter/` 只保存派生状态与快照。

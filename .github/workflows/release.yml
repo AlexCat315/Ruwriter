@@ -26,19 +26,19 @@ jobs:
           - label: macOS arm64
             os: macos-26
             platform: mac
-            asset: macos-arm64.zip
+            asset: macos-arm64.dmg
           - label: macOS x86_64
             os: macos-26-intel
             platform: mac
-            asset: macos-x86_64.zip
+            asset: macos-x86_64.dmg
           - label: Windows x64
             os: windows-2025
             platform: windows
-            asset: windows-x64.zip
+            asset: windows-x64-setup.exe
           - label: Linux x64
             os: ubuntu-24.04
             platform: linux
-            asset: linux-x64.tar.gz
+            asset: linux-x64.deb
     defaults:
       run:
         shell: bash
@@ -95,18 +95,29 @@ jobs:
       - name: Build desktop package
         run: cargo xtask package ${{ matrix.platform }} --release --output dist
 
-      - name: Archive macOS app
+      - name: Build macOS dmg
         if: runner.os == 'macOS'
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/Ruwriter.app" "Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}"
+        run: |
+          chmod +x scripts/build-dmg.sh
+          bash scripts/build-dmg.sh "dist/Ruwriter.app" "Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}" "Ruwriter"
 
-      - name: Archive Windows folder
+      - name: Build Windows installer
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: Compress-Archive -Path dist/Ruwriter -DestinationPath "Ruwriter-$env:RELEASE_TAG-${{ matrix.asset }}"
+        run: |
+          iscc="/c/Program Files (x86)/Inno Setup 6/ISCC.exe"
+          if [ ! -f "$iscc" ]; then
+            choco install innosetup --no-progress -y
+          fi
+          test -f "$iscc" || { echo "Inno Setup compiler not found" >&2; exit 1; }
+          "$iscc" packaging/windows/Ruwriter.iss \
+            "/DAppVersion=${RELEASE_TAG#v}" \
+            "/DOutputName=Ruwriter-${RELEASE_TAG}-windows-x64-setup"
 
-      - name: Archive Linux folder
+      - name: Build Debian package
         if: runner.os == 'Linux'
-        run: tar -C dist -czf "Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}" Ruwriter
+        run: |
+          chmod +x scripts/build-deb.sh
+          bash scripts/build-deb.sh dist/Ruwriter "${RELEASE_TAG#v}" amd64 "Ruwriter-${RELEASE_TAG}-${{ matrix.asset }}"
 
       - name: Upload release asset
         uses: actions/upload-artifact@v4

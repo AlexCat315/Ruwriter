@@ -6,7 +6,7 @@
 
 ## 下载
 
-[GitHub Releases](https://github.com/AlexCat315/Ruwriter/releases) 提供 macOS（Apple 芯片 / Intel）、Windows x64 与 Linux x64 的桌面包。当前包没有 Apple 开发者签名，macOS 首次打开需右键「打开」或在「系统设置 → 隐私与安全性」允许；Windows 可能提示 SmartScreen，选择「更多信息 → 仍要运行」。iOS 与 Android 需要各自的签名材料，暂不提供安装包。
+[GitHub Releases](https://github.com/AlexCat315/Ruwriter/releases) 提供 macOS（Apple 芯片 / Intel）的 `.dmg`、Windows x64 的 `.exe` 安装程序与 Linux x64 的 `.deb`。当前包没有 Apple 开发者签名，macOS 首次打开需右键「打开」或在「系统设置 → 隐私与安全性」允许；Windows 可能提示 SmartScreen，选择「更多信息 → 仍要运行」。iOS 与 Android 需要各自的签名材料，暂不提供安装包。
 
 ## 界面
 
