@@ -5,3 +5,5 @@ Platforms/Android/cove.properties
 *.apk
 *.apk.idsig
 *.keystore
+
+packaging/windows/Ruwriter.generated.iss

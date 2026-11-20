@@ -1,10 +1,10 @@
 ; Ruwriter Windows installer (Inno Setup 6).
-; Build: iscc packaging\windows\Ruwriter.iss /DAppVersion=0.4.0 /DOutputName=Ruwriter-v0.4.0-windows-x64-setup
+; Build: substitute @APP_VERSION@ and @OUTPUT_NAME@, then run iscc on the generated file.
 #ifndef AppVersion
-  #define AppVersion "0.0.0"
+  #define AppVersion "@APP_VERSION@"
 #endif
 #ifndef OutputName
-  #define OutputName "Ruwriter"
+  #define OutputName "@OUTPUT_NAME@"
 #endif
 
 [Setup]
