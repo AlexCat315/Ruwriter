@@ -109,9 +109,10 @@ jobs:
             choco install innosetup --no-progress -y
           fi
           test -f "$iscc" || { echo "Inno Setup compiler not found" >&2; exit 1; }
-          "$iscc" packaging/windows/Ruwriter.iss \
+          "$iscc" \
             "/DAppVersion=${RELEASE_TAG#v}" \
-            "/DOutputName=Ruwriter-${RELEASE_TAG}-windows-x64-setup"
+            "/DOutputName=Ruwriter-${RELEASE_TAG}-windows-x64-setup" \
+            packaging/windows/Ruwriter.iss
 
       - name: Build Debian package
         if: runner.os == 'Linux'

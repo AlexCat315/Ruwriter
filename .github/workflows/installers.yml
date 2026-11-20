@@ -79,9 +79,10 @@ jobs:
             choco install innosetup --no-progress -y
           fi
           test -f "$iscc" || { echo "Inno Setup compiler not found" >&2; exit 1; }
-          "$iscc" packaging/windows/Ruwriter.iss \
+          "$iscc" \
             "/DAppVersion=${TAG#v}" \
-            "/DOutputName=Ruwriter-${TAG}-windows-x64-setup"
+            "/DOutputName=Ruwriter-${TAG}-windows-x64-setup" \
+            packaging/windows/Ruwriter.iss
           test -f "dist/Ruwriter-${TAG}-windows-x64-setup.exe"
       - name: Upload installer
         env:
