@@ -124,7 +124,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Ruwriter-${{ matrix.label }}
-          path: Ruwriter/Ruwriter-${{ github.ref_name }}-${{ matrix.asset }}
+          path: Ruwriter/dist/Ruwriter-${{ github.ref_name }}-${{ matrix.asset }}
           if-no-files-found: error
           retention-days: 7
 
