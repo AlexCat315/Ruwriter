@@ -64,8 +64,13 @@ jobs:
           set -euo pipefail
           mkdir -p download/app dist
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*-windows-x64.zip" --dir download
-          tar -xf download/*.zip -C download/app
-          mv download/app/Ruwriter dist/Ruwriter
+      - name: Extract app archive
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem download -Filter *.zip | Select-Object -First 1
+          Expand-Archive -Path $zip.FullName -DestinationPath download/app -Force
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Move-Item download/app/Ruwriter dist/Ruwriter
       - name: Build installer
         run: |
           set -euo pipefail
