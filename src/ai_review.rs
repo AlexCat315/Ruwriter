@@ -12,10 +12,10 @@ use crate::ai_continuation::{
 use crate::ai_research::Source;
 
 const REVIEW: &str = r#"你是这部小说的编辑。先判断 candidate 是否真的交付了正文。只有流程解释、提纲、拒绝或索取材料时，usable 为 false。人物对白或实际接续的半句可以是正文。
-检查人名、角色已知事实、物品与时间是否和原稿相符，已经发生的事有没有被重写。不要用其他题材或你的文字偏好评判这部作品。比较 manuscript_excerpt 和 author_examples 中叙述者说话的方法、长短句、对白切换、情绪和场景收束。作者原有的术语、调侃、抒情、议论或感官细节应保留。只有与作者稿实际不同、会造成跳脱的地方才报告。举原稿中支持判断的短句，诸如「文风偏 AI」的抽象判断无效。author_revisions 按时间排列，最新的要求优先。
-只输出 JSON 对象，格式为 {"usable":true,"issues":[{"kind":"continuity","quote":"候选稿原句","reason":"问题和改法","source":null,"basis":"用来核对的原稿或作者样段中的逐字短句"}]}。kind 为 continuity、voice 或 intent。缺乏确切原句时 basis 填 null，并说明待核对。只有实际引用了检索来源才填 source 编号。最多五项，没发现问题时 issues 为空。不要凭空添加新设定。"#;
+核对 genre、tone 和 direction 的创作意图。author_truth_for_review_only 是只供审稿核对的作者私设，包括真实动机、谁已知、何时可以揭示。用它判断越过视角、不当揭露或把人物说法坐实，审稿意见只引用候选稿及公开原文，不复述私设。检查人名、角色已知事实、物品与时间是否和原稿相符，已经发生的事有没有被重写。不要用其他题材或你的文字偏好评判这部作品。比较 manuscript_excerpt 和 author_examples 中叙述者说话的方法、长短句、对白切换、情绪和场景收束。作者原有的术语、调侃、抒情、议论或感官细节应保留。只有与作者稿实际不同、会造成跳脱的地方才报告。举原稿中支持判断的短句，诸如「文风偏 AI」的抽象判断无效。author_revisions 按时间排列，最新的要求优先。
+只输出 JSON 对象，格式为 {"usable":true,"issues":[{"kind":"continuity","quote":"候选稿原句","reason":"问题和改法","source":null,"basis":"用来核对的原稿或作者样段中的逐字短句"}]}。kind 为 continuity、voice、intent 或 disclosure。只有候选稿确实提前揭露私设、把未获证实的角色说法坐实，或超出当前视角时才用 disclosure。作者本轮明确要求揭晓且视角允许时，按本轮要求审稿。缺乏确切原句时 basis 填 null，并说明待核对。只有实际引用了检索来源才填 source 编号。最多五项，没发现问题时 issues 为空。不要凭空添加新设定。"#;
 
-const REVISE: &str = r#"按原文和作者要求修订候选稿。candidate 为空时，直接使用 manuscript_excerpt 起草。revision 是当前要做的事；author_revisions 中仍适用的作者要求继续遵守。author_examples 只供揣摩写法，原稿写法优先，不能把样段事件带进剧情。定位被指出的句子，保留其他已成立的事实、视角和节奏。有话没说完就从原稿末字后接，不抄原稿，不重新叙述已发生的事。只输出完整的修订后候选正文。"#;
+const REVISE: &str = r#"按原文和作者要求修订候选稿。candidate 为空时，直接使用 manuscript_excerpt 起草。revision 是当前要做的事；author_revisions 中仍适用的作者要求继续遵守。accepted_revisions 是作者明示保留的改法，仅参考发生变化的写法。author_examples 只供揣摩写法，原稿写法优先，不能把样段事件带进剧情。定位被指出的句子，保留其他已成立的事实、视角和节奏。有话没说完就从原稿末字后接，不抄原稿，不重新叙述已发生的事。只输出完整的修订后候选正文。"#;
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +23,7 @@ pub enum IssueKind {
     Continuity,
     Voice,
     Intent,
+    Disclosure,
 }
 
 impl IssueKind {
@@ -31,6 +32,7 @@ impl IssueKind {
             Self::Continuity => "连续性",
             Self::Voice => "文风",
             Self::Intent => "作者要求",
+            Self::Disclosure => "知情边界",
         }
     }
 }
@@ -53,14 +55,31 @@ pub enum Review {
 }
 
 impl Review {
-    pub fn revision_direction(&self) -> Option<String> {
+    pub fn has_disclosure(&self) -> bool {
+        matches!(self, Self::Checked(issues) if issues.iter().any(|issue| matches!(issue.kind, IssueKind::Disclosure)))
+    }
+
+    pub fn revision_direction(&self, protect_truth: bool) -> Option<String> {
         let Self::Checked(issues) = self else {
             return None;
         };
         let edits: Vec<_> = issues
             .iter()
             .filter_map(|issue| {
+                if matches!(issue.kind, IssueKind::Disclosure) {
+                    return Some(format!(
+                        "删除「{}」中超出当前视角的定论，保留可观察的言行和不确定性。",
+                        issue.quote
+                    ));
+                }
                 let basis = issue.basis.as_ref()?;
+                if protect_truth {
+                    return Some(format!(
+                        "参照公开原文「{basis}」检查「{}」的{}，不要补写角色尚不知道的内容。",
+                        issue.quote,
+                        issue.kind.label()
+                    ));
+                }
                 Some(format!(
                     "「{}」{}。对照原稿「{basis}」。",
                     issue.quote, issue.reason
@@ -81,7 +100,7 @@ impl Review {
             return false;
         };
         let counts = |issues: &[DraftIssue]| {
-            let mut counts = [0usize; 3];
+            let mut counts = [0usize; 4];
             for issue in issues {
                 counts[issue.kind as usize] += 1;
             }
@@ -89,13 +108,19 @@ impl Review {
         };
         let before_counts = counts(before);
         let after_counts = counts(after);
-        let grounded_after = after.iter().filter(|issue| issue.basis.is_some()).count();
-        let grounded_before = before.iter().filter(|issue| issue.basis.is_some()).count();
+        let actionable = |issues: &[DraftIssue]| {
+            issues
+                .iter()
+                .filter(|issue| {
+                    issue.basis.is_some() || matches!(issue.kind, IssueKind::Disclosure)
+                })
+                .count()
+        };
         before_counts
             .iter()
             .zip(after_counts)
             .all(|(prior, later)| later <= *prior)
-            && grounded_after < grounded_before
+            && actionable(after) < actionable(before)
     }
 }
 
@@ -125,10 +150,11 @@ impl DraftContext {
             "author_revisions": revisions,
             "manuscript_excerpt": self.excerpt,
             "continuity": self.plan,
-            "story": self.brief.story,
+            "story": self.brief.story.public_view(),
             "canon": self.brief.canon,
             "voice": self.brief.voice,
             "author_examples": self.voice_samples,
+            "accepted_revisions": self.brief.feedback,
             "avoid": self.brief.avoid,
             "evidence": evidence,
             "candidate": draft,
@@ -145,7 +171,9 @@ impl DraftContext {
         if self.task == WritingTask::Request {
             return Review::NotRequested;
         }
-        prose_reply(model, REVIEW, &self.payload(draft, sources, revisions))
+        let mut input = self.payload(draft, sources, revisions);
+        input["author_truth_for_review_only"] = json!(self.brief.story.author_truth);
+        prose_reply(model, REVIEW, &input)
             .ok()
             .and_then(|reply| {
                 parse_review(&reply, draft, sources, |quote| {
@@ -284,9 +312,14 @@ mod tests {
             {"kind":"voice","quote":"命运","reason":"改用原稿里的客观动作","basis":"他把匣子交给阿霜。"}
         ]}"#;
         let unsupported = parse_review(report, draft, &[], |_| false).unwrap();
-        assert!(unsupported.revision_direction().is_none());
+        assert!(unsupported.revision_direction(false).is_none());
         let original = parse_review(report, draft, &[], |quote| earlier.contains(quote)).unwrap();
-        assert!(original.revision_direction().unwrap().contains(earlier));
+        assert!(
+            original
+                .revision_direction(false)
+                .unwrap()
+                .contains(earlier)
+        );
         let revision = "他把匣子交给阿禾。";
         let worse = parse_review(
             r#"{"usable":true,"issues":[

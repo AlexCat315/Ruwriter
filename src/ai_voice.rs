@@ -47,6 +47,49 @@ fn dialogue_share(text: &str) -> usize {
     dialogue * 100 / prose.max(1)
 }
 
+/// Reuse the generic Cove text index for author-approved revision examples.
+pub fn select_feedback(
+    request: &str,
+    scene: &str,
+    records: &[ruwriter_core::WritingFeedback],
+) -> Vec<ruwriter_core::WritingFeedback> {
+    use cove_agent::retrieval::SearchIndex;
+    use ruwriter_core::WritingFeedback;
+    let mut index = SearchIndex::default();
+    for record in records {
+        index.add(&record.instruction, &record.after);
+    }
+    let sentence = scene.trim_end().lines().last().unwrap_or_default();
+    let query = format!("{request} {sentence}");
+    let mut selected = index.search(&query, 3);
+    if selected.is_empty() {
+        selected.extend((0..records.len()).rev().take(2));
+    }
+    selected
+        .into_iter()
+        .map(|index| {
+            let record = &records[index];
+            let common = record
+                .before
+                .chars()
+                .zip(record.after.chars())
+                .take_while(|(a, b)| a == b)
+                .map(|(character, _)| character.len_utf8())
+                .sum::<usize>();
+            let excerpt = |text: &str| {
+                let start = text.floor_char_boundary(common.saturating_sub(180));
+                let end = text.floor_char_boundary((common + 1800).min(text.len()));
+                text[start..end].to_owned()
+            };
+            WritingFeedback {
+                instruction: record.instruction.clone(),
+                before: excerpt(&record.before),
+                after: excerpt(&record.after),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

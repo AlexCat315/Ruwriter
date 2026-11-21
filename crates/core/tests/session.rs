@@ -52,7 +52,9 @@ fn a_work_brief_survives_folder_rename_and_reopening() {
             outline: "守门人交出北门钥匙。".to_owned(),
             characters: "阿玉，守门人。".to_owned(),
             open_threads: "北门还没开。".to_owned(),
+            ..Default::default()
         },
+        ..Default::default()
     };
     session
         .library

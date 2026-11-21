@@ -1,4 +1,5 @@
 mod ai;
+mod ai_chat;
 mod ai_continuation;
 mod ai_research;
 mod ai_review;

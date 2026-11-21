@@ -16,9 +16,10 @@ use cove_agent::{
 use cove_ui::compose::primitives::text::TextBuffer;
 use cove_ui::composition::Scope;
 use cove_ui::core::{Binding, Signal, SignalSender};
-use ruwriter_core::{AiPreferences, AiSettings, StoryProfile, WritingBrief};
+use ruwriter_core::{AiPreferences, AiSettings, StoryProfile, WritingBrief, WritingFeedback};
 use serde_json::json;
 
+use crate::ai_chat;
 use crate::ai_continuation::{self, SCENE_CHARACTERS, ScenePlan};
 use crate::ai_research::{
     self, ResearchCache, ResearchRequest, ResearchRun, ResearchScope, Source,
@@ -224,6 +225,28 @@ impl ModelRun {
     pub fn draft_in_progress(&self) -> Option<&WritingResult> {
         self.draft_preview.as_deref().or(self.revising.as_deref())
     }
+
+    pub fn feedback_example(&self) -> Option<WritingFeedback> {
+        let ModelStatus::Ready(result) = &self.status else {
+            return None;
+        };
+        if result.task == WritingTask::Request || !result.can_adopt() {
+            return None;
+        }
+        let after = result.text.string_value();
+        let (before, instruction) = if !result.text.has_same_contents(&result.original_text) {
+            (result.original_text.string_value(), "作者手改".to_owned())
+        } else {
+            let previous = self.previous.as_ref()?;
+            let instruction = result.revisions.last()?.clone();
+            (previous.text.string_value(), instruction)
+        };
+        (before != after).then_some(WritingFeedback {
+            before,
+            after,
+            instruction,
+        })
+    }
 }
 
 pub type WorkspaceKey = Option<(PathBuf, String)>;
@@ -242,6 +265,7 @@ pub enum StoryStatus {
 
 #[derive(Clone)]
 pub struct ChatTurn {
+    pub id: String,
     pub author: TextBuffer,
     pub answer: Option<TextBuffer>,
     pub adopted: bool,
@@ -255,6 +279,9 @@ pub struct Batch {
     task: WritingTask,
     pub prompt: TextBuffer,
     pub history: Arc<Vec<ChatTurn>>,
+    turn_id: String,
+    selected: usize,
+    pub archive_error: Option<String>,
     scope: ResearchScope,
     pub adopted: Option<usize>,
     pre_adoption: Option<TextBuffer>,
@@ -287,6 +314,7 @@ impl Batch {
             _ => None,
         };
         Arc::make_mut(&mut history).push(ChatTurn {
+            id: self.turn_id.clone(),
             author: self.prompt.clone(),
             answer,
             adopted: self.applied(),
@@ -326,11 +354,25 @@ impl WritingResult {
         !text.trim().is_empty()
             && (self.task == WritingTask::Request
                 || (!matches!(self.review, Review::Rejected)
+                    && !self.review.has_disclosure()
+                    && !self.needs_private_review()
                     && !ai_continuation::is_non_prose(&text)))
     }
 
+    pub fn needs_private_review(&self) -> bool {
+        !self
+            .draft_context
+            .brief
+            .story
+            .author_truth
+            .trim()
+            .is_empty()
+            && (!matches!(self.review, Review::Checked(_))
+                || !self.text.has_same_contents(&self.reviewed_text))
+    }
+
     fn revise_checked_issues(&mut self, model: &AgentModel, on_revision: impl FnOnce()) {
-        let Some(direction) = self.review.revision_direction() else {
+        let Some(direction) = self.review_revision_instruction() else {
             return;
         };
         on_revision();
@@ -356,6 +398,11 @@ impl WritingResult {
             self.review = review;
             self.repetition_warning = warning;
         }
+    }
+
+    pub fn review_revision_instruction(&self) -> Option<String> {
+        self.review
+            .revision_direction(!self.draft_context.brief.story.author_truth.is_empty())
     }
 }
 
@@ -389,6 +436,12 @@ pub struct AiState {
     pub story_outline: Signal<TextBuffer>,
     pub story_characters: Signal<TextBuffer>,
     pub story_threads: Signal<TextBuffer>,
+    pub story_genre: Signal<TextBuffer>,
+    pub story_tone: Signal<TextBuffer>,
+    pub story_direction: Signal<TextBuffer>,
+    pub story_claims: Signal<TextBuffer>,
+    pub story_truth: Signal<TextBuffer>,
+    pub story_page: Signal<usize>,
     pub avoid: Signal<TextBuffer>,
     pub endpoint: Signal<TextBuffer>,
     pub model: Signal<TextBuffer>,
@@ -406,6 +459,7 @@ pub struct AiState {
     pub context: Signal<Result<TextBuffer, &'static str>>,
     pub target: Signal<Option<WritingTarget>>,
     workspace: Signal<WorkspaceKey>,
+    archived: Signal<Arc<Vec<ChatTurn>>>,
     stories: Signal<BTreeMap<WorkspaceKey, StoryStatus>>,
     batches: Signal<Workspaces>,
     composer_drafts: Signal<BTreeMap<WorkspaceKey, TextBuffer>>,
@@ -416,6 +470,7 @@ pub struct AiState {
     pub feedback: Signal<String>,
     pub follow_after_write: Signal<Option<PendingDraftEdit>>,
     pub error: Signal<String>,
+    pub archive_read_error: Signal<String>,
 }
 
 impl AiState {
@@ -438,6 +493,12 @@ impl AiState {
             story_outline: cx.state(TextBuffer::empty),
             story_characters: cx.state(TextBuffer::empty),
             story_threads: cx.state(TextBuffer::empty),
+            story_genre: cx.state(TextBuffer::empty),
+            story_tone: cx.state(TextBuffer::empty),
+            story_direction: cx.state(TextBuffer::empty),
+            story_claims: cx.state(TextBuffer::empty),
+            story_truth: cx.state(TextBuffer::empty),
+            story_page: cx.state(|| 0),
             avoid: cx.state(TextBuffer::empty),
             endpoint: cx.state(|| TextBuffer::new(&profile.endpoint)),
             model: cx.state(|| TextBuffer::new(&profile.model)),
@@ -455,6 +516,7 @@ impl AiState {
             context: cx.state(|| Ok(TextBuffer::empty())),
             target: cx.state(|| None),
             workspace: cx.state(|| None),
+            archived: cx.state(|| Arc::new(Vec::new())),
             stories: cx.state(BTreeMap::new),
             batches: cx.state(BTreeMap::new),
             composer_drafts: cx.state(BTreeMap::new),
@@ -465,6 +527,7 @@ impl AiState {
             feedback: cx.state(String::new),
             follow_after_write: cx.state(|| None),
             error: cx.state(String::new),
+            archive_read_error: cx.state(String::new),
         }
     }
 
@@ -574,6 +637,56 @@ impl AiState {
             .with_untracked(|batches| batches.get(&key).cloned())
     }
 
+    pub fn archived_chat(&self) -> Arc<Vec<ChatTurn>> {
+        self.archived.get()
+    }
+
+    pub fn current_chat(&self) -> Arc<Vec<ChatTurn>> {
+        self.current_batch().map_or_else(
+            || self.archived.get_untracked(),
+            |batch| batch.transcript(batch.selected),
+        )
+    }
+
+    pub fn select_draft(&self, index: usize) {
+        let key = self.workspace.get_untracked();
+        self.viewed_result.set(index);
+        self.batches.update(|batches| {
+            if let Some(batch) = batches.get_mut(&key) {
+                batch.selected = index;
+                persist_batch(&key, batch);
+            }
+        });
+        self.viewed_source.set(None);
+        self.clear_revision();
+    }
+
+    pub fn flush_chat(&self) {
+        let key = self.workspace.get_untracked();
+        self.batches.update(|batches| {
+            if let Some(batch) = batches.get_mut(&key) {
+                persist_batch(&key, batch);
+            }
+        });
+    }
+
+    pub fn import_chat(&self, path: &std::path::Path) -> Result<(), String> {
+        let key = self.workspace.get_untracked();
+        let (root, id) = key.as_ref().ok_or("请先打开文稿。")?;
+        if self.current_batch().is_some_and(|batch| batch.busy()) {
+            return Err("请等这轮写作结束再导入。".to_owned());
+        }
+        let imported = ai_chat::decode(path).map_err(|error| error.to_string())?;
+        let mut turns = self.current_chat().as_ref().clone();
+        ai_chat::merge_new(&mut turns, imported);
+        ai_chat::save(root, id, &turns, None).map_err(|error| error.to_string())?;
+        self.batches.update(|batches| {
+            batches.remove(&key);
+        });
+        self.archived.set(Arc::new(turns));
+        Ok(())
+    }
+
     pub fn story_status(&self) -> Option<StoryStatus> {
         let key = self.workspace.get();
         self.stories.with(|stories| stories.get(&key).cloned())
@@ -586,6 +699,11 @@ impl AiState {
                 token.store(true, Ordering::Relaxed);
             }
         });
+        if let Some((root, id)) = key
+            && let Err(error) = ai_chat::clear_story(&root, &id)
+        {
+            self.error.set(format!("无法清理作品资料草稿。{error}"));
+        }
     }
 
     pub fn confirm_story_for_session(&self, profile: StoryProfile) {
@@ -645,7 +763,18 @@ impl AiState {
                     })
                 });
                 update(match result {
-                    Ok(draft) => StoryStatus::Ready(draft),
+                    Ok(draft) => {
+                        if !token.load(Ordering::Relaxed)
+                            && let Some((root, id)) = key.as_ref()
+                            && let Err(error) = ai_chat::save_story(root, id, &draft)
+                        {
+                            update(StoryStatus::Failed(AgentError::Model(format!(
+                                "无法保存作品资料草稿。{error}"
+                            ))));
+                            return;
+                        }
+                        StoryStatus::Ready(draft)
+                    }
                     Err(error) => StoryStatus::Failed(error),
                 });
             })
@@ -661,6 +790,8 @@ impl AiState {
         if previous == key {
             return;
         }
+        self.flush_chat();
+        self.archive_read_error.set(String::new());
         let in_progress = self.prompt.get_untracked();
         let composer = self
             .composer_drafts
@@ -677,7 +808,37 @@ impl AiState {
         } else {
             WritingTask::Request
         };
+        let history = match key
+            .as_ref()
+            .map(|(root, id)| ai_chat::load(root, id))
+            .transpose()
+        {
+            Ok(history) => history.unwrap_or_default(),
+            Err(error) => {
+                self.archive_read_error
+                    .set(format!("无法读取对话存档。{error}"));
+                Vec::new()
+            }
+        };
+        self.archived.set(Arc::new(history));
+        if let Some((root, id)) = key.as_ref()
+            && !self
+                .stories
+                .with_untracked(|stories| stories.contains_key(&key))
+        {
+            match ai_chat::load_story(root, id) {
+                Ok(Some(draft)) => self.stories.update(|stories| {
+                    stories.insert(key.clone(), StoryStatus::Ready(draft));
+                }),
+                Ok(None) => {}
+                Err(error) => self
+                    .archive_read_error
+                    .set(format!("无法读取作品资料草稿。{error}")),
+            }
+        }
         self.workspace.set(key);
+        self.story_direction.set(TextBuffer::empty());
+        self.story_page.set(0);
         let batch = self.current_batch();
         self.follow_draft.set(true);
         self.task
@@ -690,7 +851,7 @@ impl AiState {
         self.prompt.set(composer.unwrap_or_else(TextBuffer::empty));
         self.feedback.set(String::new());
         self.viewed_result
-            .set(batch.and_then(|batch| batch.adopted).unwrap_or_default());
+            .set(batch.map_or(0, |batch| batch.adopted.unwrap_or(batch.selected)));
         self.viewed_source.set(None);
         self.clear_revision();
     }
@@ -707,6 +868,7 @@ impl AiState {
             if let Some(batch) = batches.get_mut(&key) {
                 batch.adopted = Some(index);
                 batch.pre_adoption = Some(before);
+                persist_batch(&key, batch);
             }
         });
         self.clear_revision();
@@ -727,6 +889,7 @@ impl AiState {
                 batch.adopted = None;
                 batch.pre_adoption = None;
                 undone = true;
+                persist_batch(&key, batch);
                 return true;
             }
             false
@@ -750,6 +913,7 @@ impl AiState {
                             .map_or(ModelStatus::Cancelled, ModelStatus::Ready);
                     }
                 }
+                persist_batch(&key, batch);
             }
         });
     }
@@ -858,7 +1022,7 @@ impl AiState {
             .collect();
         let flag = Arc::new(AtomicBool::new(false));
         let history = previous.as_ref().map_or_else(
-            || Arc::new(Vec::new()),
+            || self.archived.get_untracked(),
             |batch| batch.transcript(self.viewed_result.get_untracked()),
         );
         let displayed_prompt = if prompt.trim().is_empty() {
@@ -884,6 +1048,9 @@ impl AiState {
                     task,
                     prompt: TextBuffer::new(displayed_prompt),
                     history: history.clone(),
+                    turn_id: ai_chat::new_id(),
+                    selected: 0,
+                    archive_error: None,
                     scope: self.scope.get_untracked(),
                     adopted: None,
                     pre_adoption: None,
@@ -892,6 +1059,7 @@ impl AiState {
         });
         self.follow_draft.set(true);
         self.prompt.set(TextBuffer::empty());
+        self.flush_chat();
         if models.is_empty() {
             return Ok(());
         }
@@ -1050,6 +1218,7 @@ impl AiState {
             if let Some(instruction) = &revision {
                 batch.history = batch.transcript(index);
                 batch.prompt = TextBuffer::new(instruction);
+                batch.turn_id = ai_chat::new_id();
             }
             batch.cancelled = flag.clone();
             let run = &mut batch.runs[index];
@@ -1191,8 +1360,19 @@ fn update_batch(
             return false;
         }
         change(batch);
+        if !batch.busy() {
+            persist_batch(&key, batch);
+        }
         true
     });
+}
+
+fn persist_batch(key: &WorkspaceKey, batch: &mut Batch) {
+    let Some((root, id)) = key else { return };
+    let turns = batch.transcript(batch.selected);
+    batch.archive_error = ai_chat::save(root, id, &turns, Some(&batch.turn_id))
+        .err()
+        .map(|error| error.to_string());
 }
 
 pub fn requires_key(endpoint: &str) -> bool {
@@ -1216,6 +1396,8 @@ fn run_writing_agent(
         history,
     } = job;
     let continuing = task == WritingTask::Continue;
+    let mut brief = brief;
+    brief.feedback = ai_voice::select_feedback(prompt, &context, &brief.feedback);
     let voice_samples = ai_voice::select_samples(&context, &brief.voice_samples);
     if continuing && context.trim().is_empty() {
         return Err(AgentError::Model("续写需要落笔位置之前的正文。".to_owned()));
@@ -1271,7 +1453,10 @@ fn run_writing_agent(
     let request = if plan_scene {
         let mut request = json!({"next_beat": prompt.trim(), "scene_before_caret": context});
         if brief.story.is_ready() {
-            request["story"] = json!(brief.story);
+            request["story"] = json!(brief.story.public_view());
+        }
+        if !brief.feedback.is_empty() {
+            request["accepted_revisions"] = json!(brief.feedback);
         }
         if !brief.canon.trim().is_empty() {
             request["canon"] = json!(brief.canon);
@@ -1394,7 +1579,7 @@ fn run_writing_agent(
     let source_texts: Vec<_> = sources.iter().map(|source| source.text.as_str()).collect();
     let plan = if continuing {
         ScenePlan::parse(&first).map(|mut plan| {
-            plan.keep_grounded(&context, &source_texts);
+            plan.keep_grounded(&context, &source_texts, brief.feedback.len());
             plan
         })
     } else {
@@ -1528,6 +1713,10 @@ mod tests {
                 outline: "主角在门口收到一通电话。".to_owned(),
                 characters: "说话人和来访者。".to_owned(),
                 open_threads: "来访者还有事情要说。".to_owned(),
+                genre: "悬疑".into(),
+                tone: "克制".into(),
+                direction: "让来访者继续说话".into(),
+                ..Default::default()
             },
             ..Default::default()
         }
@@ -1559,11 +1748,13 @@ mod tests {
         });
         let history = Arc::new(vec![
             ChatTurn {
+                id: ai_chat::new_id(),
                 author: TextBuffer::new("银匣交给了谁？"),
                 answer: Some(TextBuffer::new("交给了晏澄。")),
                 adopted: false,
             },
             ChatTurn {
+                id: ai_chat::new_id(),
                 author: TextBuffer::new("这一条没有答复"),
                 answer: None,
                 adopted: false,
@@ -1842,6 +2033,66 @@ mod tests {
             |_| {},
         );
         assert!(matches!(result, Err(AgentError::Model(reason)) if reason.contains("先确认")));
+    }
+
+    #[test]
+    fn author_secrets_go_to_review_and_a_literal_character_claim_cannot_be_adopted() {
+        let mut brief = story_brief();
+        let truth = "她是为了拒绝父亲安排的联姻才离家。";
+        brief.story.author_truth = truth.to_owned();
+        brief.story.character_claims = "她说在公司画广告。叙述者只听到这句。".to_owned();
+        brief.feedback.push(WritingFeedback {
+            instruction: "人物在回避时保留含糊".into(),
+            before: "她把身世都说了。".into(),
+            after: "她只摇了摇头。".into(),
+        });
+        let model: AgentModel = Arc::new(move |messages, _| {
+            let input: serde_json::Value = serde_json::from_str(&messages[1].text).unwrap();
+            assert!(input["story"].get("author_truth").is_none());
+            assert_eq!(
+                input["story"]["character_claims"],
+                "她说在公司画广告。叙述者只听到这句。"
+            );
+            assert_eq!(input["accepted_revisions"][0]["after"], "她只摇了摇头。");
+            let answer = if input.get("author_truth_for_review_only").is_some() {
+                assert_eq!(input["author_truth_for_review_only"], truth);
+                if input["candidate"] == "她从前确实是广告设计师。" {
+                    r#"{"usable":true,"issues":[{"kind":"disclosure","quote":"确实是广告设计师","reason":"真实情况是家庭联姻，不应坐实"}]}"#
+                } else {
+                    r#"{"usable":true,"issues":[]}"#
+                }
+            } else {
+                assert!(!messages[1].text.contains("联姻"));
+                if input.get("scene_before_caret").is_some() {
+                    r#"{"carry_from":"她讲完画的事","settled":[],"advance_to":"我停一停再问"}"#
+                } else if input.get("revision").is_some() {
+                    assert!(input["revision"].as_str().unwrap().contains("超出当前视角"));
+                    "她把平板扣了过去。我没再往下问。"
+                } else {
+                    "她从前确实是广告设计师。"
+                }
+            };
+            Ok(AgentReply::Answer(answer.to_owned()))
+        });
+        let revised = run_writing_agent(
+            model,
+            "这段继续写",
+            "她说在公司画广告。".into(),
+            false,
+            None,
+            WritingJob {
+                task: WritingTask::Continue,
+                brief,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            revised.text.string_value(),
+            "她把平板扣了过去。我没再往下问。"
+        );
+        assert!(revised.can_adopt());
     }
 
     #[test]

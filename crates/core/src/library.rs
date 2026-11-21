@@ -279,6 +279,8 @@ pub struct WritingBrief {
     pub voice_samples: Vec<String>,
     #[serde(skip_serializing_if = "StoryProfile::is_empty")]
     pub story: StoryProfile,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub feedback: Vec<WritingFeedback>,
 }
 
 impl WritingBrief {
@@ -288,6 +290,7 @@ impl WritingBrief {
             && self.avoid.trim().is_empty()
             && self.voice_samples.is_empty()
             && self.story.is_empty()
+            && self.feedback.is_empty()
     }
 }
 
@@ -297,18 +300,43 @@ pub struct StoryProfile {
     pub outline: String,
     pub characters: String,
     pub open_threads: String,
+    pub genre: String,
+    pub tone: String,
+    pub direction: String,
+    pub character_claims: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub author_truth: String,
 }
 
 impl StoryProfile {
     pub fn is_empty(&self) -> bool {
-        self.outline.trim().is_empty()
-            && self.characters.trim().is_empty()
-            && self.open_threads.trim().is_empty()
+        self == &Self::default()
     }
 
     pub fn is_ready(&self) -> bool {
+        self.has_material()
+            && !self.genre.trim().is_empty()
+            && !self.tone.trim().is_empty()
+            && !self.direction.trim().is_empty()
+    }
+
+    pub fn has_material(&self) -> bool {
         !self.outline.trim().is_empty() && !self.characters.trim().is_empty()
     }
+
+    pub fn public_view(&self) -> Self {
+        Self {
+            author_truth: String::new(),
+            ..self.clone()
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WritingFeedback {
+    pub instruction: String,
+    pub before: String,
+    pub after: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
