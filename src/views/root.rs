@@ -7,9 +7,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use cove_ui::compose::FrameDimension;
 use cove_ui::compose::adaptive::SurfaceEnvironment;
 use cove_ui::compose::modifiers::layout::{FlexExt, LayoutFrameExt};
-use cove_ui::compose::modifiers::style::SemanticStyleViewExt;
+use cove_ui::compose::modifiers::style::{AppearanceExt, SemanticStyleViewExt};
 use cove_ui::compose::primitives::overlays::ShortcutHost;
 use cove_ui::compose::primitives::overlays::portal::LayerRoot;
 use cove_ui::compose::primitives::text::{Divider, TextBuffer};
@@ -21,7 +22,7 @@ use cove_ui::core::scene::{Align, OpenedDocuments};
 use cove_ui::watch::{DirectoryWatcher, WatchOptions};
 use ruwriter_core::{Session, count};
 
-use super::ai::AiDialog;
+use super::ai::AiPanel;
 use super::editor::EditorPane;
 use super::history::HistoryDialog;
 use super::info::InfoDialog;
@@ -40,6 +41,8 @@ use crate::theme::Mode;
 pub const SIDEBAR_WIDTH: f32 = 216.0;
 pub const LIST_WIDTH: f32 = 300.0;
 pub const OUTLINE_WIDTH: f32 = 240.0;
+pub const AI_PANEL_WIDTH: f32 = 380.0;
+pub const AI_DOCK_MIN_WIDTH: f32 = 820.0;
 /// Below this width one pane shows at a time.
 pub const SINGLE_PANE_WIDTH: f32 = 640.0;
 /// Below this width the sidebar folds into the list's title menu.
@@ -54,6 +57,8 @@ pub struct Layout {
     pub list: bool,
     pub editor: bool,
     pub outline: bool,
+    pub ai_docked: bool,
+    pub ai_full_width: bool,
     pub single_pane: bool,
     pub editor_width: f32,
     pub top_inset: f32,
@@ -66,16 +71,31 @@ impl Layout {
         let options = model.options();
         let single_pane = width < SINGLE_PANE_WIDTH;
         let showing_editor = model.showing_editor.get();
-        let sidebar =
-            !single_pane && !options.focus && options.sidebar && width >= SIDEBAR_MIN_WINDOW;
-        let list = !options.focus && (!single_pane || !showing_editor);
+        let ai_open = model.ai.open.get();
+        let ai_docked = width >= AI_DOCK_MIN_WIDTH && ai_open;
+        let ai_full_width = ai_open && !ai_docked;
+        let sidebar = !ai_full_width
+            && !single_pane
+            && !options.focus
+            && options.sidebar
+            && width
+                >= if ai_docked {
+                    1330.0
+                } else {
+                    SIDEBAR_MIN_WINDOW
+                };
+        let list = !ai_full_width
+            && !options.focus
+            && (!single_pane || !showing_editor)
+            && (!ai_docked || width >= 1100.0);
         let editor = !single_pane || showing_editor || options.focus;
         let outline = editor
             && !single_pane
             && !options.focus
             && options.outline
-            && width >= OUTLINE_MIN_WINDOW;
-        let mut editor_width = width;
+            && width >= OUTLINE_MIN_WINDOW
+            && !ai_open;
+        let mut editor_width = if ai_full_width { 0.0 } else { width };
         if sidebar {
             editor_width -= SIDEBAR_WIDTH;
         }
@@ -85,11 +105,16 @@ impl Layout {
         if outline {
             editor_width -= OUTLINE_WIDTH + 1.0;
         }
+        if ai_docked {
+            editor_width -= AI_PANEL_WIDTH + 1.0;
+        }
         Self {
             sidebar,
             list,
             editor,
             outline,
+            ai_docked,
+            ai_full_width,
             single_pane,
             editor_width: editor_width.max(0.0),
             top_inset,
@@ -242,19 +267,47 @@ impl View for RootView {
                     mode,
                 })
                 .semantic_background(SemanticColorRef::background())
-                .flex_with(1.0, 1.0, Some(0.0)),
+                .frame(
+                    layout.ai_full_width.then_some(FrameDimension::Points(0.0)),
+                    None,
+                    Some(0.0),
+                    None,
+                    None,
+                    None,
+                )
+                .clipped()
+                .flex_with(
+                    if layout.ai_full_width { 0.0 } else { 1.0 },
+                    1.0,
+                    Some(0.0),
+                ),
             )
         } else {
             AnyView::new(EmptyView)
         };
 
-        let outline_divider: AnyView = if layout.outline {
+        let outline_divider: AnyView = if layout.outline || layout.ai_docked {
             full_height(Divider::vertical())
         } else {
             AnyView::new(EmptyView)
         };
 
-        let outline: AnyView = if layout.outline {
+        let outline: AnyView = if layout.ai_docked || layout.ai_full_width {
+            full_height(
+                AnyView::new(AiPanel {
+                    model: model.clone(),
+                    docked: layout.ai_docked,
+                    top_inset: layout.top_inset,
+                    bottom_inset: layout.bottom_inset,
+                })
+                .frame_width(if layout.ai_full_width {
+                    environment.viewport.width
+                } else {
+                    AI_PANEL_WIDTH
+                })
+                .semantic_background(SemanticColorRef::surface()),
+            )
+        } else if layout.outline {
             full_height(
                 AnyView::new(OutlinePane {
                     model: model.clone(),
@@ -293,9 +346,6 @@ impl View for RootView {
                     model: model.clone(),
                 }),
                 AnyView::new(HistoryDialog {
-                    model: model.clone(),
-                }),
-                AnyView::new(AiDialog {
                     model: model.clone(),
                 }),
                 AnyView::new(SyncDialog {

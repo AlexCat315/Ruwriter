@@ -1,7 +1,7 @@
 //! Local manuscript traversal, chapter tools and evidence for a writing run.
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,6 @@ use cove_ui::compose::primitives::text::TextBuffer;
 use ruwriter_core::files::{Stamp, stamp};
 use serde_json::{Value, json};
 
-const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TOOL_BYTES: usize = 48 * 1024;
 const CHUNK_BYTES: usize = 2100;
 const CHUNK_OVERLAP: usize = 240;
@@ -70,8 +69,33 @@ struct ManuscriptIndex {
 
 struct IndexedDocument {
     id: String,
-    text: String,
+    text: IndexedText,
     lines: Vec<usize>,
+}
+
+enum IndexedText {
+    Memory(String),
+    File { path: PathBuf, fingerprint: Stamp },
+}
+
+impl IndexedText {
+    fn read(&self, start: usize, end: usize) -> Option<Vec<u8>> {
+        match self {
+            Self::Memory(text) => Some(text.as_bytes().get(start..end)?.to_vec()),
+            Self::File { path, fingerprint } => {
+                if path.canonicalize().ok().as_ref() != Some(path)
+                    || stamp(path) != Some(*fingerprint)
+                {
+                    return None;
+                }
+                let mut handle = std::fs::File::open(path).ok()?;
+                handle.seek(SeekFrom::Start(start as u64)).ok()?;
+                let mut bytes = vec![0; end - start];
+                handle.read_exact(&mut bytes).ok()?;
+                (stamp(path) == Some(*fingerprint)).then_some(bytes)
+            }
+        }
+    }
 }
 
 struct Chapter {
@@ -128,22 +152,15 @@ impl ResearchRequest {
                 passages: Vec::new(),
                 skipped: 0,
             };
-            let mut available = MAX_INDEX_BYTES;
             for (file, fingerprint) in &files {
                 check_cancelled(cancelled)?;
-                let text = if file.id == self.active_id {
-                    if self.active.utf8_length() > available {
-                        return Err(index_limit());
-                    }
-                    self.active.string_value()
+                let (text, backing) = if file.id == self.active_id {
+                    (self.active.string_value(), None)
                 } else {
-                    let Some(fingerprint) = fingerprint else {
+                    let Some(fingerprint) = *fingerprint else {
                         index.skipped += 1;
                         continue;
                     };
-                    if fingerprint.size > available as u64 {
-                        return Err(index_limit());
-                    }
                     let Some(path) = file
                         .path
                         .canonicalize()
@@ -153,27 +170,22 @@ impl ResearchRequest {
                         index.skipped += 1;
                         continue;
                     };
-                    let Ok(handle) = std::fs::File::open(path) else {
+                    let Ok(bytes) = std::fs::read(&path) else {
                         index.skipped += 1;
                         continue;
                     };
-                    let mut bytes = Vec::new();
-                    if handle
-                        .take(available as u64 + 1)
-                        .read_to_end(&mut bytes)
-                        .is_err()
-                        || stamp(&file.path) != Some(*fingerprint)
-                    {
+                    if stamp(&path) != Some(fingerprint) {
                         index.skipped += 1;
                         continue;
                     }
-                    if bytes.len() > available {
-                        return Err(index_limit());
+                    match String::from_utf8(bytes) {
+                        Ok(text) => (text, Some(IndexedText::File { path, fingerprint })),
+                        Err(error) => {
+                            (String::from_utf8_lossy(error.as_bytes()).into_owned(), None)
+                        }
                     }
-                    String::from_utf8_lossy(&bytes).into_owned()
                 };
-                available = available.checked_sub(text.len()).ok_or_else(index_limit)?;
-                index.add(file, text, cancelled)?;
+                index.add(file, text, backing, cancelled)?;
             }
             let index = Arc::new(index);
             if index.skipped == 0
@@ -225,10 +237,6 @@ impl ResearchRequest {
     }
 }
 
-fn index_limit() -> AgentError {
-    AgentError::Model("本次本地索引超过 64 MiB，请缩小作品范围。".to_owned())
-}
-
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), AgentError> {
     if cancelled.load(Ordering::Relaxed) {
         Err(AgentError::Model("请求已取消。".to_owned()))
@@ -242,6 +250,7 @@ impl ManuscriptIndex {
         &mut self,
         file: &ManuscriptFile,
         text: String,
+        backing: Option<IndexedText>,
         cancelled: &AtomicBool,
     ) -> Result<(), AgentError> {
         if text.trim().is_empty() {
@@ -313,7 +322,7 @@ impl ManuscriptIndex {
         }
         self.documents.push(IndexedDocument {
             id: file.id.clone(),
-            text,
+            text: backing.unwrap_or(IndexedText::Memory(text)),
             lines,
         });
         Ok(())
@@ -473,16 +482,35 @@ impl ResearchRun {
         let hits = self.index.search.search(query, usize::MAX);
         let mut results = Vec::new();
         for hit in hits {
-            let passage = self.index.passages[hit];
-            if passage.end > self.readable_end(&self.index.chapters[passage.chapter]) {
+            let mut passage = self.index.passages[hit];
+            let chapter = &self.index.chapters[passage.chapter];
+            let stop = self.readable_end(chapter);
+            if passage.start >= stop {
                 continue;
             }
+            let clipped = passage.end > stop;
+            passage.end = passage.end.min(stop);
             let count = by_chapter.entry(passage.chapter).or_default();
             if *count == 2 {
                 continue;
             }
+            let Some(text) = self.index.documents[chapter.document]
+                .text
+                .read(passage.start, passage.end)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+            else {
+                continue;
+            };
+            if clipped {
+                // A hit can come from the hidden half of a passage.
+                let mut visible = SearchIndex::default();
+                visible.add(self.readable_title(chapter), &text);
+                if visible.search(query, 1).is_empty() {
+                    continue;
+                }
+            }
             *count += 1;
-            results.push(self.reference(passage));
+            results.push(self.reference(passage, text));
             if results.len() >= limit {
                 break;
             }
@@ -501,20 +529,40 @@ impl ResearchRun {
         if offset >= stop.saturating_sub(section.start) {
             return json!({"error": "偏移超出本章。"});
         }
-        let text = &self.index.documents[section.document].text;
-        let start = text.ceil_char_boundary(section.start + offset);
-        if start >= stop {
-            return json!({"error": "偏移超出本章。"});
+        let start = section.start + offset;
+        let end_with_boundary = start.saturating_add(max + 4).min(stop);
+        let backing = &self.index.documents[section.document].text;
+        let Some(bytes) = backing.read(start, end_with_boundary) else {
+            return json!({"error":"文稿在查阅期间发生变化，请重新生成以刷新索引。"});
+        };
+        let skip = bytes
+            .iter()
+            .take_while(|&&byte| byte & 0xc0 == 0x80)
+            .count();
+        let mut length = (skip + max).min(bytes.len());
+        while length < bytes.len() && bytes[length] & 0xc0 == 0x80 {
+            length -= 1;
         }
-        let end = text.floor_char_boundary((start + max).min(stop));
-        let next = (end < stop).then_some(end - section.start);
+        let Some(text) = bytes
+            .get(skip..length)
+            .and_then(|part| std::str::from_utf8(part).ok())
+            .filter(|text| !text.is_empty())
+        else {
+            return json!({"error": "偏移超出本章。"});
+        };
+        let next = (start + length < stop).then_some(start + length - section.start);
+        let passage = Passage {
+            chapter: id,
+            start: start + skip,
+            end: start + length,
+        };
         json!({
-            "passage": self.reference(Passage { chapter: id, start, end }),
+            "passage": self.reference(passage, text.to_owned()),
             "next_offset_bytes": next,
         })
     }
 
-    fn reference(&mut self, passage: Passage) -> Value {
+    fn reference(&mut self, passage: Passage, text: String) -> Value {
         let chapter = &self.index.chapters[passage.chapter];
         let doc = &self.index.documents[chapter.document];
         let source =
@@ -527,7 +575,7 @@ impl ResearchRun {
                     file: doc.id.clone(),
                     first_line: doc.lines.partition_point(|&byte| byte <= passage.start),
                     last_line: doc.lines.partition_point(|&byte| byte < passage.end).max(1),
-                    text: doc.text[passage.start..passage.end].to_owned(),
+                    text,
                 };
                 self.evidence.push((passage, source));
                 &self.evidence.last().unwrap().1
@@ -589,7 +637,7 @@ pub fn tools() -> Vec<AgentTool> {
             schema(
                 vec![
                     ("chapter", integer(1.0, 1_000_000.0)),
-                    ("offset_bytes", integer(0.0, MAX_INDEX_BYTES as f64)),
+                    ("offset_bytes", integer(0.0, 9_007_199_254_740_991.0)),
                     ("max_bytes", integer(256.0, 6500.0)),
                 ],
                 &["chapter"],
@@ -713,6 +761,45 @@ mod tests {
             .answer_tool("search_manuscript", &json!({"query": "未保存"}))
             .unwrap();
         assert_eq!(result.value().unwrap()["matches"][0]["source"], "R2");
+    }
+
+    #[test]
+    fn continuation_never_reads_past_the_active_caret_and_other_files_remain_searchable() {
+        let library = tempfile::tempdir().unwrap();
+        let root = library.path();
+        let active = file(root, "1-正文.txt");
+        let note = file(root, "2-设定.txt");
+        let past = "第一章 夜\n青铜铃刚响过。";
+        std::fs::write(&note.path, "白塔的铜锁始终由晏澄保管。").unwrap();
+        let request = ResearchRequest {
+            root: root.to_path_buf(),
+            files: vec![active.clone(), note.clone()],
+            active_id: active.id,
+            active: TextBuffer::new(&format!(
+                "{past}乌木船随后靠岸。\n第二章 雪豹密令\n未来原文。"
+            )),
+            caret: TextBuffer::new(past).character_count(),
+        };
+        let mut run = request
+            .open(&ResearchCache::default(), &AtomicBool::new(false))
+            .unwrap();
+        run.restrict_to_preceding_text();
+        assert_eq!(run.list(1, 1)["next"], 3);
+        assert_eq!(run.list(1, 3)["total"], 2);
+        assert!(run.list(2, 3).to_string().contains("设定"));
+        assert!(!run.list(1, 3).to_string().contains("雪豹"));
+        assert!(run.read(2, 0, 2000).get("error").is_some());
+        assert_eq!(run.read(1, 0, 2000)["passage"]["text"], past);
+        assert_eq!(run.search("乌木船", 3)["matches"], json!([]));
+        assert_eq!(run.search("青铜铃", 1)["matches"][0]["text"], past);
+        assert!(
+            run.search("铜锁", 1)["matches"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("晏澄")
+        );
+        std::fs::write(&note.path, "此时改成了另一份设定。").unwrap();
+        assert!(run.read(3, 0, 2000).get("error").is_some());
     }
 
     #[cfg(unix)]

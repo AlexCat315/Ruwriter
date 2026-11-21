@@ -262,8 +262,25 @@ pub struct LibraryState {
     pub expanded: BTreeSet<String>,
     /// Trashed document id → the id it had before.
     pub trash_origins: BTreeMap<String, String>,
+    /// Folder id (or a standalone manuscript id) to the author's notes.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub writing_briefs: BTreeMap<String, WritingBrief>,
     /// Gist identity and merge baseline for this folder.
     pub(crate) sync: crate::sync::SyncConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WritingBrief {
+    pub canon: String,
+    pub voice: String,
+    pub avoid: String,
+}
+
+impl WritingBrief {
+    pub fn is_empty(&self) -> bool {
+        self.canon.trim().is_empty() && self.voice.trim().is_empty() && self.avoid.trim().is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,6 +328,23 @@ impl Library {
         let bytes = serde_json::to_vec_pretty(&self.state).map_err(io::Error::other)?;
         let json = String::from_utf8(bytes).map_err(io::Error::other)?;
         write_document(&state_path(&self.root), &json)
+    }
+
+    pub fn save_writing_brief(&mut self, work: &str, brief: WritingBrief) -> io::Result<()> {
+        let previous = if brief.is_empty() {
+            self.state.writing_briefs.remove(work)
+        } else {
+            self.state.writing_briefs.insert(work.to_owned(), brief)
+        };
+        if let Err(error) = self.save_state() {
+            if let Some(previous) = previous {
+                self.state.writing_briefs.insert(work.to_owned(), previous);
+            } else {
+                self.state.writing_briefs.remove(work);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     // MARK: - Identity
@@ -576,6 +610,11 @@ impl Library {
         self.state.order = order
             .into_iter()
             .map(|(id, names)| (moved(&id).unwrap_or(id), names))
+            .collect();
+        let briefs = std::mem::take(&mut self.state.writing_briefs);
+        self.state.writing_briefs = briefs
+            .into_iter()
+            .map(|(id, brief)| (moved(&id).unwrap_or(id), brief))
             .collect();
         let expanded = std::mem::take(&mut self.state.expanded);
         self.state.expanded = expanded

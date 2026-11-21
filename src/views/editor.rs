@@ -173,8 +173,8 @@ impl EditorPane {
         trailing.push(icon_button(
             icons::status::sparkles(),
             "AI 助手",
-            false,
-            move || ai.open_ai(),
+            model.ai.open.get(),
+            move || ai.toggle_ai(),
         ));
         trailing.push(AnyView::new(
             MenuButton::new(

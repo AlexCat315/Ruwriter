@@ -1,14 +1,15 @@
 use cove_agent::AgentError;
-use cove_ui::compose::modifiers::layout::{LayoutFrameExt, PaddingExt};
+use cove_ui::compose::modifiers::layout::{EdgeInsets, FlexExt, LayoutFrameExt, PaddingExt};
 use cove_ui::compose::modifiers::style::SemanticStyleViewExt;
 use cove_ui::compose::primitives::controls::{Button, MenuButton, Toggle};
-use cove_ui::compose::primitives::overlays::{Dialog, MenuEntry, MenuItem, PopoverPlacement};
+use cove_ui::compose::primitives::overlays::{MenuEntry, MenuItem, PopoverPlacement};
 use cove_ui::compose::primitives::text::text_field::TextFieldBehavior;
 use cove_ui::compose::primitives::text::{Text, TextBuffer, TextField};
 use cove_ui::compose::theme::styles::buttons::{
     ButtonStyleViewExt, PrimaryButtonStyle, ToggleButtonStyle,
 };
 use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
+use cove_ui::compose::{ScrollAxis, ScrollView};
 use cove_ui::composition::{AnyView, BoxView, EmptyView, Scope, TupleView, View};
 use cove_ui::core::scene::{Align, FlexDirection, Justify, Wrap};
 use cove_ui::core::{Binding, Signal};
@@ -19,8 +20,11 @@ use crate::ai::{AiState, Batch, Catalog, ModelStatus, WritingResult, WritingTask
 use crate::ai_research::ResearchScope;
 use crate::model::Model;
 
-pub struct AiDialog {
+pub struct AiPanel {
     pub model: Model,
+    pub docked: bool,
+    pub top_inset: f32,
+    pub bottom_inset: f32,
 }
 
 const WRITING_ACTIONS: [(&str, WritingTask, Option<&str>); 5] = [
@@ -100,7 +104,7 @@ fn profile_title(profile: &AiPreferences) -> String {
     format!("{} · {}", profile.model, profile.endpoint)
 }
 
-impl AiDialog {
+impl AiPanel {
     fn settings(&self) -> (Vec<AnyView>, AnyView) {
         let ai = &self.model.ai;
         let settings = self.model.ai_settings();
@@ -226,10 +230,66 @@ impl AiDialog {
         (rows, action)
     }
 
+    fn brief(&self) -> (Vec<AnyView>, AnyView) {
+        let ai = &self.model.ai;
+        let notes = |label: &str, signal: Signal<TextBuffer>, height: f32| {
+            AnyView::new(
+                TextField::new(label, signal.binding())
+                    .multiline()
+                    .frame_height(height),
+            )
+        };
+        let mut rows = vec![];
+        if let Some((_, name)) = self.model.ai_work() {
+            rows.push(caption(name));
+        }
+        rows.push(caption(
+            "启用手记后，会把这些内容连同本次任务发给所选模型。",
+        ));
+        rows.push(caption("硬设定和既定事实"));
+        rows.push(notes("硬设定和既定事实", ai.canon, 105.0));
+        rows.push(caption("文风要求和认可的样段"));
+        rows.push(notes("文风要求和认可的样段", ai.voice, 105.0));
+        if ai
+            .target
+            .get()
+            .is_some_and(|target| target.selection.is_some())
+        {
+            let take = self.model.clone();
+            rows.push(AnyView::new(Button::title(
+                "把选区加入文风样段",
+                move || take.ai_voice_from_selection(),
+            )));
+        }
+        rows.push(caption("避免的词语或句式（每行一条）"));
+        rows.push(notes("避免的词语或句式", ai.avoid, 72.0));
+        let save = self.model.clone();
+        (
+            rows,
+            primary("保存手记", true, move || save.save_ai_brief()),
+        )
+    }
+
     fn writer(&self, preview_context: Signal<bool>) -> (Vec<AnyView>, AnyView) {
         let ai = &self.model.ai;
         let batch = ai.batch.get();
         let busy = batch.as_ref().is_some_and(Batch::busy);
+        if let Some(batch) = batch.as_ref() {
+            if !ai.show_request.get() || busy {
+                let mut rows = Vec::new();
+                self.results(&mut rows, batch);
+                let request = ai.show_request;
+                let stop = ai.clone();
+                let action = if busy {
+                    AnyView::new(Button::title("停止等待", move || stop.stop()))
+                } else {
+                    AnyView::new(Button::title("修改写作要求", move || {
+                        request.set(true)
+                    }))
+                };
+                return (rows, action);
+            }
+        }
         let chosen = ai.include_context.get();
         let mode = ai.task.get();
         let continuing = mode == WritingTask::Continue;
@@ -286,6 +346,29 @@ impl AiDialog {
             Button::title("管理模型", move || manage.manage_ai()).enabled(!busy),
         ));
         let mut rows = vec![wrap_controls(actions), wrap_controls(model_controls)];
+        let mut work_controls = Vec::new();
+        if self.docked {
+            let align = self.model.clone();
+            work_controls.push(AnyView::new(Button::title(
+                "对准当前光标",
+                move || align.refresh_ai_target(),
+            )));
+        }
+        if self.model.ai_work().is_some() {
+            let notes = self.model.clone();
+            work_controls.push(AnyView::new(Button::title("作品手记", move || {
+                notes.edit_ai_brief()
+            })));
+            if !self.model.ai_brief().is_empty() {
+                work_controls.push(AnyView::new(Toggle::labeled(
+                    "采用手记",
+                    ai.use_brief.binding(),
+                )));
+            }
+        }
+        if !work_controls.is_empty() {
+            rows.push(wrap_controls(work_controls));
+        }
         if can_research && target.is_some() && !polishing {
             let mut scopes = vec![
                 ("仅片段", ResearchScope::Excerpt),
@@ -350,7 +433,6 @@ impl AiDialog {
             .multiline()
             .behavior(TextFieldBehavior {
                 disabled: busy,
-                max_length: Some(4000),
                 ..Default::default()
             })
             .frame_height(76.0),
@@ -362,9 +444,9 @@ impl AiDialog {
                 vec![AnyView::new(
                     Toggle::labeled(
                         if continuing && selected {
-                            "参考选区末尾（最多 1,800 字符）"
+                            "参考选区末尾"
                         } else if continuing {
-                            "参考落笔前文（最多 1,800 字符）"
+                            "参考落笔前文"
                         } else if selected {
                             "附带选区"
                         } else {
@@ -394,14 +476,15 @@ impl AiDialog {
             Err(message) => rows.push(caption(message)),
             _ => {}
         }
-        if let Some(batch) = batch.as_ref() {
-            self.results(&mut rows, batch, selected, target.is_some());
+        if batch.is_some() {
+            let show = ai.show_request;
+            rows.push(AnyView::new(Button::title(
+                "查看当前草稿",
+                move || show.set(false),
+            )));
         }
         let send = self.model.clone();
-        let stop = ai.clone();
-        let action = if busy {
-            AnyView::new(Button::title("停止等待", move || stop.stop()))
-        } else if preferences.models.is_empty() {
+        let action = if preferences.models.is_empty() {
             primary("添加模型", true, move || send.manage_ai())
         } else {
             primary(
@@ -425,7 +508,13 @@ impl AiDialog {
         (rows, action)
     }
 
-    fn results(&self, rows: &mut Vec<AnyView>, batch: &Batch, selected: bool, has_target: bool) {
+    fn results(&self, rows: &mut Vec<AnyView>, batch: &Batch) {
+        let selected = batch
+            .target
+            .as_ref()
+            .is_some_and(|target| target.selection.is_some());
+        let has_target = batch.target.is_some();
+        let docked = self.docked;
         let ai = &self.model.ai;
         let current = ai.viewed_result.get();
         let Some(run) = batch.runs.get(current) else {
@@ -483,6 +572,20 @@ impl AiDialog {
             }
             ModelStatus::Failed(error) => rows.push(error_label(format!("请求失败。{error}"))),
             ModelStatus::Ready(result) => {
+                if result.task == WritingTask::Continue
+                    && let Some(anchor) = batch
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.continuation_anchor())
+                {
+                    rows.push(caption(format!("接在「{anchor}」后")));
+                }
+                if !result.continuity_notes.is_empty() {
+                    rows.push(caption("设定疑点 · 请核对"));
+                    for note in result.continuity_notes.iter() {
+                        rows.push(caption(note));
+                    }
+                }
                 let modified = result.text != result.original_text;
                 let repeats = !modified && result.repetition_warning.is_some();
                 let binding = ai.draft_binding(batch, current);
@@ -516,7 +619,7 @@ impl AiDialog {
                     if result.task == WritingTask::Polish {
                         if selected {
                             buttons.push(primary("替换选区", ready, move || {
-                                replace.apply_ai(current, true)
+                                replace.apply_ai(current, true, docked)
                             }));
                         }
                     } else if result.task == WritingTask::Continue {
@@ -527,16 +630,16 @@ impl AiDialog {
                                 "接在这里"
                             },
                             ready,
-                            move || insert.apply_ai(current, false),
+                            move || insert.apply_ai(current, false, docked),
                         ));
                     } else {
                         buttons.push(primary("插入", ready, move || {
-                            insert.apply_ai(current, false)
+                            insert.apply_ai(current, false, docked)
                         }));
                         if selected {
                             buttons.push(AnyView::new(
                                 Button::title("替换选区", move || {
-                                    replace.apply_ai(current, true);
+                                    replace.apply_ai(current, true, docked);
                                 })
                                 .enabled(ready),
                             ));
@@ -731,65 +834,83 @@ fn error_label(message: String) -> AnyView {
     AnyView::new(Text::new(message).semantic_foreground(SemanticColorRef::error()))
 }
 
-impl View for AiDialog {
+impl View for AiPanel {
     fn body(&self, cx: &Scope) -> AnyView {
         if !self.model.ai.open.get() {
             return AnyView::new(EmptyView);
         }
         let preview = cx.state(|| false);
         let settings = self.model.ai.settings_open.get();
+        let brief = self.model.ai.brief_open.get();
         let (mut rows, action) = if settings {
             self.settings()
+        } else if brief {
+            self.brief()
         } else {
             self.writer(preview)
         };
         let error = self.model.ai.error.get();
         if !error.is_empty() {
-            rows.push(error_label(error));
+            rows.insert(0, error_label(error));
         }
+        let feedback = self.model.ai.feedback.get();
+        if !feedback.is_empty() && !settings && !brief {
+            rows.insert(0, caption(feedback));
+        }
+        let title = if settings {
+            "AI 模型设置"
+        } else if brief {
+            "作品手记"
+        } else {
+            "AI 写作"
+        };
         let close = self.model.clone();
-        let dismiss = self.model.clone();
-        let binding = Binding::new(
-            || true,
-            move |shown: bool| {
-                if !shown {
-                    dismiss.close_ai();
-                }
-            },
-        );
-        let footer = hstack(
-            8.0,
+        let back = move || {
+            if settings || brief {
+                close.ai.settings_open.set(false);
+                close.ai.brief_open.set(false);
+                close.ai.error.set(String::new());
+            } else {
+                close.close_ai();
+            }
+        };
+        let heading = hstack(
+            6.0,
             Align::Center,
             vec![
-                AnyView::new(Button::title(
-                    if settings { "返回助手" } else { "关闭" },
-                    move || {
-                        if settings {
-                            close.ai.settings_open.set(false);
-                            close.ai.error.set(String::new());
-                        } else {
-                            close.close_ai();
-                        }
-                    },
-                )),
+                AnyView::new(Text::new(title).semantic_font(SemanticFontRef::headline())),
                 spacer(),
-                action,
+                AnyView::new(Button::title(
+                    if settings || brief {
+                        "返回写作"
+                    } else if self.docked {
+                        "收起"
+                    } else {
+                        "返回正文"
+                    },
+                    back,
+                )),
             ],
-        );
-        let dialog = Dialog::new(
-            binding,
-            if settings {
-                "AI 模型设置"
-            } else {
-                "AI 助手"
-            },
-            vstack(9.0, Align::Stretch, rows),
         )
-        .footer(footer)
-        .configure(|options| {
-            options.modal.geometry.width = 600.0;
-            options.modal.geometry.height = if settings { 535.0 } else { 650.0 };
-        });
-        AnyView::new(AnyView::new(dialog).padding(4.0))
+        .padding_insets(EdgeInsets::new(self.top_inset + 10.0, 14.0, 8.0, 14.0));
+        let body = AnyView::new(ScrollView::new(
+            ScrollAxis::Vertical,
+            AnyView::new(vstack(9.0, Align::Stretch, rows).padding_edges(14.0, 8.0)),
+        ))
+        .flex_with(1.0, 1.0, Some(0.0));
+        let footer = hstack(6.0, Align::Center, vec![spacer(), action])
+            .padding_insets(EdgeInsets::new(8.0, 14.0, 10.0 + self.bottom_inset, 14.0));
+        AnyView::new(
+            vstack(
+                0.0,
+                Align::Stretch,
+                vec![
+                    AnyView::new(heading),
+                    AnyView::new(body),
+                    AnyView::new(footer),
+                ],
+            )
+            .fill(),
+        )
     }
 }

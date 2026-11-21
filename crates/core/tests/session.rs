@@ -1,5 +1,7 @@
 use ruwriter_core::files::{read_document, write_document};
-use ruwriter_core::{AiPreferences, AppearancePreference, Collection, Rescan, Session};
+use ruwriter_core::{
+    AiPreferences, AppearancePreference, Collection, Rescan, Session, WritingBrief,
+};
 use std::path::Path;
 
 fn library(session: &Session) -> &Path {
@@ -34,6 +36,29 @@ fn a_saved_single_ai_model_migrates_and_parallel_selection_survives_relaunch() {
     assert_eq!(saved.selected, vec![1, 0]);
     assert_eq!(saved.models[1].model, "review");
     assert_eq!(saved.models[0].endpoint, "http://127.0.0.1:1234/v1");
+}
+
+#[test]
+fn a_work_brief_survives_folder_rename_and_reopening() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::at(root.path());
+    let work = session.create_folder("", "旧书名").unwrap();
+    let brief = WritingBrief {
+        canon: "钥匙只能开北门".to_owned(),
+        voice: "短句，限制于人物视角".to_owned(),
+        avoid: "命运的齿轮".to_owned(),
+    };
+    session
+        .library
+        .save_writing_brief(&work, brief.clone())
+        .unwrap();
+    session.rename_folder(&work, "新书名", "").unwrap();
+    let reopened = Session::at(root.path());
+    assert_eq!(
+        reopened.library.state.writing_briefs.get("新书名"),
+        Some(&brief)
+    );
+    assert!(!reopened.library.state.writing_briefs.contains_key("旧书名"));
 }
 
 #[test]

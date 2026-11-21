@@ -352,6 +352,10 @@ impl Model {
 
     /// Called by the editor after every accepted edit.
     pub fn on_change(&self, buffer: &TextBuffer) {
+        if let Some(caret) = self.ai.follow_after_write.get_untracked() {
+            self.ai.follow_after_write.set(None);
+            self.set_ai_target(buffer.clone(), None, caret);
+        }
         if buffer.character_count() > LARGE_DOCUMENT {
             self.pending_save.set(Some(buffer.clone()));
             self.save_revision.update(|value| *value += 1);
@@ -845,37 +849,86 @@ impl Model {
         self.open_ai_task(WritingTask::Request);
     }
 
+    pub fn toggle_ai(&self) {
+        if self.ai.open.get_untracked() {
+            self.close_ai();
+        } else {
+            self.open_ai();
+        }
+    }
+
     pub fn open_ai_continuation(&self) {
         self.open_ai_task(WritingTask::Continue);
     }
 
     fn open_ai_task(&self, task: WritingTask) {
         if self.ai.open.get_untracked() {
+            if task == WritingTask::Continue
+                && !self
+                    .ai
+                    .batch
+                    .get_untracked()
+                    .is_some_and(|batch| batch.busy())
+            {
+                self.ai.task.set(task);
+                self.refresh_ai_target();
+            }
             return;
         }
-        let target = self.ai_document().map(|document| {
-            let buffer = self.buffer.get_untracked();
-            let len = buffer.character_count();
-            let caret = self.caret.get_untracked();
-            let selection = caret
-                .selected_range
-                .map(|(start, end)| start.min(len)..end.min(len))
-                .filter(|range| !range.is_empty());
-            let insertion = selection
-                .as_ref()
-                .map_or(caret.caret_index.min(len), |range| range.end);
-            WritingTarget {
-                document,
-                buffer,
-                selection,
-                insertion,
-            }
+        self.ai.task.set(task);
+        self.ai.scope.set(ResearchScope::Excerpt);
+        self.ai.viewed_source.set(None);
+        self.ai.prompt.set(TextBuffer::empty());
+        self.ai.error.set(String::new());
+        self.ai.feedback.set(String::new());
+        self.refresh_ai_target();
+        self.showing_editor.set(true);
+        self.ai.open.set(true);
+        self.revision.update(|value| *value += 1);
+    }
+
+    pub fn refresh_ai_target(&self) {
+        if self
+            .ai
+            .batch
+            .get_untracked()
+            .is_some_and(|batch| batch.busy())
+        {
+            return;
+        }
+        let buffer = self.buffer.get_untracked();
+        let len = buffer.character_count();
+        let caret = self.caret.get_untracked();
+        let selection = caret
+            .selected_range
+            .map(|(start, end)| start.min(len)..end.min(len))
+            .filter(|range| !range.is_empty());
+        let insertion = selection
+            .as_ref()
+            .map_or(caret.caret_index.min(len), |range| range.end);
+        self.set_ai_target(buffer, selection, insertion);
+        self.ai.error.set(String::new());
+        self.ai.feedback.set(String::new());
+    }
+
+    fn set_ai_target(
+        &self,
+        buffer: TextBuffer,
+        selection: Option<std::ops::Range<usize>>,
+        insertion: usize,
+    ) {
+        let previous_work = self.ai_work();
+        let target = self.ai_document().map(|document| WritingTarget {
+            document,
+            buffer,
+            selection,
+            insertion,
         });
         let context = target
             .as_ref()
             .map_or_else(|| Ok(TextBuffer::empty()), WritingTarget::context);
         let attach = target.as_ref().is_some_and(|target| {
-            if task == WritingTask::Continue {
+            if self.ai.task.get_untracked() == WritingTask::Continue {
                 target
                     .continuation_context()
                     .is_ok_and(|text| !text.is_empty())
@@ -885,19 +938,116 @@ impl Model {
         });
         self.ai.include_context.set(attach);
         self.ai.context.set(context);
-        self.ai.scope.set(ResearchScope::Excerpt);
-        self.ai.viewed_source.set(None);
         self.ai.target.set(target);
-        self.ai.prompt.set(TextBuffer::empty());
-        self.ai.task.set(task);
+        if self.ai_work() != previous_work {
+            self.ai.scope.set(ResearchScope::Excerpt);
+            self.ai.use_brief.set(!self.ai_brief().is_empty());
+        }
+    }
+
+    pub fn ai_work(&self) -> Option<(PathBuf, String)> {
+        let target = self.ai.target.get()?;
+        self.read(|session| {
+            let root = session.library_root();
+            let doc = session
+                .library
+                .documents
+                .iter()
+                .find(|doc| doc.id == target.document.1 && !doc.external && !doc.trashed)?;
+            let folder = project_folder(&doc.id);
+            if root == target.document.0 {
+                Some((
+                    root.to_path_buf(),
+                    if folder.is_empty() {
+                        doc.id.clone()
+                    } else {
+                        folder.to_owned()
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+        .flatten()
+    }
+
+    pub fn ai_brief(&self) -> ruwriter_core::WritingBrief {
+        let _ = self.revision.get();
+        self.ai_work()
+            .and_then(|(_, work)| {
+                self.read(|session| session.library.state.writing_briefs.get(&work).cloned())
+                    .flatten()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn edit_ai_brief(&self) {
+        let brief = self.ai_brief();
+        self.ai.canon.set(TextBuffer::new(&brief.canon));
+        self.ai.voice.set(TextBuffer::new(&brief.voice));
+        self.ai.avoid.set(TextBuffer::new(&brief.avoid));
         self.ai.error.set(String::new());
-        self.ai.open.set(true);
-        self.revision.update(|value| *value += 1);
+        self.ai.settings_open.set(false);
+        self.ai.brief_open.set(true);
+    }
+
+    pub fn save_ai_brief(&self) {
+        let result = (|| {
+            let (root, work) = self
+                .ai_work()
+                .ok_or("要为作品保存手记，请打开资料库内的文稿。")?;
+            let brief = ruwriter_core::WritingBrief {
+                canon: self.ai.canon.get_untracked().string_value(),
+                voice: self.ai.voice.get_untracked().string_value(),
+                avoid: self.ai.avoid.get_untracked().string_value(),
+            };
+            let active = !brief.is_empty();
+            self.with_session(|session| {
+                if session.library_root() != root {
+                    return Err("资料库已切换，请重新打开手记。".to_owned());
+                }
+                session
+                    .library
+                    .save_writing_brief(&work, brief)
+                    .map_err(|error| error.to_string())
+            })?;
+            self.ai.use_brief.set(active);
+            self.ai.brief_open.set(false);
+            self.revision.update(|value| *value += 1);
+            Ok(())
+        })();
+        self.ai.error.set(result.err().unwrap_or_default());
+    }
+
+    pub fn ai_voice_from_selection(&self) {
+        let Some(target) = self
+            .ai
+            .target
+            .get_untracked()
+            .filter(|target| target.selection.is_some())
+        else {
+            return;
+        };
+        match target.context() {
+            Ok(text) => {
+                let current = self.ai.voice.get_untracked().string_value();
+                let sample = text.string_value();
+                let voice = if current.trim().is_empty() {
+                    format!("文风样段\n{sample}")
+                } else {
+                    format!("{current}\n\n文风样段\n{sample}")
+                };
+                self.ai.voice.set(TextBuffer::new(&voice));
+            }
+            Err(error) => self.ai.error.set(error.to_owned()),
+        }
     }
 
     pub fn close_ai(&self) {
         if self.ai.open.get_untracked() {
             self.ai.clear_batch();
+            self.ai.follow_after_write.set(None);
+            self.ai.brief_open.set(false);
             self.ai.target.set(None);
             self.ai.viewed_source.set(None);
             self.ai.context.set(Ok(TextBuffer::empty()));
@@ -930,6 +1080,7 @@ impl Model {
                 },
             );
         }
+        self.ai.brief_open.set(false);
         self.ai.settings_open.set(true);
     }
 
@@ -1067,6 +1218,19 @@ impl Model {
 
     pub fn run_ai(&self) {
         let result = (|| {
+            if let Some(target) = self.ai.target.get_untracked() {
+                if self.ai_document().as_ref() != Some(&target.document)
+                    || self.buffer.get_untracked() != target.buffer
+                {
+                    return Err("正文已变化。点「对准当前光标」更新落笔位置。".to_owned());
+                }
+            }
+            self.ai.feedback.set(String::new());
+            let brief = if self.ai.use_brief.get_untracked() {
+                self.ai_brief()
+            } else {
+                Default::default()
+            };
             let scope = if self.ai.task.get_untracked() == WritingTask::Polish {
                 ResearchScope::Excerpt
             } else {
@@ -1155,16 +1319,16 @@ impl Model {
                     ))
                 })
                 .ok_or_else(|| "无法读取模型设置。".to_owned())??;
-            self.ai.start(prepared.0, prepared.1)
+            self.ai.start(prepared.0, prepared.1, brief)
         })();
         self.ai.error.set(result.err().unwrap_or_default());
     }
 
-    pub fn apply_ai(&self, index: usize, replace: bool) {
-        let (Some(target), Some(batch)) = (
-            self.ai.target.get_untracked(),
-            self.ai.batch.get_untracked(),
-        ) else {
+    pub fn apply_ai(&self, index: usize, replace: bool, keep_open: bool) {
+        let Some(batch) = self.ai.batch.get_untracked() else {
+            return;
+        };
+        let Some(target) = batch.target.as_ref() else {
             return;
         };
         let Some(ModelStatus::Ready(result)) = batch.runs.get(index).map(|run| &run.status) else {
@@ -1183,7 +1347,7 @@ impl Model {
             return;
         }
         let range = if replace {
-            let Some(selection) = target.selection else {
+            let Some(selection) = target.selection.clone() else {
                 return;
             };
             selection
@@ -1197,7 +1361,15 @@ impl Model {
         let start = current.utf8_offset_for_character_index(range.start);
         let updated = current.replace(range.clone(), &text);
         let caret = updated.character_index_for_utf8_offset(start + text.len());
-        self.close_ai();
+        if keep_open {
+            self.ai.clear_batch();
+            self.ai.follow_after_write.set(Some(caret));
+            self.ai.prompt.set(TextBuffer::empty());
+            self.ai.error.set(String::new());
+            self.ai.feedback.set("已写入正文".to_owned());
+        } else {
+            self.close_ai();
+        }
         if self.options().preview {
             self.toggle_preview();
         }
