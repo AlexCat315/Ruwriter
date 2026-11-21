@@ -47,6 +47,12 @@ fn a_work_brief_survives_folder_rename_and_reopening() {
         canon: "钥匙只能开北门".to_owned(),
         voice: "短句，限制于人物视角".to_owned(),
         avoid: "命运的齿轮".to_owned(),
+        voice_samples: vec!["她说完，顺手把炉门关上。".to_owned()],
+        story: ruwriter_core::StoryProfile {
+            outline: "守门人交出北门钥匙。".to_owned(),
+            characters: "阿玉，守门人。".to_owned(),
+            open_threads: "北门还没开。".to_owned(),
+        },
     };
     session
         .library

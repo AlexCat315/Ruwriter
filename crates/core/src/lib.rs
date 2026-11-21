@@ -12,11 +12,11 @@ pub mod stats;
 pub mod sync;
 
 pub use document::{DocStatus, Document, normalize_tags, parse_tags, title_from_text};
-pub use library::WritingBrief;
 pub use library::{
     AppearancePreference, Collection, ColumnWidth, Folder, Library, LineSpacing, Settings,
     SortOrder, WritingMode,
 };
+pub use library::{StoryProfile, WritingBrief};
 pub use outline::{Heading, heading_at, headings, is_chapter_line};
 pub use session::{
     AiPreferences, AiSettings, MAX_PARALLEL_AI_MODELS, Rescan, Session, ViewOptions,

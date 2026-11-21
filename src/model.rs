@@ -32,7 +32,10 @@ use ruwriter_core::{
     SortOrder, WritingStats, count, heading_at, headings, parse_tags,
 };
 
-use crate::ai::{AiState, ModelStatus, WritingTarget, WritingTask};
+use crate::ai::{
+    AiState, ModelStatus, PendingDraftEdit, StoryStatus, WritingTarget, WritingTask,
+    continuation_insertion, is_continuation_command,
+};
 use crate::ai_research::{ManuscriptFile, ResearchRequest, ResearchScope};
 use crate::formatting::{self, Command};
 
@@ -268,6 +271,12 @@ impl Model {
         self.find_open.set(false);
         self.find_index.set(0);
         self.document.update(|value| *value += 1);
+        self.ai.follow_after_write.set(None);
+        self.ai
+            .activate(self.ai_document().map(|(root, id, _)| (root, id)));
+        if self.ai.open.get_untracked() {
+            self.update_ai_target(true);
+        }
     }
 
     // MARK: - Writing mode
@@ -352,9 +361,22 @@ impl Model {
 
     /// Called by the editor after every accepted edit.
     pub fn on_change(&self, buffer: &TextBuffer) {
-        if let Some(caret) = self.ai.follow_after_write.get_untracked() {
+        if let Some(edit) = self.ai.follow_after_write.get_untracked() {
             self.ai.follow_after_write.set(None);
-            self.set_ai_target(buffer.clone(), None, caret);
+            if buffer.has_same_contents(&edit.expected) {
+                self.ai.was_applied(edit.index, edit.before);
+                if edit.keep_open {
+                    if let Some(batch) = self.ai.current_batch() {
+                        self.ai.task.set(batch.writing_task());
+                    }
+                    self.set_ai_target(buffer.clone(), None, edit.caret, false);
+                    self.ai.feedback.set("已写入正文。".to_owned());
+                } else {
+                    self.close_ai();
+                }
+            }
+        } else {
+            self.ai.reopen_after_undo(buffer);
         }
         if buffer.character_count() > LARGE_DOCUMENT {
             self.pending_save.set(Some(buffer.clone()));
@@ -458,6 +480,9 @@ impl Model {
             return;
         }
         self.caret.set(state);
+        if self.ai.open.get_untracked() {
+            self.update_ai_target(false);
+        }
         let offset = state.caret_index;
         let _ = self.with_session(|session| {
             session.remember_caret(offset);
@@ -846,7 +871,7 @@ impl Model {
     }
 
     pub fn open_ai(&self) {
-        self.open_ai_task(WritingTask::Request);
+        self.show_ai(None);
     }
 
     pub fn toggle_ai(&self) {
@@ -858,42 +883,47 @@ impl Model {
     }
 
     pub fn open_ai_continuation(&self) {
-        self.open_ai_task(WritingTask::Continue);
+        self.show_ai(Some(WritingTask::Continue));
     }
 
-    fn open_ai_task(&self, task: WritingTask) {
-        if self.ai.open.get_untracked() {
-            if task == WritingTask::Continue
-                && !self
-                    .ai
-                    .batch
-                    .get_untracked()
-                    .is_some_and(|batch| batch.busy())
-            {
+    fn show_ai(&self, task: Option<WritingTask>) {
+        let document = self.ai_document();
+        self.ai.activate(
+            document
+                .as_ref()
+                .map(|(root, id, _)| (root.clone(), id.clone())),
+        );
+        let batch = self.ai.current_batch();
+        if !batch.as_ref().is_some_and(|batch| batch.busy()) {
+            if let Some(task) = task {
                 self.ai.task.set(task);
-                self.refresh_ai_target();
+                self.ai.follow_draft.set(false);
+            } else if batch.is_none() && !self.ai.open.get_untracked() {
+                let mode = if document.is_none() {
+                    WritingTask::Request
+                } else if self.caret.get_untracked().selected_range.is_some() {
+                    WritingTask::Polish
+                } else {
+                    WritingTask::Continue
+                };
+                self.ai.task.set(mode);
             }
-            return;
         }
-        self.ai.task.set(task);
-        self.ai.scope.set(ResearchScope::Excerpt);
-        self.ai.viewed_source.set(None);
-        self.ai.prompt.set(TextBuffer::empty());
         self.ai.error.set(String::new());
-        self.ai.feedback.set(String::new());
-        self.refresh_ai_target();
+        self.update_ai_target(true);
         self.showing_editor.set(true);
         self.ai.open.set(true);
         self.revision.update(|value| *value += 1);
     }
 
     pub fn refresh_ai_target(&self) {
-        if self
-            .ai
-            .batch
-            .get_untracked()
-            .is_some_and(|batch| batch.busy())
-        {
+        self.update_ai_target(true);
+        self.ai.error.set(String::new());
+        self.ai.feedback.set(String::new());
+    }
+
+    fn update_ai_target(&self, refresh_attachment: bool) {
+        if self.ai.current_batch().is_some_and(|batch| batch.busy()) && !refresh_attachment {
             return;
         }
         let buffer = self.buffer.get_untracked();
@@ -906,9 +936,7 @@ impl Model {
         let insertion = selection
             .as_ref()
             .map_or(caret.caret_index.min(len), |range| range.end);
-        self.set_ai_target(buffer, selection, insertion);
-        self.ai.error.set(String::new());
-        self.ai.feedback.set(String::new());
+        self.set_ai_target(buffer, selection, insertion, refresh_attachment);
     }
 
     fn set_ai_target(
@@ -916,8 +944,10 @@ impl Model {
         buffer: TextBuffer,
         selection: Option<std::ops::Range<usize>>,
         insertion: usize,
+        refresh_attachment: bool,
     ) {
         let previous_work = self.ai_work();
+        let previous = self.ai.target.get_untracked();
         let target = self.ai_document().map(|document| WritingTarget {
             document,
             buffer,
@@ -928,19 +958,21 @@ impl Model {
             .as_ref()
             .map_or_else(|| Ok(TextBuffer::empty()), WritingTarget::context);
         let attach = target.as_ref().is_some_and(|target| {
-            if self.ai.task.get_untracked() == WritingTask::Continue {
-                target
-                    .continuation_context()
-                    .is_ok_and(|text| !text.is_empty())
-            } else {
-                target.selection.is_some() && context.as_ref().is_ok_and(|text| !text.is_empty())
-            }
+            target.selection.is_some() && context.as_ref().is_ok_and(|text| !text.is_empty())
         });
-        self.ai.include_context.set(attach);
+        if refresh_attachment
+            || previous
+                .as_ref()
+                .map(|target| (&target.document, target.selection.is_some()))
+                != target
+                    .as_ref()
+                    .map(|target| (&target.document, target.selection.is_some()))
+        {
+            self.ai.include_context.set_if_changed(attach);
+        }
         self.ai.context.set(context);
         self.ai.target.set(target);
         if self.ai_work() != previous_work {
-            self.ai.scope.set(ResearchScope::Excerpt);
             self.ai.use_brief.set(!self.ai_brief().is_empty());
         }
     }
@@ -986,6 +1018,17 @@ impl Model {
         self.ai.canon.set(TextBuffer::new(&brief.canon));
         self.ai.voice.set(TextBuffer::new(&brief.voice));
         self.ai.avoid.set(TextBuffer::new(&brief.avoid));
+        self.ai.voice_samples.set(brief.voice_samples);
+        self.ai
+            .story_outline
+            .set(TextBuffer::new(&brief.story.outline));
+        self.ai
+            .story_characters
+            .set(TextBuffer::new(&brief.story.characters));
+        self.ai
+            .story_threads
+            .set(TextBuffer::new(&brief.story.open_threads));
+        self.ai.brief_work.set(self.ai_work());
         self.ai.error.set(String::new());
         self.ai.settings_open.set(false);
         self.ai.brief_open.set(true);
@@ -996,10 +1039,19 @@ impl Model {
             let (root, work) = self
                 .ai_work()
                 .ok_or("要为作品保存手记，请打开资料库内的文稿。")?;
+            if self.ai.brief_work.get_untracked().as_ref() != Some(&(root.clone(), work.clone())) {
+                return Err("作品已切换，请重新打开这部作品的手记。".to_owned());
+            }
             let brief = ruwriter_core::WritingBrief {
                 canon: self.ai.canon.get_untracked().string_value(),
                 voice: self.ai.voice.get_untracked().string_value(),
                 avoid: self.ai.avoid.get_untracked().string_value(),
+                voice_samples: self.ai.voice_samples.get_untracked(),
+                story: ruwriter_core::StoryProfile {
+                    outline: self.ai.story_outline.get_untracked().string_value(),
+                    characters: self.ai.story_characters.get_untracked().string_value(),
+                    open_threads: self.ai.story_threads.get_untracked().string_value(),
+                },
             };
             let active = !brief.is_empty();
             self.with_session(|session| {
@@ -1012,6 +1064,9 @@ impl Model {
                     .map_err(|error| error.to_string())
             })?;
             self.ai.use_brief.set(active);
+            if self.ai_story().is_ready() {
+                self.ai.clear_story();
+            }
             self.ai.brief_open.set(false);
             self.revision.update(|value| *value += 1);
             Ok(())
@@ -1020,6 +1075,10 @@ impl Model {
     }
 
     pub fn ai_voice_from_selection(&self) {
+        if self.ai.brief_work.get_untracked() != self.ai_work() {
+            self.ai.error.set("作品已切换，请重新打开手记。".to_owned());
+            return;
+        }
         let Some(target) = self
             .ai
             .target
@@ -1030,14 +1089,17 @@ impl Model {
         };
         match target.context() {
             Ok(text) => {
-                let current = self.ai.voice.get_untracked().string_value();
                 let sample = text.string_value();
-                let voice = if current.trim().is_empty() {
-                    format!("文风样段\n{sample}")
-                } else {
-                    format!("{current}\n\n文风样段\n{sample}")
-                };
-                self.ai.voice.set(TextBuffer::new(&voice));
+                let sample = sample.trim();
+                if !sample.is_empty() {
+                    self.ai.voice_samples.update_if(|samples| {
+                        if samples.iter().any(|known| known == sample) {
+                            return false;
+                        }
+                        samples.push(sample.to_owned());
+                        true
+                    });
+                }
             }
             Err(error) => self.ai.error.set(error.to_owned()),
         }
@@ -1045,13 +1107,7 @@ impl Model {
 
     pub fn close_ai(&self) {
         if self.ai.open.get_untracked() {
-            self.ai.clear_batch();
-            self.ai.follow_after_write.set(None);
             self.ai.brief_open.set(false);
-            self.ai.target.set(None);
-            self.ai.viewed_source.set(None);
-            self.ai.context.set(Ok(TextBuffer::empty()));
-            self.ai.prompt.set(TextBuffer::empty());
             self.ai.open.set(false);
             self.revision.update(|value| *value += 1);
         }
@@ -1195,14 +1251,7 @@ impl Model {
 
     fn store_ai_settings(&self, mut settings: ruwriter_core::AiSettings) -> Result<(), String> {
         settings.normalize_selection();
-        let tools = settings
-            .selected
-            .iter()
-            .all(|&index| settings.models[index].tools);
         self.with_session(|session| session.set_ai_preferences(settings))?;
-        if !tools {
-            self.ai.scope.set(ResearchScope::Excerpt);
-        }
         self.revision.update(|value| *value += 1);
         Ok(())
     }
@@ -1216,116 +1265,241 @@ impl Model {
         .flatten()
     }
 
-    pub fn run_ai(&self) {
+    pub fn send_ai_message(&self) {
+        let prompt = self.ai.prompt.get_untracked().string_value();
+        let index = self.ai.viewed_result.get_untracked();
+        if self.ai.follow_draft.get_untracked()
+            && self
+                .ai
+                .current_batch()
+                .is_some_and(|batch| batch.can_revise(index))
+        {
+            if !is_continuation_command(&prompt) {
+                self.ai.feedback.set(String::new());
+                self.ai.error.set(
+                    self.ai
+                        .refine(index, Some(prompt))
+                        .err()
+                        .map_or_else(String::new, |error| error.to_string()),
+                );
+                return;
+            }
+            self.ai.task.set(WritingTask::Continue);
+        }
+        self.run_ai();
+    }
+
+    pub fn retry_ai(&self) {
+        let Some(batch) = self.ai.current_batch().filter(|batch| !batch.busy()) else {
+            return;
+        };
+        self.ai.task.set(batch.writing_task());
+        self.ai.prompt.set(batch.prompt);
+        self.run_ai();
+    }
+
+    fn run_ai(&self) {
+        self.update_ai_target(false);
         let result = (|| {
-            if let Some(target) = self.ai.target.get_untracked() {
-                if self.ai_document().as_ref() != Some(&target.document)
-                    || self.buffer.get_untracked() != target.buffer
-                {
-                    return Err("正文已变化。点「对准当前光标」更新落笔位置。".to_owned());
-                }
+            if let Some(target) = self.ai.target.get_untracked()
+                && (self.ai_document().as_ref() != Some(&target.document)
+                    || self.buffer.get_untracked() != target.buffer)
+            {
+                return Err("正文刚发生变化，请在当前落笔位置重新发送。".to_owned());
             }
             self.ai.feedback.set(String::new());
-            let brief = if self.ai.use_brief.get_untracked() {
+            let mut brief = if self.ai.use_brief.get_untracked() {
                 self.ai_brief()
             } else {
                 Default::default()
             };
+            if self.ai.task.get_untracked() == WritingTask::Continue {
+                brief.story = self.ai_story();
+            }
             let scope = if self.ai.task.get_untracked() == WritingTask::Polish {
                 ResearchScope::Excerpt
             } else {
                 self.ai.scope.get_untracked()
             };
-            let prepared = self
-                .read(|session| {
-                    let settings = session.ai_preferences();
-                    let profiles: Vec<_> = settings
-                        .selected
-                        .iter()
-                        .filter_map(|&index| settings.models.get(index).cloned())
-                        .collect();
-                    if scope == ResearchScope::Excerpt {
-                        return Ok((profiles, None));
-                    }
-                    if profiles.iter().any(|profile| !profile.tools) {
-                        return Err("跨章节检索需要为所有已选模型开启工具调用。".to_owned());
-                    }
-                    let target = self
-                        .ai
-                        .target
-                        .get_untracked()
-                        .ok_or_else(|| "请先打开要检索的文稿。".to_owned())?;
-                    let doc = session
-                        .active_document()
-                        .filter(|doc| !doc.trashed)
-                        .ok_or_else(|| "请先打开要检索的文稿。".to_owned())?;
-                    let root = session.library_root();
-                    if root != target.document.0
-                        || doc.id != target.document.1
-                        || self.document.get_untracked() != target.document.2
-                        || self.buffer.get_untracked() != target.buffer
-                    {
-                        return Err("原文稿已变化，请重新打开助手确认检索范围。".to_owned());
-                    }
-                    if scope == ResearchScope::Project && doc.external {
-                        return Err("库外文稿可检索本文稿。作品检索需要先打开库内文稿。".to_owned());
-                    }
-                    let folder = project_folder(&doc.id);
-                    let files = session
-                        .library
-                        .documents
-                        .iter()
-                        .filter(|file| {
-                            if scope == ResearchScope::Document {
-                                file.id == doc.id
-                            } else {
-                                !file.external
-                                    && !file.trashed
-                                    && ruwriter_core::Library::is_within(&file.id, folder)
-                            }
-                        })
-                        .map(|file| ManuscriptFile {
-                            id: if file.external {
-                                file.path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned()
-                            } else {
-                                file.id.clone()
-                            },
-                            title: file.display_title().to_owned(),
-                            path: file.path.clone(),
-                        })
-                        .collect();
-                    let active_id = if doc.external {
-                        doc.path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    } else {
-                        doc.id.clone()
-                    };
-                    Ok((
-                        profiles,
-                        Some(ResearchRequest {
-                            root: root.to_path_buf(),
-                            files,
-                            active_id,
-                            active: target.buffer,
-                            caret: target.insertion,
-                        }),
-                    ))
-                })
-                .ok_or_else(|| "无法读取模型设置。".to_owned())??;
+            if self.ai.task.get_untracked() == WritingTask::Continue && !brief.story.is_ready() {
+                if matches!(self.ai.story_status(), Some(StoryStatus::Ready(_))) {
+                    return Err("请先确认这部作品的剧情和人物。".to_owned());
+                }
+                return self.prepare_story_request();
+            }
+            let prepared = self.ai_inputs(scope)?;
             self.ai.start(prepared.0, prepared.1, brief)
         })();
         self.ai.error.set(result.err().unwrap_or_default());
     }
 
+    pub fn ai_story(&self) -> ruwriter_core::StoryProfile {
+        if let Some(StoryStatus::Confirmed(story)) = self.ai.story_status() {
+            return story;
+        }
+        self.ai_brief().story
+    }
+
+    pub fn prepare_ai_story(&self) {
+        self.update_ai_target(false);
+        self.ai
+            .error
+            .set(self.prepare_story_request().err().unwrap_or_default());
+    }
+
+    fn prepare_story_request(&self) -> Result<(), String> {
+        let scope = if self.ai.scope.get_untracked() == ResearchScope::Project {
+            ResearchScope::Project
+        } else {
+            ResearchScope::Document
+        };
+        let (models, request) = self.ai_inputs(scope)?;
+        let model = models.first().ok_or("请先选择用于整理作品的模型。")?;
+        let request = request.ok_or("请先打开要整理的文稿。")?;
+        self.ai
+            .prepare_story(model, request)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn edit_prepared_story(&self) {
+        let Some(StoryStatus::Ready(draft)) = self.ai.story_status() else {
+            return;
+        };
+        self.edit_ai_brief();
+        self.ai
+            .story_outline
+            .set(TextBuffer::new(&draft.profile.outline));
+        self.ai
+            .story_characters
+            .set(TextBuffer::new(&draft.profile.characters));
+        self.ai
+            .story_threads
+            .set(TextBuffer::new(&draft.profile.open_threads));
+    }
+
+    pub fn confirm_ai_story(&self) {
+        let Some(StoryStatus::Ready(draft)) = self.ai.story_status() else {
+            return;
+        };
+        let saved = if let Some((root, work)) = self.ai_work() {
+            let mut brief = self.ai_brief();
+            brief.story = draft.profile.clone();
+            self.with_session(|session| {
+                if session.library_root() != root {
+                    return Err("资料库已切换，请重新整理作品。".to_owned());
+                }
+                session
+                    .library
+                    .save_writing_brief(&work, brief)
+                    .map_err(|error| error.to_string())
+            })
+        } else {
+            self.ai.confirm_story_for_session(draft.profile);
+            Ok(())
+        };
+        match saved {
+            Ok(()) => {
+                if self.ai_work().is_some() {
+                    self.ai.clear_story();
+                }
+                self.revision.update(|value| *value += 1);
+                self.ai.task.set(WritingTask::Continue);
+                self.run_ai();
+            }
+            Err(error) => self.ai.error.set(error),
+        }
+    }
+
+    fn ai_inputs(
+        &self,
+        scope: ResearchScope,
+    ) -> Result<(Vec<ruwriter_core::AiPreferences>, Option<ResearchRequest>), String> {
+        self.read(|session| {
+            let settings = session.ai_preferences();
+            let profiles: Vec<_> = settings
+                .selected
+                .iter()
+                .filter_map(|&index| settings.models.get(index).cloned())
+                .collect();
+            if scope == ResearchScope::Excerpt {
+                return Ok((profiles, None));
+            }
+            let target = self
+                .ai
+                .target
+                .get_untracked()
+                .ok_or_else(|| "请先打开要检索的文稿。".to_owned())?;
+            let doc = session
+                .active_document()
+                .filter(|doc| !doc.trashed)
+                .ok_or_else(|| "请先打开要检索的文稿。".to_owned())?;
+            let root = session.library_root();
+            if root != target.document.0
+                || doc.id != target.document.1
+                || self.document.get_untracked() != target.document.2
+                || self.buffer.get_untracked() != target.buffer
+            {
+                return Err("原文稿已变化，请重新打开助手确认检索范围。".to_owned());
+            }
+            if scope == ResearchScope::Project && doc.external {
+                return Err("库外文稿可检索本文稿。作品检索需要先打开库内文稿。".to_owned());
+            }
+            let folder = project_folder(&doc.id);
+            let files = session
+                .library
+                .documents
+                .iter()
+                .filter(|file| {
+                    if scope == ResearchScope::Document {
+                        file.id == doc.id
+                    } else {
+                        !file.external
+                            && !file.trashed
+                            && ruwriter_core::Library::is_within(&file.id, folder)
+                    }
+                })
+                .map(|file| ManuscriptFile {
+                    id: if file.external {
+                        file.path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        file.id.clone()
+                    },
+                    title: file.display_title().to_owned(),
+                    path: file.path.clone(),
+                })
+                .collect();
+            let active_id = if doc.external {
+                doc.path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                doc.id.clone()
+            };
+            Ok((
+                profiles,
+                Some(ResearchRequest {
+                    root: root.to_path_buf(),
+                    files,
+                    active_id,
+                    active: target.buffer,
+                    caret: target.insertion,
+                }),
+            ))
+        })
+        .ok_or_else(|| "无法读取模型设置。".to_owned())?
+    }
+
     pub fn apply_ai(&self, index: usize, replace: bool, keep_open: bool) {
-        let Some(batch) = self.ai.batch.get_untracked() else {
+        if self.ai.follow_after_write.get_untracked().is_some() {
+            return;
+        }
+        let Some(batch) = self.ai.current_batch().filter(|batch| !batch.applied()) else {
             return;
         };
         let Some(target) = batch.target.as_ref() else {
@@ -1334,42 +1508,54 @@ impl Model {
         let Some(ModelStatus::Ready(result)) = batch.runs.get(index).map(|run| &run.status) else {
             return;
         };
+        if !result.can_adopt() {
+            self.ai
+                .error
+                .set("这条回复还不能写入正文。请重新生成或编辑后审稿。".to_owned());
+            return;
+        }
         if (result.task == WritingTask::Continue && replace)
             || (result.task == WritingTask::Polish && !replace)
         {
             return;
         }
         let current = self.buffer.get_untracked();
-        if self.ai_document().as_ref() != Some(&target.document) || current != target.buffer {
+        let same_document = self
+            .ai_document()
+            .is_some_and(|(root, id, _)| root == target.document.0 && id == target.document.1);
+        let range = same_document
+            .then(|| target.resolve_range(&current, replace))
+            .flatten();
+        let Some(range) = range else {
             self.ai
                 .error
-                .set("原文稿已变化。可复制结果，或重新打开助手选取范围。".to_owned());
+                .set("原落笔点已变化或无法唯一定位。可以复制草稿，再手动放入正文。".to_owned());
             return;
-        }
-        let range = if replace {
-            let Some(selection) = target.selection.clone() else {
-                return;
-            };
-            selection
-        } else {
-            target.insertion..target.insertion
         };
-        let text = result.text.string_value();
+        let mut text = result.text.string_value();
         if text.trim().is_empty() {
             return;
+        }
+        if result.task == WritingTask::Continue {
+            text = continuation_insertion(&current, range.start, text);
         }
         let start = current.utf8_offset_for_character_index(range.start);
         let updated = current.replace(range.clone(), &text);
         let caret = updated.character_index_for_utf8_offset(start + text.len());
-        if keep_open {
-            self.ai.clear_batch();
-            self.ai.follow_after_write.set(Some(caret));
-            self.ai.prompt.set(TextBuffer::empty());
-            self.ai.error.set(String::new());
-            self.ai.feedback.set("已写入正文".to_owned());
-        } else {
-            self.close_ai();
+        if updated.has_same_contents(&current) {
+            self.ai
+                .error
+                .set("草稿与选区相同，正文无需改动。".to_owned());
+            return;
         }
+        self.ai.error.set(String::new());
+        self.ai.follow_after_write.set(Some(PendingDraftEdit {
+            before: current,
+            expected: updated,
+            caret,
+            index,
+            keep_open,
+        }));
         if self.options().preview {
             self.toggle_preview();
         }

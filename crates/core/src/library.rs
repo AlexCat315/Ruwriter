@@ -275,11 +275,39 @@ pub struct WritingBrief {
     pub canon: String,
     pub voice: String,
     pub avoid: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub voice_samples: Vec<String>,
+    #[serde(skip_serializing_if = "StoryProfile::is_empty")]
+    pub story: StoryProfile,
 }
 
 impl WritingBrief {
     pub fn is_empty(&self) -> bool {
-        self.canon.trim().is_empty() && self.voice.trim().is_empty() && self.avoid.trim().is_empty()
+        self.canon.trim().is_empty()
+            && self.voice.trim().is_empty()
+            && self.avoid.trim().is_empty()
+            && self.voice_samples.is_empty()
+            && self.story.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StoryProfile {
+    pub outline: String,
+    pub characters: String,
+    pub open_threads: String,
+}
+
+impl StoryProfile {
+    pub fn is_empty(&self) -> bool {
+        self.outline.trim().is_empty()
+            && self.characters.trim().is_empty()
+            && self.open_threads.trim().is_empty()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        !self.outline.trim().is_empty() && !self.characters.trim().is_empty()
     }
 }
 

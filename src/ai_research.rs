@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 const MAX_TOOL_BYTES: usize = 48 * 1024;
 const CHUNK_BYTES: usize = 2100;
 const CHUNK_OVERLAP: usize = 240;
+const STORY_BATCH_BYTES: usize = 42 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ResearchScope {
@@ -47,6 +48,15 @@ pub struct Source {
     pub first_line: usize,
     pub last_line: usize,
     pub text: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct StoryExcerpt {
+    file: String,
+    chapter: usize,
+    title: String,
+    offset: usize,
+    text: String,
 }
 
 pub type ResearchCache = Arc<Mutex<Option<CachedIndex>>>;
@@ -405,11 +415,77 @@ impl ResearchRun {
         context
     }
 
+    /// Walk every readable chapter segment in order. The batch budget limits
+    /// a single model call; no chapter is sampled away at this boundary.
+    pub fn visit_story_batches(
+        &self,
+        cancelled: &AtomicBool,
+        mut visit: impl FnMut(&[StoryExcerpt]) -> Result<(), AgentError>,
+    ) -> Result<(), AgentError> {
+        let mut batch = Vec::new();
+        let mut used = 0;
+        for (id, chapter) in self.index.chapters.iter().enumerate() {
+            let document = &self.index.documents[chapter.document];
+            let stop = self.readable_end(chapter);
+            let mut start = chapter.start;
+            while start < stop {
+                check_cancelled(cancelled)?;
+                if STORY_BATCH_BYTES - used < 4 {
+                    visit(&batch)?;
+                    batch.clear();
+                    used = 0;
+                }
+                let end = (start + STORY_BATCH_BYTES - used).min(stop);
+                let bytes = document.text.read(start, end).ok_or_else(|| {
+                    AgentError::Model("读稿时资料发生变化，请重新梳理。".to_owned())
+                })?;
+                let text = match std::str::from_utf8(&bytes) {
+                    Ok(text) => text,
+                    Err(error) if error.error_len().is_none() => {
+                        std::str::from_utf8(&bytes[..error.valid_up_to()])
+                            .map_err(|_| AgentError::InvalidResult)?
+                    }
+                    Err(_) => return Err(AgentError::InvalidResult),
+                };
+                if text.is_empty() {
+                    return Err(AgentError::InvalidResult);
+                }
+                batch.push(StoryExcerpt {
+                    file: document.id.clone(),
+                    chapter: id + 1,
+                    title: self.readable_title(chapter).to_owned(),
+                    offset: start - chapter.start,
+                    text: text.to_owned(),
+                });
+                used += text.len();
+                start += text.len();
+            }
+        }
+        if !batch.is_empty() {
+            visit(&batch)?;
+        }
+        Ok(())
+    }
+
     pub fn sources(&self) -> Vec<Source> {
         self.evidence
             .iter()
             .map(|(_, source)| source.clone())
             .collect()
+    }
+
+    /// Supply a small evidence set even when the model cannot call tools.
+    /// For continuation the opening evidence should come from earlier
+    /// passages, beyond the immediate context already sent with the request.
+    pub fn initial_evidence(&mut self, query: &str, recent_bytes: usize) -> Value {
+        let previous = self.evidence.len();
+        let data = self.search_passages(query, 3, recent_bytes);
+        let result = self.admit(data.clone(), previous);
+        if result.is_error {
+            json!({"matches":[]})
+        } else {
+            data
+        }
     }
 
     pub fn answer_tool(
@@ -478,12 +554,22 @@ impl ResearchRun {
     }
 
     fn search(&mut self, query: &str, limit: usize) -> Value {
+        self.search_passages(query, limit, 0)
+    }
+
+    fn search_passages(&mut self, query: &str, limit: usize, recent_bytes: usize) -> Value {
         let mut by_chapter = HashMap::<usize, usize>::new();
         let hits = self.index.search.search(query, usize::MAX);
         let mut results = Vec::new();
         for hit in hits {
             let mut passage = self.index.passages[hit];
             let chapter = &self.index.chapters[passage.chapter];
+            if recent_bytes > 0
+                && self.active_document == Some(chapter.document)
+                && passage.end > self.caret.saturating_sub(recent_bytes)
+            {
+                continue;
+            }
             let stop = self.readable_end(chapter);
             if passage.start >= stop {
                 continue;
@@ -660,6 +746,39 @@ mod tests {
     }
 
     #[test]
+    fn story_batches_read_the_whole_authorized_prefix_with_no_utf8_gaps() {
+        let library = tempfile::tempdir().unwrap();
+        let root = library.path();
+        let book = file(root, "大纲.txt");
+        let text = format!("第一章\n{}\n第二章\n阿雪关门，", "故事。".repeat(7_000));
+        let caret = TextBuffer::new(&text).character_count();
+        let active = TextBuffer::new(&format!("{text}光标之后不能发。"));
+        let cancelled = AtomicBool::new(false);
+        let mut run = ResearchRequest {
+            root: root.to_path_buf(),
+            files: vec![book.clone()],
+            active_id: book.id,
+            active,
+            caret,
+        }
+        .open(&ResearchCache::default(), &cancelled)
+        .unwrap();
+        run.restrict_to_preceding_text();
+        let mut reconstructed = String::new();
+        let mut visits = 0;
+        run.visit_story_batches(&cancelled, |parts| {
+            visits += 1;
+            for part in parts {
+                reconstructed.push_str(&part.text);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(visits > 1);
+        assert_eq!(reconstructed, text);
+    }
+
+    #[test]
     fn reads_distant_evidence_in_a_thousand_chapter_book() {
         let library = tempfile::tempdir().unwrap();
         let root = library.path();
@@ -688,6 +807,10 @@ mod tests {
         assert_eq!(page["total"], 1000);
         assert_eq!(page["chapters"][0]["title"], "第997章");
         assert_eq!(page["next"], 999);
+
+        let initial = run.initial_evidence("鹰纹银匣", 5400);
+        assert_eq!(initial["matches"][0]["chapter"], 27);
+        assert_eq!(initial["matches"][0]["source"], "R1");
 
         let results = run.search("鹰纹银匣", 2);
         let hit = &results["matches"][0];

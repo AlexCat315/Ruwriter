@@ -1,6 +1,9 @@
 mod ai;
 mod ai_continuation;
 mod ai_research;
+mod ai_review;
+mod ai_story;
+mod ai_voice;
 mod app;
 mod dates;
 mod formatting;
