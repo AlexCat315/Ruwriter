@@ -1,8 +1,13 @@
 //! Three-way merge rules for Gist sync, independent of the network.
 
 use std::collections::BTreeMap;
+use std::fs;
 
-use ruwriter_core::sync::{SyncBase, SyncDocument, content_hash, gist_name, plan_sync, uid_for};
+use ruwriter_core::Session;
+use ruwriter_core::sync::{
+    SyncBase, SyncDocument, SyncPlan, SyncReport, base_for, content_hash, gist_name, plan_sync,
+    uid_for,
+};
 
 fn doc(uid: &str, path: &str, text: &str) -> SyncDocument {
     SyncDocument {
@@ -45,6 +50,7 @@ fn base(uid: &str, path: &str, text: &str) -> (String, SyncBase) {
             path: path.to_owned(),
             hash: content_hash(text),
             updated_at: 10,
+            metadata: None,
         },
     )
 }
@@ -193,4 +199,133 @@ fn library_id_and_device_are_stamped() {
     assert_eq!(plan.manifest.device, "mac");
     assert_eq!(plan.manifest.updated_at, 123);
     assert_eq!(plan.manifest.schema, 1);
+}
+
+fn report(plan: SyncPlan) -> SyncReport {
+    SyncReport {
+        gist_id: "test-gist".to_owned(),
+        created: false,
+        base: base_for(&plan.manifest),
+        manifest: plan.manifest,
+        pulled: plan.downloads,
+        deleted: plan.local_deletes,
+        conflicts: plan.conflicts,
+        summary: plan.summary,
+    }
+}
+
+#[test]
+fn legacy_sync_config_migrates_and_follows_its_library() {
+    let data = tempfile::tempdir().unwrap();
+    fs::write(
+        data.path().join("library.json"),
+        r#"{"sync":{"library_id":"old-library","gist_id":"old-gist","last_synced_at":123}}"#,
+    )
+    .unwrap();
+    let mut session = Session::at(data.path());
+    assert_eq!(session.sync_config().library_id, "old-library");
+    assert_eq!(session.sync_config().gist_id.as_deref(), Some("old-gist"));
+
+    let other = tempfile::tempdir().unwrap();
+    session.open_library(other.path(), "").unwrap();
+    let other_id = session.sync_config().library_id.clone();
+    assert_ne!(other_id, "old-library");
+    assert!(session.sync_config().gist_id.is_none());
+    assert_eq!(Session::at(data.path()).sync_config().library_id, other_id);
+
+    session
+        .open_library(&data.path().join("documents"), "")
+        .unwrap();
+    assert_eq!(session.sync_config().library_id, "old-library");
+    assert_eq!(session.sync_config().last_synced_at, 123);
+    assert_eq!(
+        Session::at(data.path()).sync_config().gist_id.as_deref(),
+        Some("old-gist")
+    );
+}
+
+#[test]
+fn pull_applies_cloud_move_and_metadata_without_rewriting_the_text() {
+    let data = tempfile::tempdir().unwrap();
+    let mut session = Session::at(data.path());
+    session.save("雨夜").unwrap();
+    let before = session.sync_snapshot().unwrap();
+    let library = session.sync_config().library_id.clone();
+    let base = base_for(&plan_sync(&before, &[], &BTreeMap::new(), &library, "a", 100).manifest);
+    let mut remote = before.clone();
+    remote[0].path = format!("第一卷/{}", before[0].path);
+    remote[0].synopsis = "第一卷摘要".to_owned();
+    remote[0].pinned = true;
+    let report = report(plan_sync(&before, &remote, &base, &library, "a", 101));
+    assert_eq!(report.pulled.len(), 1);
+    let original = session.library_root().join(&before[0].path);
+    let stamp = ruwriter_core::files::stamp(&original);
+    let outcome = session.apply_sync_report(&report, &before).unwrap();
+    assert!(!outcome.active_changed);
+    assert!(!original.exists());
+    let target = session.library_root().join(&remote[0].path);
+    assert_eq!(ruwriter_core::files::stamp(&target), stamp);
+    let after = session.sync_snapshot().unwrap();
+    assert_eq!(after[0].uid, before[0].uid);
+    assert_eq!(after[0].path, remote[0].path);
+    assert_eq!(after[0].synopsis, "第一卷摘要");
+    assert!(after[0].pinned);
+}
+
+#[test]
+fn pull_preserves_text_written_after_the_sync_started() {
+    let data = tempfile::tempdir().unwrap();
+    let mut session = Session::at(data.path());
+    session.save("雨夜").unwrap();
+    let before = session.sync_snapshot().unwrap();
+    let library = session.sync_config().library_id.clone();
+    let base = base_for(&plan_sync(&before, &[], &BTreeMap::new(), &library, "a", 100).manifest);
+    let mut remote = before.clone();
+    remote[0].content = "云端版本".to_owned();
+    remote[0].hash = content_hash(&remote[0].content);
+    let report = report(plan_sync(&before, &remote, &base, &library, "a", 101));
+    session.autosave("雨夜\n刚写的一段").unwrap();
+    let outcome = session.apply_sync_report(&report, &before).unwrap();
+    assert_eq!(session.text(), "雨夜\n刚写的一段");
+    assert_eq!(outcome.deferred, 1);
+    assert_eq!(
+        fs::read_to_string(&outcome.conflicts[0]).unwrap(),
+        "云端版本"
+    );
+}
+
+#[test]
+fn local_edit_during_cloud_deletion_can_be_uploaded_on_retry() {
+    let data = tempfile::tempdir().unwrap();
+    let mut session = Session::at(data.path());
+    session.save("雨夜").unwrap();
+    let before = session.sync_snapshot().unwrap();
+    let library = session.sync_config().library_id.clone();
+    let base = base_for(&plan_sync(&before, &[], &BTreeMap::new(), &library, "a", 100).manifest);
+    let remote = [deleted(&before[0].uid, &before[0].path)];
+    let report = report(plan_sync(&before, &remote, &base, &library, "a", 101));
+    session.autosave("雨夜\n仍在写").unwrap();
+    let outcome = session.apply_sync_report(&report, &before).unwrap();
+    assert_eq!(outcome.deferred, 1);
+
+    let local = session.sync_snapshot().unwrap();
+    let retry = plan_sync(
+        &local,
+        &remote,
+        &session.sync_config().base,
+        &library,
+        "a",
+        102,
+    );
+    assert_eq!(retry.uploads[0].content, "雨夜\n仍在写");
+    assert!(retry.local_deletes.is_empty());
+}
+
+#[test]
+fn a_missing_document_in_the_snapshot_is_an_error() {
+    let data = tempfile::tempdir().unwrap();
+    let mut session = Session::at(data.path());
+    let id = session.active_id().unwrap();
+    fs::remove_file(session.library_root().join(id)).unwrap();
+    assert!(session.sync_snapshot().is_err());
 }

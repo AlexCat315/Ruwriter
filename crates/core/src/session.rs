@@ -61,8 +61,9 @@ pub(crate) struct AppState {
     external: BTreeMap<String, Meta>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     documents: Vec<LegacyDocument>,
-    /// Gist cloud backup settings and last-synced hashes.
-    pub(crate) sync: crate::sync::SyncConfig,
+    /// Sync settings from v0.4.1 and earlier, migrated into the open library.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sync: Option<crate::sync::SyncConfig>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -107,16 +108,20 @@ impl Session {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        if app.sync.library_id.is_empty() {
-            app.sync.library_id = crate::sync::new_library_id();
-        }
         let root = app
             .library_folder
             .clone()
             .unwrap_or_else(|| paths::documents_directory(data_root));
         let legacy = std::mem::take(&mut app.documents);
         let external = std::mem::take(&mut app.external);
-        let library = Library::open(&root, external);
+        let mut library = Library::open(&root, external);
+        if library.state.sync.library_id.is_empty() {
+            library.state.sync = app.sync.clone().unwrap_or_default();
+            library.ensure_sync_identity();
+        }
+        if app.sync.is_some() && library.save_state().is_ok() {
+            app.sync = None;
+        }
         let settings = app.settings.clone();
         let mut session = Self {
             data_root: data_root.to_path_buf(),
@@ -138,7 +143,6 @@ impl Session {
         if !legacy.is_empty() {
             session.migrate(legacy);
         }
-        session.ensure_sync_uids();
         if session
             .app
             .settings
@@ -716,6 +720,7 @@ impl Session {
         self.app.settings.folder = None;
         let external = std::mem::take(&mut self.library.external);
         self.library = Library::open(folder, external);
+        self.library.ensure_sync_identity();
         let first = self.documents().first().map(|document| document.id.clone());
         match first {
             Some(id) => self.open_document(&id),
@@ -1112,7 +1117,7 @@ impl Session {
     /// Moves a file or folder inside the library and carries its cached
     /// state, the open document and the selected folder along. Returns the
     /// new id.
-    fn relocate(&mut self, id: &str, from: &Path, to: &Path) -> Result<String, String> {
+    pub(crate) fn relocate(&mut self, id: &str, from: &Path, to: &Path) -> Result<String, String> {
         move_path(from, to).map_err(|error| error.to_string())?;
         let new_id = self
             .library

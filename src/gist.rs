@@ -15,10 +15,12 @@ use std::time::Duration;
 
 const API: &str = "https://api.github.com";
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
+const MAX_FILES: usize = 300;
+const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+const DESCRIPTION_SUFFIX: &str = "（私有云同步，请勿手动编辑）";
 
 #[derive(Clone, Debug)]
 pub struct SyncRequest {
-    pub token: String,
     pub gist_id: Option<String>,
     pub library_id: String,
     pub device: String,
@@ -31,251 +33,276 @@ struct Remote {
     id: String,
     manifest: Manifest,
     documents: Vec<SyncDocument>,
-}
-
-enum Resolved {
-    Existing(Remote, BTreeMap<String, SyncBase>),
-    Created(SyncReport),
+    files: BTreeSet<String>,
 }
 
 /// Finds the library's Gist automatically: a configured id wins, a stale id
-/// falls back to the one carrying our library description, and a fresh library
-/// creates one. No user-facing Gist id is required.
-fn resolve_remote(client: &Client, token: &str, request: &SyncRequest) -> Result<Resolved, String> {
-    if let Some(id) = request
+/// falls back to the one carrying our library description.
+fn resolve_remote(
+    client: &Client,
+    token: &str,
+    request: &SyncRequest,
+) -> Result<Option<Remote>, String> {
+    let configured = request
         .gist_id
         .as_deref()
-        .filter(|id| !id.trim().is_empty())
-    {
-        match fetch(client, token, id.trim()) {
-            Ok(remote) => return Ok(Resolved::Existing(remote, request.base.clone())),
-            Err(error) if error.starts_with("找不到这个 Gist") => {}
-            Err(error) => return Err(error),
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    if let Some(id) = configured {
+        if let Some(remote) = fetch(client, token, id)? {
+            return Ok(Some(remote));
         }
     }
     if let Some(id) = find_gist(client, token, &request.library_id)? {
-        return Ok(Resolved::Existing(
-            fetch(client, token, &id)?,
-            BTreeMap::new(),
-        ));
+        return fetch(client, token, &id)?
+            .map(Some)
+            .ok_or_else(|| "云端 Gist 在查找后消失，请重试同步。".to_owned());
     }
-    create(request, token, client).map(Resolved::Created)
+    if configured.is_some() {
+        return Err(
+            "当前 GitHub 账号无法访问这个资料库的私有 Gist。请确认登录的是原同步账号。".to_owned(),
+        );
+    }
+    Ok(None)
 }
 
 fn find_gist(client: &Client, token: &str, library_id: &str) -> Result<Option<String>, String> {
-    let response = client
-        .send(auth(
-            Request::get(format!("{API}/gists?per_page=100")),
-            token,
-        ))
-        .map_err(network_error)?;
-    let (status, bytes) = read(response)?;
-    if status != 200 {
-        return Err(api_error(status, &bytes));
-    }
-    let value = parse_json(&bytes)?;
-    let Some(gists) = value.as_array() else {
-        return Ok(None);
-    };
     let marker = format!("Ruwriter 资料库 · {library_id}");
-    for gist in gists {
-        let description = gist
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !description.contains(&marker) {
-            continue;
+    let description = format!("{marker}{DESCRIPTION_SUFFIX}");
+    for page in 1.. {
+        let response = client
+            .send(auth(
+                Request::get(format!("{API}/gists?per_page=100&page={page}")),
+                token,
+            ))
+            .map_err(network_error)?;
+        let has_next = response.header("link").is_some_and(|link| {
+            link.split(',')
+                .any(|entry| entry.trim_end().ends_with("rel=\"next\""))
+        });
+        let (status, bytes) = read(response)?;
+        if status != 200 {
+            return Err(api_error(status, &bytes));
         }
-        if let Some(id) = gist.get("id").and_then(Value::as_str) {
-            return Ok(Some(id.to_owned()));
+        let value = parse_json(&bytes)?;
+        let gists = value
+            .as_array()
+            .ok_or_else(|| "GitHub 返回了无效的 Gist 列表。".to_owned())?;
+        for gist in gists {
+            let name = gist.get("description").and_then(Value::as_str);
+            if gist.get("public").and_then(Value::as_bool) == Some(false)
+                && (name == Some(&description) || name == Some(&marker))
+                && let Some(id) = gist.get("id").and_then(Value::as_str)
+            {
+                return Ok(Some(id.to_owned()));
+            }
+        }
+        if !has_next {
+            break;
         }
     }
     Ok(None)
 }
 
-pub fn sync_with_gist(request: &SyncRequest) -> Result<SyncReport, String> {
-    let token = request.token.trim();
-    if token.is_empty() {
-        return Err("还没有填写 GitHub Token。".to_owned());
-    }
-    let client = Client::new(ClientConfig {
+pub fn sync_with_gist(request: &SyncRequest, token: &str) -> Result<SyncReport, String> {
+    prepare_sync(request, token)?.finish(token)
+}
+
+pub(crate) struct PendingSync {
+    pub report: SyncReport,
+    files: Map<String, Value>,
+}
+
+fn sync_client() -> Client {
+    Client::new(ClientConfig {
         timeout: Duration::from_secs(40),
         max_redirects: 3,
-        user_agent: "Ruwriter/0.3 GistSync".to_owned(),
-    });
+        user_agent: concat!("Ruwriter/", env!("CARGO_PKG_VERSION"), " GistSync").to_owned(),
+    })
+}
 
-    let (remote, base) = match resolve_remote(&client, token, request)? {
-        Resolved::Existing(remote, base) => (remote, base),
-        Resolved::Created(report) => return Ok(report),
+pub(crate) fn prepare_sync(request: &SyncRequest, token: &str) -> Result<PendingSync, String> {
+    if token.trim().is_empty() {
+        return Err("GitHub CLI 没有返回登录凭据。".to_owned());
+    }
+    let remote = resolve_remote(&sync_client(), token, request)?;
+    if let Some(remote) = &remote
+        && remote.manifest.library_id != request.library_id
+    {
+        return Err("这个 Gist 属于另一个 Ruwriter 资料库。".to_owned());
+    }
+
+    let empty_base = BTreeMap::new();
+    let base = if remote.is_some() {
+        &request.base
+    } else {
+        &empty_base
     };
-    if remote.manifest.library_id != request.library_id {
-        return Err(format!(
-            "这个 Gist 属于另一个 Ruwriter 资料库（{}）。",
-            remote.manifest.library_id
-        ));
-    }
-
     let plan = plan_sync(
         &request.local,
-        &remote.documents,
-        &base,
-        &request.library_id,
-        &request.device,
-        ruwriter_core::sync::now(),
-    );
-    let mut files = Map::new();
-    for doc in &plan.uploads {
-        // Gist rejects an empty `content` ("missing_field: files"). An empty
-        // document is represented by its manifest entry alone; fetching it
-        // back restores empty text from the recorded hash.
-        if doc.content.is_empty() {
-            files.insert(doc.gist_name(), Value::Null);
-        } else {
-            files.insert(doc.gist_name(), json!({ "content": doc.content }));
-        }
-    }
-    let remote_active: BTreeSet<String> = remote
-        .documents
-        .iter()
-        .filter(|d| !d.deleted)
-        .map(|d| d.uid.clone())
-        .collect();
-    for doc in &plan.manifest.documents {
-        if doc.deleted && remote_active.contains(&doc.uid) {
-            files.insert(doc.file.clone(), Value::Null);
-        }
-    }
-    let manifest_json = serde_json::to_string_pretty(&plan.manifest)
-        .map_err(|e| format!("无法生成同步清单：{e}"))?;
-    files.insert(
-        MANIFEST_FILE.to_owned(),
-        json!({ "content": manifest_json }),
-    );
-    patch(&client, token, &remote.id, files)?;
-
-    let base = base_for(&plan.manifest);
-    Ok(SyncReport {
-        gist_id: remote.id,
-        created: false,
-        manifest: plan.manifest,
-        pulled: plan.downloads,
-        deleted: plan.local_deletes,
-        conflicts: plan.conflicts,
-        summary: plan.summary,
+        remote
+            .as_ref()
+            .map_or(&[], |remote| remote.documents.as_slice()),
         base,
-    })
-}
-
-fn create(request: &SyncRequest, token: &str, client: &Client) -> Result<SyncReport, String> {
-    let plan = plan_sync(
-        &request.local,
-        &[],
-        &BTreeMap::new(),
         &request.library_id,
         &request.device,
         ruwriter_core::sync::now(),
     );
-    let mut files = Map::new();
-    for doc in &plan.uploads {
-        if doc.content.is_empty() {
-            continue;
-        }
-        files.insert(doc.gist_name(), json!({ "content": doc.content }));
-    }
-    let manifest_json = serde_json::to_string_pretty(&plan.manifest)
-        .map_err(|e| format!("无法生成同步清单：{e}"))?;
-    files.insert(
-        MANIFEST_FILE.to_owned(),
-        json!({ "content": manifest_json }),
-    );
-    let body = json!({
-        "description": format!(
-            "Ruwriter 资料库 · {}（私有云同步，请勿手动编辑）",
-            request.library_id
-        ),
-        "public": false,
-        "files": files,
-    });
-    let response = client
-        .send(auth(
-            Request::post(format!("{API}/gists"), body.to_string()),
-            token,
-        ))
-        .map_err(network_error)?;
-    let (status, bytes) = read(response)?;
-    if status != 201 {
-        return Err(api_error(status, &bytes));
-    }
-    let value = parse_json(&bytes)?;
-    let id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "GitHub 没有返回 Gist ID。".to_owned())?
-        .to_owned();
-    let base = base_for(&plan.manifest);
-    Ok(SyncReport {
-        gist_id: id,
-        created: true,
-        manifest: plan.manifest,
-        pulled: Vec::new(),
-        deleted: Vec::new(),
-        conflicts: Vec::new(),
-        summary: format!(
-            "已创建私有 Gist，{}",
-            if plan.uploads.is_empty() {
-                "资料库已上传".to_owned()
+
+    let files = changed_files(remote.as_ref(), &plan)?;
+    let created = remote.is_none();
+    Ok(PendingSync {
+        files,
+        report: SyncReport {
+            gist_id: remote.map(|remote| remote.id).unwrap_or_default(),
+            created,
+            base: base_for(&plan.manifest),
+            manifest: plan.manifest,
+            pulled: plan.downloads,
+            deleted: plan.local_deletes,
+            conflicts: plan.conflicts,
+            summary: if created {
+                format!("已创建私有 Gist，{}", plan.summary)
             } else {
-                plan.summary.clone()
-            }
-        ),
-        base,
+                plan.summary
+            },
+        },
     })
 }
 
-fn fetch(client: &Client, token: &str, id: &str) -> Result<Remote, String> {
+fn changed_files(
+    remote: Option<&Remote>,
+    plan: &ruwriter_core::sync::SyncPlan,
+) -> Result<Map<String, Value>, String> {
+    let mut files = Map::new();
+    for doc in &plan.uploads {
+        let name = doc.gist_name();
+        if doc.content.is_empty() {
+            // A blank document lives only in the manifest.
+            if remote.is_some_and(|remote| remote.files.contains(&name)) {
+                files.insert(name, Value::Null);
+            }
+        } else if !remote.is_some_and(|remote| {
+            remote.files.contains(&name)
+                && remote
+                    .documents
+                    .iter()
+                    .any(|old| old.uid == doc.uid && old.hash == doc.hash)
+        }) {
+            files.insert(name, json!({ "content": doc.content }));
+        }
+    }
+    if let Some(remote) = remote {
+        for doc in &plan.manifest.documents {
+            if doc.deleted && remote.files.contains(&doc.file) {
+                files.insert(doc.file.clone(), Value::Null);
+            }
+        }
+    }
+    if !files.is_empty()
+        || remote.is_none_or(|remote| remote.manifest.documents != plan.manifest.documents)
+    {
+        let manifest_json = serde_json::to_string_pretty(&plan.manifest)
+            .map_err(|error| format!("无法生成同步清单：{error}"))?;
+        files.insert(
+            MANIFEST_FILE.to_owned(),
+            json!({ "content": manifest_json }),
+        );
+    }
+    let mut file_count = remote.map_or(0, |remote| remote.files.len());
+    for (name, entry) in &files {
+        if entry.is_null() {
+            file_count -= 1;
+        } else {
+            if !remote.is_some_and(|remote| remote.files.contains(name)) {
+                file_count += 1;
+            }
+            if entry["content"]
+                .as_str()
+                .is_some_and(|text| text.len() > MAX_FILE_SIZE)
+            {
+                return Err(format!(
+                    "同步文件「{name}」超过 Gist 可完整读取的 10 MB 上限。"
+                ));
+            }
+        }
+    }
+    if file_count > MAX_FILES {
+        return Err("资料库超过单个 Gist 可完整读取的 300 个文件上限。".to_owned());
+    }
+    Ok(files)
+}
+
+impl PendingSync {
+    pub(crate) fn finish(mut self, token: &str) -> Result<SyncReport, String> {
+        if self.files.is_empty() {
+            return Ok(self.report);
+        }
+        let client = sync_client();
+        if self.report.created {
+            let body = json!({
+                "description": format!(
+                    "Ruwriter 资料库 · {}{DESCRIPTION_SUFFIX}",
+                    self.report.manifest.library_id
+                ),
+                "public": false,
+                "files": self.files,
+            });
+            let response = client
+                .send(auth(
+                    Request::post(format!("{API}/gists"), body.to_string())
+                        .header("Content-Type", "application/json"),
+                    token,
+                ))
+                .map_err(network_error)?;
+            let (status, bytes) = read(response)?;
+            if status != 201 {
+                return Err(api_error(status, &bytes));
+            }
+            let value = parse_json(&bytes)?;
+            self.report.gist_id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "GitHub 没有返回 Gist ID。".to_owned())?
+                .to_owned();
+        } else {
+            patch(&client, token, &self.report.gist_id, self.files)?;
+        }
+        Ok(self.report)
+    }
+}
+
+fn fetch(client: &Client, token: &str, id: &str) -> Result<Option<Remote>, String> {
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("保存的 Gist 标识无效。".to_owned());
+    }
     let response = client
         .send(auth(Request::get(format!("{API}/gists/{id}")), token))
         .map_err(network_error)?;
     let (status, bytes) = read(response)?;
     if status == 404 {
-        return Err(
-            "找不到这个 Gist。请检查 Gist ID，或把 Gist ID 留空让 Ruwriter 新建一个。".to_owned(),
-        );
+        return Ok(None);
     }
     if status != 200 {
         return Err(api_error(status, &bytes));
     }
     let value = parse_json(&bytes)?;
+    if value.get("public").and_then(Value::as_bool) != Some(false) {
+        return Err("这个 Gist 未设为私有，无法用于云同步。".to_owned());
+    }
+    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+        return Err("GitHub 只返回了部分 Gist 文件，无法安全地同步这份资料库。".to_owned());
+    }
     let files = value
         .get("files")
         .and_then(Value::as_object)
         .ok_or_else(|| "GitHub 返回的 Gist 没有文件。".to_owned())?;
 
-    let mut contents = BTreeMap::new();
-    for (name, info) in files {
-        let truncated = info
-            .get("truncated")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let content = if truncated {
-            let raw = info
-                .get("raw_url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| format!("{name} 太大，GitHub 没有提供原始下载地址。"))?;
-            fetch_raw(client, raw)?
-        } else {
-            info.get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
-        };
-        contents.insert(name.clone(), content);
-    }
-
-    let manifest_text = contents
+    let manifest_info = files
         .get(MANIFEST_FILE)
         .ok_or_else(|| "这个 Gist 不是 Ruwriter 同步库：缺少同步清单。".to_owned())?;
-    let mut manifest: Manifest = serde_json::from_str(manifest_text)
+    let manifest_text = fetch_content(client, MANIFEST_FILE, manifest_info)?;
+    let manifest: Manifest = serde_json::from_str(&manifest_text)
         .map_err(|e| format!("同步清单损坏，未做任何修改：{e}"))?;
     if manifest.library_id.is_empty() {
         return Err("同步清单缺少资料库标识，未做任何修改。".to_owned());
@@ -285,9 +312,10 @@ fn fetch(client: &Client, token: &str, id: &str) -> Result<Remote, String> {
     }
 
     let mut documents = Vec::new();
+    let mut uids = BTreeSet::new();
     for doc in &manifest.documents {
-        if doc.uid.is_empty() {
-            continue;
+        if doc.uid.is_empty() || !uids.insert(&doc.uid) {
+            return Err("同步清单包含无效或重复的文稿标识。".to_owned());
         }
         if doc.deleted {
             documents.push(SyncDocument {
@@ -311,8 +339,8 @@ fn fetch(client: &Client, token: &str, id: &str) -> Result<Remote, String> {
         } else {
             doc.file.clone()
         };
-        let content = match contents.get(&file) {
-            Some(content) => content.clone(),
+        let content = match files.get(&file) {
+            Some(info) => fetch_content(client, &file, info)?,
             // Empty documents deliberately have no Gist file (the API rejects
             // empty content). The manifest hash tells us this is intentional.
             None if doc.hash == content_hash("") => String::new(),
@@ -327,7 +355,7 @@ fn fetch(client: &Client, token: &str, id: &str) -> Result<Remote, String> {
             uid: doc.uid.clone(),
             path: doc.path.clone(),
             hash: content_hash(&content),
-            content: content.clone(),
+            content,
             updated_at: doc.updated_at,
             deleted: false,
             title: doc.title.clone(),
@@ -338,16 +366,25 @@ fn fetch(client: &Client, token: &str, id: &str) -> Result<Remote, String> {
             created_at: doc.created_at,
         });
     }
-    // Keep the manifest's own metadata for deleted entries; `documents`
-    // only contains active ones, which is what the planner needs.
-    manifest
-        .documents
-        .retain(|doc| !doc.deleted || !doc.uid.is_empty());
-    Ok(Remote {
+    Ok(Some(Remote {
         id: id.to_owned(),
         manifest,
         documents,
-    })
+        files: files.keys().cloned().collect(),
+    }))
+}
+
+fn fetch_content(client: &Client, name: &str, info: &Value) -> Result<String, String> {
+    if info.get("truncated").and_then(Value::as_bool) != Some(true)
+        && let Some(content) = info.get("content").and_then(Value::as_str)
+    {
+        return Ok(content.to_owned());
+    }
+    let raw = info
+        .get("raw_url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("GitHub 没有返回「{name}」的完整内容。"))?;
+    fetch_raw(client, raw)
 }
 
 fn fetch_raw(client: &Client, url: &str) -> Result<String, String> {
@@ -386,15 +423,17 @@ fn patch(client: &Client, token: &str, id: &str, files: Map<String, Value>) -> R
     let body = json!({ "files": files });
     let response = client
         .send(auth(
-            Request::new("PATCH", format!("{API}/gists/{id}")).body(body.to_string()),
+            Request::new("PATCH", format!("{API}/gists/{id}"))
+                .header("Content-Type", "application/json")
+                .body(body.to_string()),
             token,
         ))
         .map_err(network_error)?;
-    let (status, bytes) = read(response)?;
-    if status != 200 {
-        return Err(api_error(status, &bytes));
+    if response.status == 200 {
+        return Ok(());
     }
-    Ok(())
+    let (status, bytes) = read(response)?;
+    Err(api_error(status, &bytes))
 }
 
 fn auth(request: Request, token: &str) -> Request {
@@ -436,14 +475,37 @@ fn network_error(error: cove_http::HttpError) -> String {
 
 /// Runs a `gh` command without showing a console window on Windows.
 fn gh_command(args: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = std::process::Command::new("gh");
-    command.args(args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    command.output().map_err(|error| {
+    let run = |path: &std::path::Path| {
+        let mut command = std::process::Command::new(path);
+        command.args(args).env("NO_COLOR", "1");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        command.output()
+    };
+    let result = run(std::path::Path::new("gh"));
+    // Finder-launched apps commonly inherit only the system PATH.
+    #[cfg(target_os = "macos")]
+    let result = {
+        let mut result = result;
+        for path in [
+            "/opt/homebrew/bin/gh",
+            "/usr/local/bin/gh",
+            "/opt/local/bin/gh",
+        ] {
+            if !result
+                .as_ref()
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                break;
+            }
+            result = run(std::path::Path::new(path));
+        }
+        result
+    };
+    result.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "没有找到 GitHub CLI。请先安装 gh，再在终端运行 gh auth login。Ruwriter 不保存 Token。"
                 .to_owned()
@@ -456,7 +518,7 @@ fn gh_command(args: &[&str]) -> Result<std::process::Output, String> {
 /// Reads the existing GitHub CLI login for one sync round. Nothing is written
 /// to disk; the token lives only in memory for the duration of the request.
 pub fn gh_token() -> Result<String, String> {
-    let output = gh_command(&["auth", "token"])?;
+    let output = gh_command(&["auth", "token", "--hostname", "github.com"])?;
     if !output.status.success() {
         return Err(
             "GitHub CLI 还没有登录。请在终端运行 gh auth login，完成后回到这里点“立即同步”。"
@@ -473,7 +535,7 @@ pub fn gh_token() -> Result<String, String> {
 /// Login status for the dialog, parsed from `gh auth status`; never returns a
 /// token.
 pub fn gh_status() -> String {
-    let output = match gh_command(&["auth", "status"]) {
+    let output = match gh_command(&["auth", "status", "--hostname", "github.com", "--active"]) {
         Ok(output) => output,
         Err(error) => return error,
     };
@@ -492,4 +554,58 @@ pub fn gh_status() -> String {
         }
     }
     "GitHub CLI 已登录".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruwriter_core::Session;
+
+    #[test]
+    fn blank_documents_update_the_manifest_without_deleting_absent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::at(dir.path());
+        let local = session.sync_snapshot().unwrap();
+        let blank = &local[0];
+        let name = blank.gist_name();
+        let plan = plan_sync(&local, &[], &BTreeMap::new(), "lib", "a", 100);
+        let created = changed_files(None, &plan).unwrap();
+        assert_eq!(created.len(), 1);
+        assert!(created.contains_key(MANIFEST_FILE));
+
+        let mut remote = Remote {
+            id: "test".to_owned(),
+            manifest: plan.manifest,
+            documents: local.clone(),
+            files: BTreeSet::from([MANIFEST_FILE.to_owned()]),
+        };
+        let unchanged = plan_sync(
+            &local,
+            &remote.documents,
+            &base_for(&remote.manifest),
+            "lib",
+            "b",
+            101,
+        );
+        assert!(changed_files(Some(&remote), &unchanged).unwrap().is_empty());
+
+        remote.files.insert(name.clone());
+        remote.documents[0].content = "雨夜".to_owned();
+        remote.documents[0].hash = content_hash("雨夜");
+        let mut previous = remote.manifest.clone();
+        previous.documents[0].hash = remote.documents[0].hash.clone();
+        remote.manifest = previous;
+        let emptied = plan_sync(
+            &local,
+            &remote.documents,
+            &base_for(&remote.manifest),
+            "lib",
+            "b",
+            102,
+        );
+        assert_eq!(
+            changed_files(Some(&remote), &emptied).unwrap().get(&name),
+            Some(&Value::Null)
+        );
+    }
 }

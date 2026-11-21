@@ -345,7 +345,7 @@ impl View for EditorField {
         let mut field = TextField::new("开始写作…", self.model.buffer.binding())
             .layout(TextFieldLayout {
                 axis: TextFieldAxis::Vertical,
-                max_visible_lines: 400,
+                max_visible_lines: 6,
                 wraps_lines: true,
                 first_line_indent: if novel && settings.paragraph_indent {
                     f32::from(self.font_size) * 2.0
@@ -370,7 +370,7 @@ impl View for EditorField {
                 on_change: Some(Rc::new(move |buffer| change.on_change(buffer))),
                 on_blur: Some(Rc::new(move || blur.save())),
                 on_caret_change: Some(Rc::new(move |state| caret.on_caret(state))),
-                on_key_down: Some(Rc::new(move |event| keys.on_return_key(event))),
+                on_key_down: Some(Rc::new(move |event| keys.on_editor_key(event))),
                 ..Default::default()
             });
         field.navigation = navigation;
@@ -555,7 +555,7 @@ impl View for StatusLine {
                 let len = buffer.character_count();
                 let (low, high) = (low.min(len), high.min(len));
                 if high > low {
-                    let selected = buffer.substring(low..high).chars().count();
+                    let selected = high - low;
                     parts.push(AnyView::new(
                         Text::new(format!("已选 {selected} 字 · "))
                             .semantic_foreground(SemanticColorRef::accent()),

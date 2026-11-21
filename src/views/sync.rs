@@ -39,6 +39,7 @@ impl View for SyncDialog {
             return AnyView::new(EmptyView);
         }
         let busy = self.model.sync_busy.get();
+        let checking = self.model.sync_checking.get();
         let failed = self.model.sync_failed.get();
         let status = self.model.sync_status.get();
         let login = self.model.sync_login.get();
@@ -50,11 +51,11 @@ impl View for SyncDialog {
         let status_view = AnyView::new(
             AnyView::new(
                 Text::new(status)
-                    .line_limit(Some(3))
+                    .line_limit(Some(5))
                     .semantic_font(SemanticFontRef::body())
                     .semantic_foreground(status_color),
             )
-            .frame_height(44.0),
+            .frame_height(76.0),
         );
 
         let login_card = AnyView::new(
@@ -87,7 +88,7 @@ impl View for SyncDialog {
                 ),
                 login_card,
                 note(
-                    "每个资料库自动对应一个私有 Gist：第一次同步时创建，之后按资料库标识自动找回；换电脑登录同一个 GitHub 账号即可接着写，不需要填 Gist ID。",
+                    "换电脑时，复制完整的资料库文件夹（含隐藏的 .ruwriter 目录），用同一个 GitHub 账号同步即可。",
                     true,
                 ),
                 status_view,
@@ -103,14 +104,18 @@ impl View for SyncDialog {
             vec![
                 AnyView::new(Button::title("关闭", move || close.close_sync())),
                 spacer(),
-                AnyView::new(Button::title("检查登录", move || {
-                    check.check_sync_login()
-                })),
                 AnyView::new(
-                    AnyView::new(Button::title(
-                        if busy { "同步中…" } else { "立即同步" },
-                        move || sync.sync_now(),
-                    ))
+                    Button::title("检查登录", move || check.check_sync_login())
+                        .enabled(!checking && !busy),
+                ),
+                AnyView::new(
+                    AnyView::new(
+                        Button::title(
+                            if busy { "同步中…" } else { "立即同步" },
+                            move || sync.sync_now(),
+                        )
+                        .enabled(!busy),
+                    )
                     .button_style(PrimaryButtonStyle),
                 ),
             ],

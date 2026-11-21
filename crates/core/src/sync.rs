@@ -6,8 +6,9 @@
 //! between local files, the last-synced base and the remote manifest decides
 //! what to upload, download, delete or keep as a conflict copy.
 
-use crate::document::DocStatus;
-use crate::files::{read_document, write_document};
+use crate::document::{DocStatus, derive, file_stem, is_document_path};
+use crate::files::{read_document, stamp, unique_path, write_document};
+use crate::library::{Library, Meta};
 use crate::session::Session;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -58,6 +59,41 @@ impl SyncDocument {
             created_at: self.created_at,
         }
     }
+
+    fn same_version(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.hash == other.hash
+            && self.deleted == other.deleted
+            && self.metadata() == other.metadata()
+    }
+
+    fn matches_base(&self, base: &SyncBase) -> bool {
+        self.path == base.path
+            && self.hash == base.hash
+            && base
+                .metadata
+                .as_ref()
+                .is_none_or(|meta| *meta == self.metadata())
+    }
+
+    fn metadata(&self) -> SyncMetadata {
+        SyncMetadata {
+            title: self.title.clone(),
+            synopsis: self.synopsis.clone(),
+            status: self.status,
+            tags: self.tags.clone(),
+            pinned: self.pinned,
+        }
+    }
+
+    fn baseline(&self) -> SyncBase {
+        SyncBase {
+            path: self.path.clone(),
+            hash: self.hash.clone(),
+            updated_at: self.updated_at,
+            metadata: Some(self.metadata()),
+        }
+    }
 }
 
 /// The document entry stored in the remote manifest.
@@ -95,9 +131,20 @@ pub struct SyncBase {
     pub path: String,
     pub hash: String,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SyncMetadata>,
 }
 
-/// Sync settings stored in `library.json`, so they follow the library.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncMetadata {
+    title: String,
+    synopsis: String,
+    status: DocStatus,
+    tags: Vec<String>,
+    pinned: bool,
+}
+
+/// Sync settings stored alongside the document metadata in the library folder.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
@@ -136,16 +183,29 @@ pub struct SyncOutcome {
     pub active_changed: bool,
     pub conflicts: Vec<PathBuf>,
     pub summary: String,
+    pub deferred: usize,
+}
+
+impl Library {
+    pub(crate) fn ensure_sync_identity(&mut self) {
+        if self.state.sync.library_id.is_empty() {
+            self.state.sync.library_id = new_library_id();
+        }
+    }
 }
 
 impl Session {
     pub fn sync_config(&self) -> &SyncConfig {
-        &self.app.sync
+        &self.library.state.sync
     }
 
-    pub fn set_sync_config(&mut self, config: SyncConfig) {
-        self.app.sync = config;
-        self.persist_app();
+    pub fn set_sync_config(&mut self, config: SyncConfig) -> Result<(), String> {
+        let previous = std::mem::replace(&mut self.library.state.sync, config);
+        if let Err(error) = self.library.save_state() {
+            self.library.state.sync = previous;
+            return Err(format!("无法保存同步状态：{error}"));
+        }
+        Ok(())
     }
 
     /// Makes sure every library document has a stable sync uid. Uids follow
@@ -160,61 +220,78 @@ impl Session {
     }
 
     /// Reads the local library into a form the sync planner can compare.
-    /// Reads every file, so call this off the UI thread when the library is
-    /// large; the UI only snapshots the paths and metadata.
-    pub fn sync_snapshot(&mut self) -> Vec<SyncDocument> {
+    pub fn sync_snapshot(&mut self) -> Result<Vec<SyncDocument>, String> {
         self.ensure_sync_uids();
-        let mut snapshot = Vec::new();
-        for document in self.library.documents.iter().filter(|d| !d.external) {
-            let Some(meta) = self.library.meta(&document.id) else {
-                continue;
-            };
-            let uid = if meta.uid.is_empty() {
-                uid_for(&document.id, meta.created_at)
-            } else {
-                meta.uid.clone()
-            };
-            let path = if document.trashed {
-                self.library
-                    .state
-                    .trash_origins
-                    .get(&document.id)
-                    .cloned()
-                    .unwrap_or_else(|| document.id.clone())
-            } else {
-                document.id.clone()
-            };
-            let content = if document.trashed {
-                String::new()
-            } else {
-                read_document(&document.path).unwrap_or_default()
-            };
-            snapshot.push(SyncDocument {
-                uid,
-                path,
-                hash: if document.trashed {
-                    String::new()
-                } else {
-                    content_hash(&content)
-                },
-                updated_at: document.updated_at,
-                deleted: document.trashed,
-                title: meta.title.clone(),
-                synopsis: meta.synopsis.clone(),
-                status: meta.status,
-                tags: meta.tags.clone(),
-                pinned: meta.pinned,
-                created_at: meta.created_at,
-                content,
-            });
+        self.library
+            .documents
+            .iter()
+            .filter(|doc| !doc.external)
+            .map(|doc| self.sync_document(doc))
+            .collect()
+    }
+
+    fn sync_document(&self, document: &crate::Document) -> Result<SyncDocument, String> {
+        let meta = self
+            .library
+            .meta(&document.id)
+            .ok_or_else(|| format!("找不到文稿信息：{}", document.id))?;
+        let (path, content, hash) = if document.trashed {
+            let path = self.library.state.trash_origins.get(&document.id);
+            (
+                path.unwrap_or(&document.id).clone(),
+                String::new(),
+                String::new(),
+            )
+        } else {
+            let content = read_document(&document.path)
+                .map_err(|error| format!("无法读取「{}」：{error}", document.id))?;
+            let hash = content_hash(&content);
+            (document.id.clone(), content, hash)
+        };
+        Ok(SyncDocument {
+            uid: meta.uid.clone(),
+            path,
+            content,
+            hash,
+            updated_at: document.updated_at,
+            deleted: document.trashed,
+            title: meta.title.clone(),
+            synopsis: meta.synopsis.clone(),
+            status: meta.status,
+            tags: meta.tags.clone(),
+            pinned: meta.pinned,
+            created_at: meta.created_at,
+        })
+    }
+
+    fn sync_version_changed(
+        &self,
+        uid: &str,
+        before: Option<&SyncDocument>,
+    ) -> Result<bool, String> {
+        let current = self.id_for_uid(uid).and_then(|id| self.library.find(&id));
+        match (before, current) {
+            (None, None) => Ok(false),
+            (Some(before), Some(current)) => {
+                Ok(!before.same_version(&self.sync_document(current)?))
+            }
+            _ => Ok(true),
         }
-        snapshot
     }
 
     /// Applies the planner's decisions on the UI thread. Pulls are written
     /// through the normal document writer; remote deletions go to the trash
     /// rather than disappearing.
-    pub fn apply_sync_report(&mut self, report: &SyncReport) -> Result<SyncOutcome, String> {
+    pub fn apply_sync_report(
+        &mut self,
+        report: &SyncReport,
+        snapshot: &[SyncDocument],
+    ) -> Result<SyncOutcome, String> {
+        if report.manifest.library_id != self.sync_config().library_id {
+            return Err("同步结果属于另一个资料库。".to_owned());
+        }
+        self.library.scan();
+        let before: BTreeMap<_, _> = snapshot.iter().map(|doc| (doc.uid.as_str(), doc)).collect();
         let mut outcome = SyncOutcome {
             summary: report.summary.clone(),
             ..SyncOutcome::default()
@@ -224,25 +301,42 @@ impl Session {
             if doc.deleted {
                 continue;
             }
+            if self.sync_version_changed(&doc.uid, before.get(doc.uid.as_str()).copied())? {
+                outcome.conflicts.push(self.write_conflict_copy(doc)?);
+                outcome.deferred += 1;
+                continue;
+            }
             match self.id_for_uid(&doc.uid) {
                 Some(id) if !self.library.find(&id).is_some_and(|d| d.trashed) => {
+                    let original = self.library.path_for(&id);
+                    let relative = sync_relative(doc);
+                    let id = if before
+                        .get(doc.uid.as_str())
+                        .is_some_and(|old| old.path != doc.path)
+                        && id != relative
+                    {
+                        let target = self.sync_target(&relative, Some(&original))?;
+                        self.relocate(&id, &original, &target)?
+                    } else {
+                        id
+                    };
                     let path = self.library.path_for(&id);
-                    write_document(&path, &doc.content).map_err(|e| e.to_string())?;
+                    let changed = before
+                        .get(doc.uid.as_str())
+                        .is_none_or(|old| old.hash != doc.hash);
+                    if changed {
+                        write_document(&path, &doc.content).map_err(|e| e.to_string())?;
+                    }
                     if let Some(meta) = self.library.meta_mut(&id) {
-                        meta.uid = doc.uid.clone();
-                        meta.title = doc.title.clone();
-                        meta.synopsis = doc.synopsis.clone();
-                        meta.status = doc.status;
-                        meta.tags = doc.tags.clone();
-                        meta.pinned = doc.pinned;
-                        if meta.created_at == 0 {
-                            meta.created_at = doc.created_at;
-                        }
+                        update_sync_meta(meta, doc, &path);
                     }
                     if self.active.as_deref() == Some(&id) {
                         self.saved = doc.content.clone();
-                        self.saved_stamp = crate::files::stamp(&path);
-                        outcome.active_changed = true;
+                        self.saved_stamp = stamp(&path);
+                        if changed {
+                            self.reloads += 1;
+                        }
+                        outcome.active_changed |= changed;
                     }
                 }
                 Some(_) => {
@@ -254,16 +348,25 @@ impl Session {
                     let id = self.import_sync_document(doc)?;
                     if self.active.is_none() {
                         self.open_document(&id);
+                        outcome.active_changed = true;
                     }
                 }
             }
         }
 
+        let mut base = report.base.clone();
         for uid in &report.deleted {
             let Some(id) = self.id_for_uid(uid) else {
                 continue;
             };
             if self.library.find(&id).is_some_and(|d| d.trashed) {
+                continue;
+            }
+            if self.sync_version_changed(uid, before.get(uid.as_str()).copied())? {
+                outcome.deferred += 1;
+                if let Some(old) = before.get(uid.as_str()) {
+                    base.insert(uid.clone(), old.baseline());
+                }
                 continue;
             }
             if self.active.as_deref() == Some(&id) {
@@ -274,14 +377,9 @@ impl Session {
         }
 
         for doc in &report.conflicts {
-            if let Some(path) = self.write_conflict_copy(doc)? {
-                outcome.conflicts.push(path);
-            }
+            outcome.conflicts.push(self.write_conflict_copy(doc)?);
         }
 
-        self.app.sync.gist_id = Some(report.gist_id.clone());
-        self.app.sync.last_synced_at = now();
-        self.app.sync.base = report.base.clone();
         self.library.scan();
         if self.active.is_none() {
             let first = self.documents().first().map(|d| d.id.clone());
@@ -289,8 +387,14 @@ impl Session {
                 Some(id) => self.open_document(&id),
                 None => self.activate_new("")?,
             }
+            outcome.active_changed = true;
         }
-        self.persist();
+        let mut config = self.sync_config().clone();
+        config.gist_id = Some(report.gist_id.clone());
+        config.last_synced_at = now();
+        config.base = base;
+        self.set_sync_config(config)?;
+        self.persist_app();
         Ok(outcome)
     }
 
@@ -303,55 +407,113 @@ impl Session {
             .map(|(id, _)| id.clone())
     }
 
+    pub fn preserve_sync_conflicts(
+        &mut self,
+        conflicts: &[SyncDocument],
+    ) -> Result<Vec<PathBuf>, String> {
+        let paths = conflicts
+            .iter()
+            .map(|doc| self.write_conflict_copy(doc))
+            .collect::<Result<_, _>>()?;
+        self.library.scan();
+        self.library
+            .save_state()
+            .map_err(|error| error.to_string())?;
+        Ok(paths)
+    }
+
     fn import_sync_document(&mut self, doc: &SyncDocument) -> Result<String, String> {
-        let relative = safe_relative(&doc.path).unwrap_or_else(|| format!("{}.txt", doc.uid));
-        let path = self.library.root.join(&relative);
-        let directory = path.parent().unwrap_or(&self.library.root).to_path_buf();
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| doc.title.clone());
-        let extension = path
-            .extension()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "txt".to_owned());
-        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        let target = crate::files::unique_path(&directory, &stem, &extension, None);
+        let target = self.sync_target(&sync_relative(doc), None)?;
         write_document(&target, &doc.content).map_err(|e| e.to_string())?;
         let id = self
             .library
             .id_for(&target)
             .ok_or_else(|| "无法在资料库中创建文稿".to_owned())?;
         let meta = self.library.state.entries.entry(id.clone()).or_default();
-        meta.uid = doc.uid.clone();
-        meta.title = doc.title.clone();
-        meta.synopsis = doc.synopsis.clone();
-        meta.status = doc.status;
-        meta.tags = doc.tags.clone();
-        meta.pinned = doc.pinned;
-        meta.created_at = doc.created_at;
+        update_sync_meta(meta, doc, &target);
         self.library.scan();
         Ok(id)
     }
 
-    fn write_conflict_copy(&mut self, doc: &SyncDocument) -> Result<Option<PathBuf>, String> {
-        let relative = safe_relative(&doc.path).unwrap_or_else(|| format!("{}.txt", doc.uid));
+    fn sync_target(
+        &self,
+        relative: &str,
+        original: Option<&std::path::Path>,
+    ) -> Result<PathBuf, String> {
         let path = self.library.root.join(relative);
-        let directory = path.parent().unwrap_or(&self.library.root).to_path_buf();
+        let directory = path.parent().unwrap_or(&self.library.root);
+        for parent in directory
+            .ancestors()
+            .take_while(|parent| *parent != self.library.root)
+        {
+            if std::fs::symlink_metadata(parent).is_ok_and(|meta| meta.is_symlink()) {
+                return Err(format!("同步路径包含符号链接：{}", parent.display()));
+            }
+        }
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| doc.title.clone());
+            .unwrap_or_default();
         let extension = path
             .extension()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "txt".to_owned());
-        let stamp = local_timestamp();
-        let name = format!("{stem}（云端冲突 {stamp}）");
-        let target = crate::files::unique_path(&directory, &name, &extension, None);
+        let same_file = original.filter(|original| {
+            path.canonicalize()
+                .ok()
+                .is_some_and(|target| original.canonicalize().ok() == Some(target))
+        });
+        Ok(unique_path(directory, &stem, &extension, same_file))
+    }
+
+    fn write_conflict_copy(&mut self, doc: &SyncDocument) -> Result<PathBuf, String> {
+        let relative = PathBuf::from(sync_relative(doc));
+        let stem = file_stem(&relative);
+        let extension = relative
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("txt");
+        let stamp = conflict_timestamp(doc.updated_at);
+        let relative = relative.with_file_name(format!("{stem}（云端冲突 {stamp}）.{extension}"));
+        let expected = self.library.root.join(&relative);
+        if let Some(id) = self.library.id_for(&expected)
+            && let Some(meta) = self.library.meta(&id)
+            && meta.synopsis == doc.synopsis
+            && meta.status == doc.status
+            && meta.tags == doc.tags
+            && read_document(&expected).is_ok_and(|content| content == doc.content)
+        {
+            return Ok(expected);
+        }
+        let target = self.sync_target(&relative.to_string_lossy(), None)?;
         write_document(&target, &doc.content).map_err(|e| e.to_string())?;
-        self.library.scan();
-        Ok(Some(target))
+        if let Some(id) = self.library.id_for(&target) {
+            let meta = self.library.state.entries.entry(id).or_default();
+            meta.synopsis = doc.synopsis.clone();
+            meta.status = doc.status;
+            meta.tags = doc.tags.clone();
+        }
+        Ok(target)
+    }
+}
+
+fn update_sync_meta(meta: &mut Meta, doc: &SyncDocument, path: &std::path::Path) {
+    let derived = derive(&doc.content, &file_stem(path), meta.auto_named);
+    meta.uid = doc.uid.clone();
+    meta.title = if doc.title.is_empty() {
+        derived.title
+    } else {
+        doc.title.clone()
+    };
+    meta.excerpt = derived.excerpt;
+    meta.words = derived.words;
+    meta.stamp = stamp(path).unwrap_or_default();
+    meta.synopsis = doc.synopsis.clone();
+    meta.status = doc.status;
+    meta.tags = doc.tags.clone();
+    meta.pinned = doc.pinned;
+    if meta.created_at == 0 {
+        meta.created_at = doc.created_at;
     }
 }
 
@@ -392,16 +554,16 @@ pub fn plan_sync(
 
         if let Some(la) = l_active {
             if let Some(ra) = r_active {
-                let result = if la.hash == ra.hash {
-                    la
-                } else if b.is_some_and(|b| b.hash == la.hash) {
-                    downloads += 1;
-                    plan.downloads.push(ra.clone());
+                let result = if la.same_version(ra) {
                     ra
-                } else if b.is_some_and(|b| b.hash == ra.hash) {
+                } else if b.is_some_and(|b| ra.matches_base(b)) {
                     uploads += 1;
                     plan.uploads.push(la.clone());
                     la
+                } else if b.is_some_and(|b| la.matches_base(b)) {
+                    downloads += 1;
+                    plan.downloads.push(ra.clone());
+                    ra
                 } else {
                     // Both sides changed. Keep the local text as the
                     // canonical copy and hand the remote text back as a
@@ -412,13 +574,13 @@ pub fn plan_sync(
                     plan.uploads.push(la.clone());
                     la
                 };
-                push_manifest(&mut plan, result, now);
+                plan.manifest.documents.push(result.manifest());
                 continue;
             }
 
-            let remote_deleted = r.is_some_and(|d| d.deleted);
-            let should_delete = b.is_some_and(|b| b.hash == la.hash);
-            if remote_deleted && should_delete || r.is_none() && b.is_some() && should_delete {
+            if b.is_some_and(|base| la.matches_base(base))
+                || b.is_none() && r.is_some_and(|doc| doc.deleted)
+            {
                 deletes += 1;
                 plan.local_deletes.push(uid.to_owned());
                 push_tombstone(&mut plan, uid, b, r, l, now);
@@ -427,20 +589,24 @@ pub fn plan_sync(
                 // document.
                 uploads += 1;
                 plan.uploads.push(la.clone());
-                push_manifest(&mut plan, la, now);
+                plan.manifest.documents.push(la.manifest());
             }
             continue;
         }
 
         // Local is deleted (trashed) or absent.
         if let Some(ra) = r_active {
-            if b.is_some() {
+            if l.is_some() || b.is_some() {
                 // Local deletion wins; keep the tombstone in the manifest.
+                if b.is_none_or(|base| !ra.matches_base(base)) {
+                    conflicts += 1;
+                    plan.conflicts.push(ra.clone());
+                }
                 push_tombstone(&mut plan, uid, b, r, l, now);
             } else {
                 downloads += 1;
                 plan.downloads.push(ra.clone());
-                push_manifest(&mut plan, ra, now);
+                plan.manifest.documents.push(ra.manifest());
             }
             continue;
         }
@@ -461,24 +627,20 @@ pub fn plan_sync(
     plan
 }
 
-fn push_manifest(plan: &mut SyncPlan, doc: &SyncDocument, _now: u64) {
-    plan.manifest.documents.push(doc.manifest());
-}
-
 fn push_tombstone(
     plan: &mut SyncPlan,
     uid: &str,
     base: Option<&SyncBase>,
     remote: Option<&SyncDocument>,
     local: Option<&SyncDocument>,
-    _now: u64,
+    now: u64,
 ) {
     let path = local
         .map(|d| d.path.clone())
         .or_else(|| remote.map(|d| d.path.clone()))
         .or_else(|| base.map(|b| b.path.clone()))
         .unwrap_or_else(|| format!("{uid}.txt"));
-    let updated_at = remote.map(|d| d.updated_at).unwrap_or_else(|| now());
+    let updated_at = remote.filter(|d| d.deleted).map_or(now, |d| d.updated_at);
     plan.manifest.documents.push(ManifestDoc {
         uid: uid.to_owned(),
         path,
@@ -530,6 +692,13 @@ pub fn base_for(manifest: &Manifest) -> BTreeMap<String, SyncBase> {
                     path: d.path.clone(),
                     hash: d.hash.clone(),
                     updated_at: d.updated_at,
+                    metadata: Some(SyncMetadata {
+                        title: d.title.clone(),
+                        synopsis: d.synopsis.clone(),
+                        status: d.status,
+                        tags: d.tags.clone(),
+                        pinned: d.pinned,
+                    }),
                 },
             )
         })
@@ -572,7 +741,7 @@ pub fn new_library_id() -> String {
         .unwrap_or_default();
     let pid = u128::from(std::process::id());
     let value = nanos ^ (pid << 64);
-    format!("{:024x}", value as u64)
+    format!("{value:032x}")
 }
 
 pub fn default_device() -> String {
@@ -583,25 +752,19 @@ pub fn default_device() -> String {
         .unwrap_or_else(|| std::env::consts::OS.to_owned())
 }
 
-fn safe_relative(path: &str) -> Option<String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.contains('\0') {
-        return None;
-    }
-    let parts: Vec<&str> = trimmed.split('/').filter(|p| !p.is_empty()).collect();
-    if parts
-        .iter()
-        .any(|p| *p == ".." || *p == "." || p.starts_with('.'))
+fn sync_relative(doc: &SyncDocument) -> String {
+    let path = &doc.path;
+    if is_document_path(std::path::Path::new(path))
+        && path.split('/').all(|part| {
+            !part.is_empty() && !part.starts_with('.') && !part.contains(['\\', ':', '\0'])
+        })
     {
-        return None;
+        return path.clone();
     }
-    Some(parts.join("/"))
+    format!("doc_{:.16}.txt", content_hash(&doc.uid))
 }
 
-fn local_timestamp() -> String {
-    // The UI already has a date formatter; this is only a short, sortable
-    // suffix for a conflict file name.
-    let secs = now();
+fn conflict_timestamp(secs: u64) -> String {
     let days = secs / 86_400;
     let time = secs % 86_400;
     let (year, month, day) = civil_from_days(days as i64);
@@ -630,13 +793,4 @@ pub fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
-}
-
-/// Ensures a new library has an id before the first sync.
-pub fn ensure_library_id(session: &mut Session) {
-    if session.sync_config().library_id.is_empty() {
-        let mut config = session.sync_config().clone();
-        config.library_id = new_library_id();
-        session.set_sync_config(config);
-    }
 }

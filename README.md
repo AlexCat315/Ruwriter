@@ -39,7 +39,7 @@ gh auth login
 
 Ruwriter 在每次同步时向 `gh` 读取一次凭据，用完即丢，不落盘、不写进资料库。没安装 `gh` 或未登录时，对话框会直接给出这条命令。凭据需要 `gist` 权限，`gh auth login` 默认包含。
 
-每个资料库自动对应一个**私有 Gist**：第一次同步创建，之后按 `library_id` 写在 Gist 描述里自动找回。换一台电脑登录同一个 GitHub 账号，打开同一份资料库点「立即同步」即可，不需要记 Gist ID。Gist 内一篇文稿一个扁平纯文本文件 `doc_<uid>.txt`，文件夹、标题、摘要、状态、标签、置顶等放在 `ruwriter-manifest.json`；文件名不能带 `/`，所以层级只存在清单里。
+每个资料库自动对应一个**私有 Gist**。同步配置跟随资料库，保存在隐藏的 `.ruwriter/state.json` 中。换电脑时复制整个资料库文件夹（包括 `.ruwriter`），登录同一个 GitHub 账号，再打开该资料库同步。Gist 内一篇文稿一个扁平纯文本文件 `doc_<uid>.txt`，文件夹、标题、摘要、状态、标签、置顶等放在 `ruwriter-manifest.json`。
 
 合并按「本地 / 上次同步基线 / 云端」三方比较：只改一边就同步那一边；两边都改时本地版本上传，同时把云端版本另存为「原名（云端冲突 日期 时间）.txt」；云端删除且本地未改时移入废纸篓；本地删除会写 tombstone，避免第三台设备把文稿复活。空文稿不写正文文件（Gist API 不接受空内容），清单里的空哈希负责把它还原为空。
 
@@ -61,6 +61,12 @@ Ruwriter 在每次同步时向 `gh` 读取一次凭据，用完即丢，不落�
 ## 构建
 
 `../Cove` 必须存在并完成过一次 `cargo cove setup`。
+
+使用发布工作流固定的 Cove 版本时，从 Ruwriter 根目录应用编辑器补丁：
+
+```sh
+git -C ../Cove apply "$(pwd)/patches/cove-text-field-layout.patch"
+```
 
 ```sh
 cargo build --workspace

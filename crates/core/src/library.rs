@@ -262,6 +262,8 @@ pub struct LibraryState {
     pub expanded: BTreeSet<String>,
     /// Trashed document id → the id it had before.
     pub trash_origins: BTreeMap<String, String>,
+    /// Gist identity and merge baseline for this folder.
+    pub(crate) sync: crate::sync::SyncConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

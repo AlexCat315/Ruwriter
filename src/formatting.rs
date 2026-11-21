@@ -160,41 +160,52 @@ fn wrap(chars: &[char], low: usize, high: usize, marker: &str) -> Edit {
     }
 }
 
-/// Enter inside a list or quote: the next line continues the prefix (ordered
-/// items count up), and an empty item ends the list instead. `None` keeps the
-/// field's default newline.
-pub fn continue_line(text: &str, caret: usize, selection: Option<(usize, usize)>) -> Option<Edit> {
+/// Edit only the affected line or insertion point, in TextBuffer coordinates.
+pub struct LineEdit {
+    pub range: std::ops::Range<usize>,
+    pub replacement: String,
+    pub caret: usize,
+}
+
+/// Return inside a Markdown list or quote continues its prefix. An empty item
+/// ends the list, and a selection uses the text field's ordinary newline.
+pub fn continue_line(
+    buffer: &cove_ui::compose::primitives::text::TextBuffer,
+    caret: usize,
+    selection: Option<(usize, usize)>,
+) -> Option<LineEdit> {
     if selection.is_some_and(|(low, high)| low != high) {
         return None;
     }
-    let chars: Vec<char> = text.chars().collect();
-    let caret = caret.min(chars.len());
-    let start = line_start(&chars, caret);
-    let end = line_end(&chars, caret);
-    let line = &chars[start..end];
-    let (width, next): (usize, Vec<char>) = if let Some(n) = prefix_len(line, LineStyle::Numbered) {
-        let number: usize = line[..n - 2].iter().collect::<String>().parse().ok()?;
-        (n, format!("{}. ", number + 1).chars().collect())
+    let caret = caret.min(buffer.character_count());
+    let range = buffer.line_range(buffer.line_index_for_character_index(caret));
+    let line: Vec<char> = buffer.substring(range.clone()).chars().collect();
+    let (width, prefix) = if let Some(width) = prefix_len(&line, LineStyle::Numbered) {
+        let number: usize = line[..width - 2].iter().collect::<String>().parse().ok()?;
+        (width, format!("{}. ", number.checked_add(1)?))
     } else {
-        let n =
-            prefix_len(line, LineStyle::Bullet).or_else(|| prefix_len(line, LineStyle::Quote))?;
-        (n, line[..n].to_vec())
+        let width =
+            prefix_len(&line, LineStyle::Bullet).or_else(|| prefix_len(&line, LineStyle::Quote))?;
+        (width, line[..width].iter().collect())
     };
-    let mut out = chars.clone();
-    if line[width..].iter().all(|c| c.is_whitespace()) {
-        out.drain(start..end);
-        return Some(Edit {
-            text: string(&out),
-            caret: start,
-            selection: None,
+    if line[width..]
+        .iter()
+        .all(|character| character.is_whitespace())
+    {
+        return Some(LineEdit {
+            caret: range.start,
+            range,
+            replacement: String::new(),
         });
     }
-    let insert: Vec<char> = std::iter::once('\n').chain(next).collect();
-    out.splice(caret..caret, insert.iter().copied());
-    Some(Edit {
-        text: string(&out),
-        caret: caret + insert.len(),
-        selection: None,
+    if caret < range.start + width {
+        return None;
+    }
+    Some(LineEdit {
+        range: caret..caret,
+        // The prefix is ASCII, so its byte and grapheme counts match.
+        caret: caret + 1 + prefix.len(),
+        replacement: format!("\n{prefix}"),
     })
 }
 
@@ -584,32 +595,40 @@ mod tests {
         assert_eq!(result.caret, 4);
     }
 
+    fn enter(
+        text: &str,
+        caret: usize,
+        selection: Option<(usize, usize)>,
+    ) -> Option<(String, usize)> {
+        let buffer = cove_ui::compose::primitives::text::TextBuffer::new(text);
+        let edit = continue_line(&buffer, caret, selection)?;
+        let result = buffer.replace(edit.range, &edit.replacement);
+        Some((result.string_value(), edit.caret))
+    }
+
     #[test]
     fn enter_continues_lists_and_quotes() {
-        let bullet = continue_line("- 甲", 3, None).expect("bullet");
-        assert_eq!(bullet.text, "- 甲\n- ");
-        assert_eq!(bullet.caret, 6);
-        let numbered = continue_line("1. 甲\n2. 乙", 9, None).expect("numbered");
-        assert_eq!(numbered.text, "1. 甲\n2. 乙\n3. ");
-        let quote = continue_line("> 引", 3, None).expect("quote");
-        assert_eq!(quote.text, "> 引\n> ");
-        assert!(continue_line("普通一行", 2, None).is_none());
-        assert!(continue_line("# 标题", 3, None).is_none());
-        assert!(continue_line("- 甲", 2, Some((0, 2))).is_none());
+        assert_eq!(enter("- 甲", 3, None), Some(("- 甲\n- ".to_owned(), 6)));
+        assert_eq!(
+            enter("1. 甲\n2. 乙", 9, None),
+            Some(("1. 甲\n2. 乙\n3. ".to_owned(), 13))
+        );
+        assert_eq!(enter("> 引", 3, None), Some(("> 引\n> ".to_owned(), 6)));
+        assert!(enter("普通一行", 2, None).is_none());
+        assert!(enter("# 标题", 3, None).is_none());
+        assert!(enter("- 甲", 2, Some((0, 2))).is_none());
+        assert!(enter("- 甲", 1, None).is_none());
+        assert!(enter(&format!("{}. 一", usize::MAX), usize::MAX, None).is_none());
     }
 
     #[test]
     fn enter_on_empty_item_ends_the_list() {
-        let result = continue_line("- 甲\n- ", 6, None).expect("empty item");
-        assert_eq!(result.text, "- 甲\n");
-        assert_eq!(result.caret, 4);
+        assert_eq!(enter("- 甲\n- ", 6, None), Some(("- 甲\n".to_owned(), 4)));
     }
 
     #[test]
-    fn enter_splits_mid_item_and_keeps_the_prefix() {
-        let result = continue_line("- 甲乙", 3, None).expect("split");
-        assert_eq!(result.text, "- 甲\n- 乙");
-        assert_eq!(result.caret, 6);
+    fn enter_splits_at_a_grapheme_boundary() {
+        assert_eq!(enter("- 👩‍💻乙", 3, None), Some(("- 👩‍💻\n- 乙".to_owned(), 6)));
     }
 
     #[test]

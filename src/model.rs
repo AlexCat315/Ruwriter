@@ -26,7 +26,7 @@ use cove_ui::core::scene::{
 };
 use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
-use ruwriter_core::sync::SyncReport;
+use ruwriter_core::sync::{SyncDocument, SyncReport};
 use ruwriter_core::{
     AppearancePreference, Collection, DocStatus, Document, Heading, Rescan, Session, Snapshot,
     SortOrder, WritingStats, count, heading_at, headings, parse_tags,
@@ -53,10 +53,20 @@ pub enum RenameTarget {
 type DiskHandler = Rc<dyn Fn(Vec<PathBuf>)>;
 type SyncHandler = Rc<dyn Fn(SyncEvent)>;
 
-#[derive(Clone, Debug)]
 pub enum SyncEvent {
-    Progress(String),
-    Finished(Result<SyncReport, String>),
+    Login(String),
+    PreserveConflicts {
+        library: PathBuf,
+        library_id: String,
+        documents: Vec<SyncDocument>,
+        reply: std::sync::mpsc::SyncSender<Result<Vec<PathBuf>, String>>,
+    },
+    Finished {
+        library: PathBuf,
+        snapshot: Vec<SyncDocument>,
+        conflicts: Vec<PathBuf>,
+        result: Result<SyncReport, String>,
+    },
 }
 
 thread_local! {
@@ -132,12 +142,13 @@ pub struct Model {
     /// caret and undo history).
     pub settings_revision: Signal<u64>,
     /// Text waiting for the debounced autosave of a long document.
-    pub pending_save: Signal<Option<String>>,
+    pub pending_save: Signal<Option<TextBuffer>>,
     /// Bumped by every edit that arms the autosave timer; a later edit makes
     /// the previous timer stale.
     pub save_revision: Signal<u64>,
     /// Bumped by every caret movement; a timer persists once typing settles.
     pub caret_revision: Signal<u64>,
+    pub outline: Signal<Rc<Vec<Heading>>>,
     /// Whether the version-history dialog is open, and the snapshot list it
     /// shows. Loaded when opened, not on every keystroke.
     pub history_open: Signal<bool>,
@@ -145,6 +156,8 @@ pub struct Model {
     /// Cloud backup through a private GitHub Gist.
     pub sync_open: Signal<bool>,
     pub sync_login: Signal<String>,
+    pub sync_checking: Signal<bool>,
+    pub sync_library: Signal<Option<PathBuf>>,
     pub sync_status: Signal<String>,
     pub sync_busy: Signal<bool>,
     pub sync_failed: Signal<bool>,
@@ -199,7 +212,6 @@ impl Model {
     /// Runs a structural operation, reloading the editor when it opened
     /// another document or the file's text replaced it.
     fn structural(&self, action: impl FnOnce(&mut Session, &str) -> Result<(), String>) {
-        self.pending_save.set(None);
         let before = self.editor_identity();
         let current = self.current_text();
         match self.with_session(|session| action(session, &current)) {
@@ -207,6 +219,8 @@ impl Model {
                 self.report_conflict();
                 if self.editor_identity() != before {
                     self.load_active();
+                } else {
+                    self.finish_text_summary(&current);
                 }
                 self.notice.set_if_changed(String::new());
                 self.bump();
@@ -238,9 +252,9 @@ impl Model {
     /// Puts the open document's saved text into the editor.
     fn load_active(&self) {
         let text = self.read(Session::text).unwrap_or_default();
+        self.pending_save.set(None);
         self.buffer.set(TextBuffer::new(&text));
-        self.stats.set(count(&text));
-        self.preview.set(text);
+        self.update_text_summary(&text);
         self.caret.set(TextFieldCaretState::INITIAL);
         self.navigation.set(TextFieldNavigationRequest::default());
         self.edit.set(None);
@@ -331,22 +345,29 @@ impl Model {
 
     /// Called by the editor after every accepted edit.
     pub fn on_change(&self, buffer: &TextBuffer) {
-        let text = buffer.string_value();
-        let counted = count(&text);
-        let characters = counted.characters;
-        self.stats.set_if_changed(counted);
-        self.preview.set_if_changed(text.clone());
-        if characters > LARGE_DOCUMENT {
-            // Writing a long manuscript: writing the whole file on every
-            // keystroke costs more than the keystroke itself. Save once the
-            // author pauses; blur and explicit save still write immediately.
-            self.pending_save.set(Some(text));
+        if buffer.character_count() > LARGE_DOCUMENT {
+            self.pending_save.set(Some(buffer.clone()));
             self.save_revision.update(|value| *value += 1);
             self.schedule_save();
             return;
         }
         self.pending_save.set(None);
+        let text = buffer.string_value();
+        self.update_text_summary(&text);
         self.write_text(text);
+    }
+
+    fn update_text_summary(&self, text: &str) {
+        self.stats.set_if_changed(count(text));
+        self.preview.set_if_changed(text.to_owned());
+        self.outline.set_if_changed(Rc::new(headings(text)));
+    }
+
+    fn finish_text_summary(&self, text: &str) {
+        if self.pending_save.get_untracked().is_some() {
+            self.pending_save.set(None);
+            self.update_text_summary(text);
+        }
     }
 
     /// Writes the text and refreshes what depends on it.
@@ -371,10 +392,12 @@ impl Model {
 
     /// Writes the text the debounce has been holding, if any.
     fn flush_to_disk(&self) {
-        let Some(text) = self.pending_save.get_untracked() else {
+        let Some(buffer) = self.pending_save.get_untracked() else {
             return;
         };
         self.pending_save.set(None);
+        let text = buffer.string_value();
+        self.update_text_summary(&text);
         self.write_text(text);
     }
 
@@ -448,17 +471,34 @@ impl Model {
         let selection = state
             .selected_range
             .map(|(low, high)| (low.min(len), high.min(len)));
+        let text = buffer.string_value();
+        let scalar_index = |index| {
+            text[..buffer.utf8_offset_for_character_index(index)]
+                .chars()
+                .count()
+        };
+        let selection = selection.map(|(low, high)| (scalar_index(low), scalar_index(high)));
         let edit = formatting::apply(
-            &buffer.string_value(),
-            state.caret_index.min(len),
+            &text,
+            scalar_index(state.caret_index.min(len)),
             selection,
             command,
         );
+        let edited = TextBuffer::new(&edit.text);
+        let grapheme_index = |index| {
+            let byte = edit
+                .text
+                .char_indices()
+                .nth(index)
+                .map_or(edit.text.len(), |(byte, _)| byte);
+            edited.character_index_for_utf8_offset(byte)
+        };
         self.request_edit(
             0..len,
-            edit.text,
-            edit.caret,
-            edit.selection.map(|(low, _)| low),
+            edit.text.clone(),
+            grapheme_index(edit.caret),
+            edit.selection
+                .map(|(low, high)| grapheme_index(if edit.caret == low { high } else { low })),
         );
     }
 
@@ -480,28 +520,48 @@ impl Model {
         }));
     }
 
-    /// Plain Return continues lists and quotes; other keys keep the field's
-    /// own handling.
-    pub fn on_return_key(&self, event: &KeyEvent) -> bool {
-        if !matches!(event.scancode, Scancode::RETURN | Scancode::KEYPAD_ENTER)
-            || event.modifiers.has_shift()
-            || event.modifiers.has_ctrl()
-            || event.modifiers.has_gui()
-            || event.modifiers.has_alt()
+    pub fn on_editor_key(&self, event: &KeyEvent) -> bool {
+        let key = event.scancode;
+        let modifiers = event.modifiers;
+        if matches!(
+            key,
+            Scancode::RETURN
+                | Scancode::KEYPAD_ENTER
+                | Scancode::ESCAPE
+                | Scancode::BACKSPACE
+                | Scancode::DELETE
+                | Scancode::TAB
+                | Scancode::ARROW_LEFT
+                | Scancode::ARROW_RIGHT
+                | Scancode::ARROW_UP
+                | Scancode::ARROW_DOWN
+        ) && !modifiers.has_gui()
+            && !modifiers.has_ctrl()
+            && crate::shortcuts::has_composition()
+        {
+            return true;
+        }
+        // Cove accepts Shift+Primary+X as Cut unless the editor handles it first.
+        if key == Scancode::X && modifiers.has_shift() && crate::shortcuts::has_primary(modifiers) {
+            if !event.is_repeat {
+                self.format(Command::Strikethrough);
+            }
+            return true;
+        }
+        if !matches!(key, Scancode::RETURN | Scancode::KEYPAD_ENTER)
+            || !modifiers.is_empty()
+            || self.writing_mode() != ruwriter_core::WritingMode::Markdown
         {
             return false;
         }
         let buffer = self.buffer.get_untracked();
         let state = self.caret.get_untracked();
-        let len = buffer.character_count();
-        let Some(edit) = formatting::continue_line(
-            &buffer.string_value(),
-            state.caret_index.min(len),
-            state.selected_range,
-        ) else {
+        let Some(edit) =
+            formatting::continue_line(&buffer, state.caret_index, state.selected_range)
+        else {
             return false;
         };
-        self.request_edit(0..len, edit.text, edit.caret, None);
+        self.request_edit(edit.range, edit.replacement, edit.caret, None);
         true
     }
 
@@ -679,9 +739,8 @@ impl Model {
 
     /// The heading tree plus the index of the section holding the caret.
     /// Reads both signals so the outline pane refreshes as you type and move.
-    pub fn outline_at_caret(&self) -> (Vec<Heading>, Option<usize>) {
-        let text = self.buffer.get().string_value();
-        let heads = headings(&text);
+    pub fn outline_at_caret(&self) -> (Rc<Vec<Heading>>, Option<usize>) {
+        let heads = self.outline.get();
         let caret = self.caret.get().caret_index;
         let current = heading_at(&heads, caret);
         (heads, current)
@@ -718,6 +777,20 @@ impl Model {
         {
             return;
         }
+        let active_changed = self
+            .read(|session| {
+                session
+                    .active_document()
+                    .is_some_and(|doc| paths.contains(&doc.path))
+            })
+            .unwrap_or(false);
+        if active_changed
+            && self.pending_save.get_untracked().is_some()
+            && let Err(error) = self.flush_sync_save()
+        {
+            self.notice.set(error);
+            return;
+        }
         let Ok(outcome) = self.with_session(|session| Ok(session.rescan())) else {
             return;
         };
@@ -748,136 +821,215 @@ impl Model {
     // MARK: - Cloud sync
 
     pub fn open_sync(&self) {
-        let last = self
-            .read(|session| session.sync_config().last_synced_at)
-            .unwrap_or(0);
-        self.sync_login.set(crate::gist::gh_status());
-        self.sync_failed.set(false);
-        self.sync_status.set(if last > 0 {
-            format!("上次同步：{}", crate::dates::relative(last))
-        } else {
-            "尚未同步。首次同步会新建一个私有 Gist。".to_owned()
-        });
+        let Some((library, last)) = self.read(|session| {
+            (
+                session.library_root().to_path_buf(),
+                session.sync_config().last_synced_at,
+            )
+        }) else {
+            return;
+        };
+        if self.sync_library.get_untracked().as_ref() != Some(&library) {
+            self.sync_failed.set(false);
+            self.sync_status.set(if last > 0 {
+                format!("上次同步：{}", crate::dates::relative(last))
+            } else {
+                "尚未同步。首次同步会查找或创建私有 Gist。".to_owned()
+            });
+            self.sync_library.set(Some(library));
+        }
         self.sync_open.set(true);
-        // The dialog lives outside the panes that normally re-render on
-        // revision changes, so ask the root for a frame explicitly.
-        self.bump();
+        self.revision.update(|value| *value += 1);
+        self.check_sync_login();
     }
 
     pub fn close_sync(&self) {
-        self.sync_open.set(false);
+        if self.sync_open.get_untracked() {
+            self.sync_open.set(false);
+            self.revision.update(|value| *value += 1);
+        }
     }
 
     pub fn check_sync_login(&self) {
-        self.sync_login.set(crate::gist::gh_status());
+        if self.sync_checking.get_untracked() {
+            return;
+        }
+        self.sync_checking.set(true);
+        self.sync_login.set("正在检查 GitHub CLI 登录…".to_owned());
+        let poster = cove_ui::core::ThreadPoster::current();
+        std::thread::spawn(move || {
+            let status = crate::gist::gh_status();
+            poster.post(move || deliver_sync_event(SyncEvent::Login(status)));
+        });
+    }
+
+    fn flush_sync_save(&self) -> Result<(), String> {
+        let text = self.current_text();
+        self.with_session(|session| session.autosave(&text))?;
+        self.finish_text_summary(&text);
+        if self.report_conflict() {
+            self.load_active();
+            self.bump();
+        }
+        Ok(())
     }
 
     pub fn sync_now(&self) {
         if self.sync_busy.get_untracked() {
             return;
         }
-        let token = match crate::gist::gh_token() {
-            Ok(token) => token,
-            Err(error) => {
-                self.sync_login.set(crate::gist::gh_status());
-                self.sync_status.set(error);
-                self.sync_failed.set(true);
-                return;
-            }
-        };
-        self.pending_save.set(None);
-        let text = self.current_text();
-        if let Err(error) = self.with_session(|session| session.save(&text)) {
-            self.sync_status.set(format!("同步前保存失败：{error}"));
-            self.sync_failed.set(true);
-            return;
-        }
-        let token_for_request = token.clone();
-        let data = self.with_session(|session| {
-            ruwriter_core::sync::ensure_library_id(session);
-            let local = session.sync_snapshot();
-            let config = session.sync_config().clone();
-            let gist = config.gist_id.clone().unwrap_or_default();
-            let base = if gist.is_empty() {
-                Default::default()
-            } else {
-                config.base.clone()
-            };
-            Ok(crate::gist::SyncRequest {
-                token: token_for_request.clone(),
-                gist_id: (!gist.is_empty()).then_some(gist),
-                library_id: config.library_id,
-                device: ruwriter_core::sync::default_device(),
-                local,
-                base,
+        let prepared = self.flush_sync_save().and_then(|()| {
+            self.with_session(|session| {
+                let local = session.sync_snapshot()?;
+                session
+                    .library
+                    .save_state()
+                    .map_err(|error| error.to_string())?;
+                let config = session.sync_config();
+                let request = crate::gist::SyncRequest {
+                    gist_id: config.gist_id.clone(),
+                    library_id: config.library_id.clone(),
+                    device: ruwriter_core::sync::default_device(),
+                    local,
+                    base: config.base.clone(),
+                };
+                Ok((session.library_root().to_path_buf(), request))
             })
         });
-        let request = match data {
-            Ok(request) => request,
+        let (library, request) = match prepared {
+            Ok(data) => data,
             Err(error) => {
                 self.sync_status.set(format!("无法准备同步：{error}"));
                 self.sync_failed.set(true);
                 return;
             }
         };
-        if request.token.is_empty() {
-            self.sync_status
-                .set("GitHub CLI 没有返回登录凭据。".to_owned());
-            self.sync_failed.set(true);
-            return;
-        }
+        self.sync_library.set(Some(library.clone()));
         self.sync_busy.set(true);
         self.sync_failed.set(false);
-        self.sync_status.set("正在连接 GitHub…".to_owned());
+        self.sync_status
+            .set("正在连接 GitHub 并比对文稿…".to_owned());
         let poster = cove_ui::core::ThreadPoster::current();
         std::thread::spawn(move || {
-            let progress = poster.clone();
-            progress
-                .post(move || deliver_sync_event(SyncEvent::Progress("正在比对文稿…".to_owned())));
-            let result = crate::gist::sync_with_gist(&request);
-            poster.post(move || deliver_sync_event(SyncEvent::Finished(result)));
+            let mut conflicts = Vec::new();
+            let result = (|| {
+                let token = crate::gist::gh_token()?;
+                let mut pending = crate::gist::prepare_sync(&request, &token)?;
+                if !pending.report.conflicts.is_empty() {
+                    let (reply, saved) = std::sync::mpsc::sync_channel(1);
+                    let library = library.clone();
+                    let library_id = request.library_id.clone();
+                    let documents = std::mem::take(&mut pending.report.conflicts);
+                    poster.post(move || {
+                        deliver_sync_event(SyncEvent::PreserveConflicts {
+                            library,
+                            library_id,
+                            documents,
+                            reply,
+                        })
+                    });
+                    conflicts = saved
+                        .recv_timeout(std::time::Duration::from_secs(60))
+                        .map_err(|_| "等待保存冲突副本超时，请重试。".to_owned())?
+                        .map_err(|error| format!("无法先保存冲突副本：{error}"))?;
+                }
+                pending.finish(&token)
+            })();
+            poster.post(move || {
+                deliver_sync_event(SyncEvent::Finished {
+                    library,
+                    snapshot: request.local,
+                    conflicts,
+                    result,
+                })
+            });
         });
+    }
+
+    fn is_sync_library(&self, path: &Path) -> bool {
+        self.read(|session| session.library_root() == path)
+            .unwrap_or(false)
     }
 
     fn on_sync_event(&self, event: SyncEvent) {
         match event {
-            SyncEvent::Progress(message) => {
-                self.sync_busy.set(true);
-                self.sync_status.set(message);
+            SyncEvent::Login(status) => {
+                self.sync_checking.set(false);
+                self.sync_login.set(status);
             }
-            SyncEvent::Finished(Ok(report)) => {
+            SyncEvent::PreserveConflicts {
+                library,
+                library_id,
+                documents,
+                reply,
+            } => {
+                let result = self.with_session(|session| {
+                    if session.library_root() != library
+                        || session.sync_config().library_id != library_id
+                    {
+                        return Err("资料库已切换，请回到原资料库重试。".to_owned());
+                    }
+                    session.preserve_sync_conflicts(&documents)
+                });
+                self.listing.update(|value| *value += 1);
+                let _ = reply.send(result);
+            }
+            SyncEvent::Finished {
+                library,
+                snapshot,
+                mut conflicts,
+                result,
+            } => {
                 self.sync_busy.set(false);
-                let applied = self.with_session(|session| session.apply_sync_report(&report));
+                if !self.is_sync_library(&library) {
+                    self.sync_library.set(None);
+                    if self.sync_open.get_untracked() {
+                        self.open_sync();
+                    }
+                    return;
+                }
+                let applied = result.and_then(|report| {
+                    self.flush_sync_save()
+                        .map_err(|error| format!("同步后保存失败：{error}"))?;
+                    let before = self.editor_identity();
+                    let applied =
+                        self.with_session(|session| session.apply_sync_report(&report, &snapshot));
+                    if self.editor_identity() != before
+                        || applied.as_ref().is_ok_and(|outcome| outcome.active_changed)
+                    {
+                        self.load_active();
+                        self.restore_caret();
+                    }
+                    self.bump();
+                    applied.map_err(|error| format!("同步结果写入失败：{error}"))
+                });
                 match applied {
                     Ok(outcome) => {
                         self.sync_failed.set(false);
-                        let mut status = report.summary.clone();
-                        if !outcome.conflicts.is_empty() {
-                            let names: Vec<String> = outcome
-                                .conflicts
+                        let mut status = outcome.summary;
+                        conflicts.extend(outcome.conflicts);
+                        if !conflicts.is_empty() {
+                            let names = conflicts
                                 .iter()
                                 .filter_map(|path| path.file_name())
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .collect();
-                            status.push_str(&format!("；已保留冲突副本：{}", names.join("、")));
+                                .map(|name| name.to_string_lossy())
+                                .collect::<Vec<_>>()
+                                .join("、");
+                            status.push_str(&format!("；已保留冲突副本：{names}"));
+                        }
+                        if outcome.deferred > 0 {
+                            status.push_str(&format!(
+                                "；同步期间有 {} 篇在本地修改，请再次同步。",
+                                outcome.deferred
+                            ));
                         }
                         self.sync_status.set(status);
-                        if outcome.active_changed {
-                            self.load_active();
-                        }
-                        self.revision.update(|value| *value += 1);
-                        self.listing.update(|value| *value += 1);
                     }
                     Err(error) => {
                         self.sync_failed.set(true);
-                        self.sync_status.set(format!("同步结果写入失败：{error}"));
+                        self.sync_status.set(error);
                     }
                 }
-            }
-            SyncEvent::Finished(Err(error)) => {
-                self.sync_busy.set(false);
-                self.sync_failed.set(true);
-                self.sync_status.set(error);
             }
         }
     }
@@ -893,12 +1045,21 @@ impl Model {
     }
 
     pub fn save(&self) {
-        self.pending_save.set(None);
         let text = self.current_text();
         match self.with_session(|session| session.save(&text)) {
             Ok(()) => {
-                self.notice.set_if_changed(String::new());
-                self.listing.update(|value| *value += 1);
+                if self.report_conflict() {
+                    self.pending_save.set(None);
+                    let model = self.clone();
+                    defer(move || {
+                        model.load_active();
+                        model.bump();
+                    });
+                } else {
+                    self.finish_text_summary(&text);
+                    self.notice.set_if_changed(String::new());
+                    self.listing.update(|value| *value += 1);
+                }
             }
             Err(error) => self.notice.set(error),
         }
