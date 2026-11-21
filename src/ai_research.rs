@@ -313,6 +313,7 @@ impl ManuscriptIndex {
     }
 }
 
+#[derive(Clone)]
 pub struct ResearchRun {
     index: Arc<ManuscriptIndex>,
     current: Option<usize>,

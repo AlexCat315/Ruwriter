@@ -74,11 +74,22 @@ impl View for LibrarySidebar {
             AnyView::new(header),
             collections(&self.model),
             folders_header(&self.model),
+            // Give the tree and its empty placeholder one stable slot above the footer.
             AnyView::new(
-                AnyView::new(FolderTree {
-                    model: self.model.clone(),
-                })
-                .flex_with(1.0, 1.0, Some(0.0)),
+                vstack(
+                    0.0,
+                    Align::Stretch,
+                    vec![AnyView::new(
+                        AnyView::new(FolderTree {
+                            model: self.model.clone(),
+                        })
+                        .frame_width(crate::views::root::SIDEBAR_WIDTH)
+                        .flex_with(1.0, 1.0, Some(0.0)),
+                    )],
+                )
+                .flex_with(1.0, 1.0, Some(0.0))
+                .frame_width(crate::views::root::SIDEBAR_WIDTH)
+                .debug_name("folder-area"),
             ),
         ];
         if expanded {
@@ -339,6 +350,7 @@ impl View for FolderTree {
         AnyView::new(
             AnyView::new(tree)
                 .tree_row_style(SidebarTreeRowStyle)
+                .frame_width(crate::views::root::SIDEBAR_WIDTH - 12.0)
                 .padding_edges(6.0, 0.0)
                 .debug_name("folder-tree"),
         )

@@ -27,10 +27,10 @@ index 98da08c4..40eceacc 100644
  serde_json.workspace = true
 
 diff --git a/crates/agent/src/lib.rs b/crates/agent/src/lib.rs
-index 5b8eaa45..ec44c72e 100644
+index 5b8eaa45..d8eea578 100644
 --- a/crates/agent/src/lib.rs
 +++ b/crates/agent/src/lib.rs
-@@ -1,8 +1,12 @@
+@@ -1,8 +1,13 @@
  //! UI-free agent foundation: JSON Schema subset, tools, the provider-neutral
  //! tool loop, skills, MCP and its line transports.
  //!
@@ -40,6 +40,7 @@ index 5b8eaa45..ec44c72e 100644
  mod mcp;
 +#[cfg(feature = "openai-compatible")]
 +pub mod openai_compatible;
++pub mod repetition;
 +pub mod retrieval;
  mod schema;
  mod skills;
@@ -314,15 +315,17 @@ index b26f27da..45b99dbd 100644
      }
 diff --git a/crates/agent/README.md b/crates/agent/README.md
 new file mode 100644
-index 00000000..58deb220
+index 00000000..7e79fc78
 --- /dev/null
 +++ b/crates/agent/README.md
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,52 @@
 +# Cove Agent
 +
 +`cove-agent` 提供与界面无关的工具注册、参数验证、模型调用循环和 MCP。应用定义系统指令、可访问的数据及工具执行器。
 +
 +启用 Cargo 特性 `openai-compatible` 后，可用 `ChatCompletionsModel` 连接支持 Chat Completions 的端点。该适配器支持普通答复和函数工具调用，并在后续工具回合保留提供方要求的推理上下文。API 地址可写为 `/v1` 基址或完整的 `/chat/completions` 地址。设备外的端点使用 HTTPS。
++
++`ChatCompletionsModel::list_models(base, api_key)` 查询同一 API 基址下的 `/models` 并返回模型 ID。未实现该端点的服务仍可通过指定模型 ID 连接。列表请求和生成请求都不进入网络录制。
 +
 +```rust
 +use std::sync::Arc;
@@ -364,12 +367,16 @@ index 00000000..58deb220
 +let source = index.add("人物笔记", "鹰纹银匣由晏澄保管。");
 +assert_eq!(index.search("鹰纹银匣", 3), vec![source]);
 +```
++
++## 检查生成文本的重复段落
++
++`repetition::find_repetition` 可在预览阶段查找结果中重复或来自参考稿的长文本。它忽略大小写、空白和标点，返回结果原文中的 UTF-8 范围，便于界面定位。调用方决定参考稿范围以及如何提示作者。
 diff --git a/crates/agent/src/openai_compatible.rs b/crates/agent/src/openai_compatible.rs
 new file mode 100644
-index 00000000..7a6296c8
+index 00000000..2f7f1c95
 --- /dev/null
 +++ b/crates/agent/src/openai_compatible.rs
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,239 @@
 +//! Blocking adapter for OpenAI-compatible Chat Completions servers.
 +//! Construct it with the server's API base, e.g. `http://127.0.0.1:11434/v1`.
 +
@@ -398,54 +405,40 @@ index 00000000..7a6296c8
 +
 +impl ChatCompletionsModel {
 +    pub fn new(base_url: &str, model: &str, api_key: Option<&str>) -> Result<Self, AgentError> {
-+        let base_url = base_url.trim().trim_end_matches('/');
-+        let invalid_url = || {
-+            AgentError::InvalidConfiguration(
-+                "Enter an HTTP(S) API base URL without credentials, query, or fragment.".to_owned(),
-+            )
-+        };
-+        let url = Url::parse(base_url).map_err(|_| invalid_url())?;
-+        if base_url.contains(['?', '#', '\\']) {
-+            return Err(invalid_url());
-+        }
-+        if !url.secure
-+            && url.host != "localhost"
-+            && !url.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-+        {
-+            return Err(AgentError::InvalidConfiguration(
-+                "Use HTTPS for model servers outside this device.".to_owned(),
-+            ));
-+        }
++        let base_url = api_base(base_url)?;
 +        let model = model.trim();
 +        if model.is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
 +            return Err(AgentError::InvalidConfiguration(
 +                "Enter a model name.".to_owned(),
 +            ));
 +        }
-+        let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
-+        if api_key
-+            .is_some_and(|key| key.len() > 8192 || !key.bytes().all(|byte| byte.is_ascii_graphic()))
-+        {
-+            return Err(AgentError::InvalidConfiguration(
-+                "The API key contains invalid characters.".to_owned(),
-+            ));
-+        }
-+        let endpoint = if url.path.ends_with("/chat/completions") {
-+            base_url.to_owned()
-+        } else {
-+            format!("{base_url}/chat/completions")
-+        };
-+        let client = Client::new(ClientConfig {
-+            timeout: Duration::from_secs(120),
-+            max_redirects: 0,
-+            user_agent: "Cove-Agent/1".to_owned(),
-+        });
 +        Ok(Self {
-+            client,
-+            endpoint,
++            client: client(Duration::from_secs(120)),
++            endpoint: format!("{base_url}/chat/completions"),
 +            model: model.to_owned(),
-+            api_key: api_key.map(str::to_owned),
++            api_key: validated_key(api_key)?.map(str::to_owned),
 +        })
++    }
++
++    /// Lists model IDs advertised by an OpenAI-compatible server.
++    /// Some servers omit this endpoint. Callers can still configure a model manually.
++    pub fn list_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>, AgentError> {
++        let base = api_base(base_url)?;
++        let body = fetch_json(
++            &client(Duration::from_secs(20)),
++            Request::get(format!("{base}/models")),
++            validated_key(api_key)?,
++        )?;
++        let data = body["data"].as_array().ok_or(AgentError::InvalidResult)?;
++        let models = data
++            .iter()
++            .filter_map(|entry| entry["id"].as_str())
++            .filter(|id| {
++                !id.trim().is_empty() && id.len() <= 512 && !id.chars().any(char::is_control)
++            })
++            .map(str::to_owned)
++            .collect::<std::collections::BTreeSet<_>>();
++        Ok(models.into_iter().collect())
 +    }
 +
 +    pub fn into_agent_model(self) -> AgentModel {
@@ -467,28 +460,85 @@ index 00000000..7a6296c8
 +                    .collect(),
 +            );
 +        }
-+        let mut request = Request::post(
++        let request = Request::post(
 +            &self.endpoint,
 +            serde_json::to_vec(&body).map_err(|_| AgentError::InvalidResult)?,
 +        )
-+        .header("Content-Type", "application/json")
-+        .header("Accept", "application/json");
-+        if let Some(key) = &self.api_key {
-+            request = request.header("Authorization", format!("Bearer {key}"));
-+        }
-+        let response = self.client.send_unrecorded(request).map_err(|error| {
-+            AgentError::Model(format!("Could not reach the model server: {error}"))
-+        })?;
-+        if !response.is_success() {
-+            // Some servers echo input and headers in error bodies.
-+            return Err(AgentError::HttpStatus(response.status));
-+        }
-+        let bytes = response.bytes(MAX_RESPONSE_BYTES).map_err(|error| {
-+            AgentError::Model(format!("Could not read the model response: {error}"))
-+        })?;
-+        let body: Value = serde_json::from_slice(&bytes).map_err(|_| AgentError::InvalidResult)?;
-+        decode_reply(&body)
++        .header("Content-Type", "application/json");
++        decode_reply(&fetch_json(&self.client, request, self.api_key.as_deref())?)
 +    }
++}
++
++/// Validates the API base and accepts a complete Chat Completions URL as input.
++/// The resulting base also identifies the scope of credentials for this API.
++pub fn api_base(base_url: &str) -> Result<&str, AgentError> {
++    let base_url = base_url.trim().trim_end_matches('/');
++    let invalid_url = || {
++        AgentError::InvalidConfiguration(
++            "Enter an HTTP(S) API base URL without credentials, query, or fragment.".to_owned(),
++        )
++    };
++    let url = Url::parse(base_url).map_err(|_| invalid_url())?;
++    if base_url.contains(['?', '#', '\\']) {
++        return Err(invalid_url());
++    }
++    if !url.secure
++        && url.host != "localhost"
++        && !url.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
++    {
++        return Err(AgentError::InvalidConfiguration(
++            "Use HTTPS for model servers outside this device.".to_owned(),
++        ));
++    }
++    Ok(if url.path.ends_with("/chat/completions") {
++        base_url
++            .strip_suffix("/chat/completions")
++            .unwrap_or(base_url)
++    } else {
++        base_url
++    })
++}
++
++fn validated_key(api_key: Option<&str>) -> Result<Option<&str>, AgentError> {
++    let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
++    if api_key
++        .is_some_and(|key| key.len() > 8192 || !key.bytes().all(|byte| byte.is_ascii_graphic()))
++    {
++        return Err(AgentError::InvalidConfiguration(
++            "The API key contains invalid characters.".to_owned(),
++        ));
++    }
++    Ok(api_key)
++}
++
++fn client(timeout: Duration) -> Client {
++    Client::new(ClientConfig {
++        timeout,
++        max_redirects: 0,
++        user_agent: "Cove-Agent/1".to_owned(),
++    })
++}
++
++fn fetch_json(
++    client: &Client,
++    request: Request,
++    api_key: Option<&str>,
++) -> Result<Value, AgentError> {
++    let mut request = request.header("Accept", "application/json");
++    if let Some(key) = api_key {
++        request = request.header("Authorization", format!("Bearer {key}"));
++    }
++    let response = client
++        .send_unrecorded(request)
++        .map_err(|error| AgentError::Model(format!("Could not reach the model server: {error}")))?;
++    if !response.is_success() {
++        // Some servers echo input and headers in error bodies.
++        return Err(AgentError::HttpStatus(response.status));
++    }
++    let bytes = response.bytes(MAX_RESPONSE_BYTES).map_err(|error| {
++        AgentError::Model(format!("Could not read the model response: {error}"))
++    })?;
++    serde_json::from_slice(&bytes).map_err(|_| AgentError::InvalidResult)
 +}
 +
 +fn encode_message(message: &AgentMessage) -> Value {
@@ -711,10 +761,10 @@ index 00000000..55d27667
 +}
 diff --git a/crates/agent/tests/openai_compatible.rs b/crates/agent/tests/openai_compatible.rs
 new file mode 100644
-index 00000000..29133ef2
+index 00000000..52dece10
 --- /dev/null
 +++ b/crates/agent/tests/openai_compatible.rs
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,181 @@
 +#![cfg(all(feature = "openai-compatible", any(unix, windows)))]
 +
 +use std::io::{BufRead, BufReader, Read, Write};
@@ -852,4 +902,149 @@ index 00000000..29133ef2
 +    assert!(ChatCompletionsModel::new("http://[::1]:1234/v1", "my-model", None).is_ok());
 +    assert!(ChatCompletionsModel::new("https://example.org/v1", "my-model", None).is_ok());
 +    assert!(ChatCompletionsModel::new("https://example.org/v1", "", None).is_err());
++}
++
++#[test]
++fn discovers_models_at_the_same_api_base_with_the_supplied_credentials() {
++    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++    let completions = format!(
++        "http://{}/v1/chat/completions",
++        listener.local_addr().unwrap()
++    );
++    let server = std::thread::spawn(move || {
++        let (mut stream, _) = listener.accept().unwrap();
++        stream
++            .set_read_timeout(Some(Duration::from_secs(5)))
++            .unwrap();
++        let mut reader = BufReader::new(&mut stream);
++        let mut line = String::new();
++        reader.read_line(&mut line).unwrap();
++        assert!(line.starts_with("GET /v1/models "));
++        let mut authorized = false;
++        loop {
++            line.clear();
++            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
++            if line == "\r\n" {
++                break;
++            }
++            if let Some((name, value)) = line.split_once(':')
++                && name.eq_ignore_ascii_case("authorization")
++            {
++                authorized = value.trim() == "Bearer catalog-test-key";
++            }
++        }
++        assert!(authorized);
++        let body = r#"{"data":[{"id":"review"},{"id":"draft"},{"id":"draft"},{"id":""}]}"#;
++        write!(
++            stream,
++            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
++            body.len()
++        )
++        .unwrap();
++    });
++    let models = ChatCompletionsModel::list_models(&completions, Some("catalog-test-key")).unwrap();
++    assert_eq!(models, ["draft", "review"]);
++    server.join().unwrap();
++}
+diff --git a/crates/agent/src/repetition.rs b/crates/agent/src/repetition.rs
+new file mode 100644
+index 00000000..2e5b4bcb
+--- /dev/null
++++ b/crates/agent/src/repetition.rs
+@@ -0,0 +1,96 @@
++//! Detects long verbatim or punctuation-only copies in generated text.
++
++use std::collections::HashMap;
++use std::ops::Range;
++
++const PASSAGE_LENGTH: usize = 24;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RepeatedFrom {
++    Draft,
++    Reference,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Repetition {
++    /// UTF-8 byte range into the original draft.
++    pub range: Range<usize>,
++    pub from: RepeatedFrom,
++}
++
++/// Returns a passage of 24 consecutive letters or numbers that recurs within
++/// the draft or appears in a reference. Punctuation, spacing and case are
++/// ignored. Matches within a draft must be non-overlapping.
++pub fn find_repetition<'a>(
++    draft: &str,
++    references: impl IntoIterator<Item = &'a str>,
++) -> Option<Repetition> {
++    let (offsets, characters): (Vec<_>, Vec<_>) = draft
++        .char_indices()
++        .flat_map(|(offset, ch)| normalized(ch).map(move |ch| (offset, ch)))
++        .unzip();
++    if characters.len() < PASSAGE_LENGTH {
++        return None;
++    }
++    let repetition = |start, from| Repetition {
++        range: offsets[start]
++            ..offsets
++                .get(start + PASSAGE_LENGTH)
++                .copied()
++                .unwrap_or(draft.len()),
++        from,
++    };
++    let mut passages = HashMap::<&[char], usize>::new();
++    for (start, passage) in characters.windows(PASSAGE_LENGTH).enumerate() {
++        let first = *passages.entry(passage).or_insert(start);
++        if first + PASSAGE_LENGTH <= start {
++            return Some(repetition(start, RepeatedFrom::Draft));
++        }
++    }
++    for reference in references {
++        let characters: Vec<_> = reference.chars().flat_map(normalized).collect();
++        for passage in characters.windows(PASSAGE_LENGTH) {
++            if let Some(&start) = passages.get(passage) {
++                return Some(repetition(start, RepeatedFrom::Reference));
++            }
++        }
++    }
++    None
++}
++
++fn normalized(ch: char) -> impl Iterator<Item = char> {
++    ch.to_lowercase().filter(|ch| ch.is_alphanumeric())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn catches_copied_passages_with_different_punctuation_and_spacing() {
++        let reference = "他拧亮桌上的煤油灯。把那封没有署名的信重新塞回窗台下的砖缝里。";
++        let draft =
++            "他拧亮桌上的煤油灯，把那封没有署名的信重新塞回窗台下的砖缝里。窗外传来敲门声。";
++        let found = find_repetition(draft, [reference]).unwrap();
++        assert_eq!(found.from, RepeatedFrom::Reference);
++        assert!(draft[found.range].starts_with("他拧亮桌上的煤油灯，"));
++        assert!(find_repetition("煤油灯熄了。他拉开门，接过来人手里的伞。", [reference]).is_none());
++    }
++
++    #[test]
++    fn catches_repeated_prose_in_the_draft_without_matching_overlaps() {
++        let line = "The key was hidden under the floorboard.";
++        let draft = format!("{line}\nTHE KEY WAS HIDDEN UNDER THE FLOORBOARD.");
++        let found = find_repetition(&draft, []).unwrap();
++        assert_eq!(found.from, RepeatedFrom::Draft);
++        assert!(found.range.start >= line.len());
++        assert!(find_repetition(&"啦".repeat(PASSAGE_LENGTH * 2 - 1), []).is_none());
++        assert!(
++            find_repetition(
++                "晏澄转身看向北门。晏澄握着剑。",
++                ["晏澄听见脚步声。晏澄推开门。"]
++            )
++            .is_none()
++        );
++    }
 +}

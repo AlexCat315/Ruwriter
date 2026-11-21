@@ -1,5 +1,5 @@
 use ruwriter_core::files::{read_document, write_document};
-use ruwriter_core::{AppearancePreference, Collection, Rescan, Session};
+use ruwriter_core::{AiPreferences, AppearancePreference, Collection, Rescan, Session};
 use std::path::Path;
 
 fn library(session: &Session) -> &Path {
@@ -8,6 +8,32 @@ fn library(session: &Session) -> &Path {
 
 fn active_path(session: &Session) -> std::path::PathBuf {
     session.active_document().expect("active").path.clone()
+}
+
+#[test]
+fn a_saved_single_ai_model_migrates_and_parallel_selection_survives_relaunch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("library.json"),
+        r#"{"version":2,"ai":{"endpoint":"http://127.0.0.1:1234/v1","model":"draft","tools":false}}"#,
+    )
+    .unwrap();
+    let mut session = Session::at(root.path());
+    let mut settings = session.ai_preferences().clone();
+    assert_eq!(settings.selected, vec![0]);
+    assert_eq!(settings.models[0].model, "draft");
+    assert!(!settings.models[0].tools);
+    settings.models.push(AiPreferences {
+        model: "review".to_owned(),
+        ..Default::default()
+    });
+    settings.selected = vec![1, 42, 0, 1];
+    session.set_ai_preferences(settings).unwrap();
+    let reopened = Session::at(root.path());
+    let saved = reopened.ai_preferences();
+    assert_eq!(saved.selected, vec![1, 0]);
+    assert_eq!(saved.models[1].model, "review");
+    assert_eq!(saved.models[0].endpoint, "http://127.0.0.1:1234/v1");
 }
 
 #[test]

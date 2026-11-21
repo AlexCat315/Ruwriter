@@ -68,6 +68,61 @@ impl Default for AiPreferences {
     }
 }
 
+pub const MAX_PARALLEL_AI_MODELS: usize = 4;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredAiSettings")]
+pub struct AiSettings {
+    pub models: Vec<AiPreferences>,
+    pub selected: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredAiSettings {
+    Multiple {
+        models: Vec<AiPreferences>,
+        #[serde(default)]
+        selected: Vec<usize>,
+    },
+    Single(AiPreferences),
+}
+
+impl From<StoredAiSettings> for AiSettings {
+    fn from(stored: StoredAiSettings) -> Self {
+        match stored {
+            StoredAiSettings::Multiple { models, selected } => {
+                let mut settings = Self { models, selected };
+                settings.normalize_selection();
+                settings
+            }
+            StoredAiSettings::Single(model) if !model.model.trim().is_empty() => Self {
+                models: vec![model],
+                selected: vec![0],
+            },
+            StoredAiSettings::Single(_) => Self::default(),
+        }
+    }
+}
+
+impl AiSettings {
+    pub fn normalize_selection(&mut self) {
+        let mut selected = Vec::new();
+        for &index in &self.selected {
+            if index < self.models.len() && !selected.contains(&index) {
+                selected.push(index);
+                if selected.len() == MAX_PARALLEL_AI_MODELS {
+                    break;
+                }
+            }
+        }
+        if selected.is_empty() && !self.models.is_empty() {
+            selected.push(0);
+        }
+        self.selected = selected;
+    }
+}
+
 /// Application state kept in the data folder: which library is open and the
 /// user's settings. Version 1 also listed every document; it is migrated.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -77,7 +132,7 @@ pub(crate) struct AppState {
     library_folder: Option<PathBuf>,
     active: Option<String>,
     settings: Settings,
-    ai: AiPreferences,
+    ai: AiSettings,
     external: BTreeMap<String, Meta>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     documents: Vec<LegacyDocument>,
@@ -418,11 +473,12 @@ impl Session {
 
     // MARK: - Persistence
 
-    pub fn ai_preferences(&self) -> &AiPreferences {
+    pub fn ai_preferences(&self) -> &AiSettings {
         &self.app.ai
     }
 
-    pub fn set_ai_preferences(&mut self, preferences: AiPreferences) -> Result<(), String> {
+    pub fn set_ai_preferences(&mut self, mut preferences: AiSettings) -> Result<(), String> {
+        preferences.normalize_selection();
         let previous = std::mem::replace(&mut self.app.ai, preferences);
         if let Err(error) = self.write_app() {
             self.app.ai = previous;

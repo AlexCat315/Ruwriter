@@ -32,7 +32,7 @@ use ruwriter_core::{
     SortOrder, WritingStats, count, heading_at, headings, parse_tags,
 };
 
-use crate::ai::{AiState, Response as AiResponse, WritingTarget};
+use crate::ai::{AiState, ModelStatus, WritingTarget};
 use crate::ai_research::{ManuscriptFile, ResearchRequest, ResearchScope};
 use crate::formatting::{self, Command};
 
@@ -877,6 +877,7 @@ impl Model {
         self.ai.viewed_source.set(None);
         self.ai.target.set(target);
         self.ai.prompt.set(TextBuffer::empty());
+        self.ai.continuing.set(false);
         self.ai.error.set(String::new());
         self.ai.open.set(true);
         self.revision.update(|value| *value += 1);
@@ -884,7 +885,7 @@ impl Model {
 
     pub fn close_ai(&self) {
         if self.ai.open.get_untracked() {
-            self.ai.cancel();
+            self.ai.clear_batch();
             self.ai.target.set(None);
             self.ai.viewed_source.set(None);
             self.ai.context.set(Ok(TextBuffer::empty()));
@@ -894,44 +895,153 @@ impl Model {
         }
     }
 
+    pub fn ai_settings(&self) -> ruwriter_core::AiSettings {
+        let _ = self.revision.get();
+        self.read(|session| session.ai_preferences().clone())
+            .unwrap_or_default()
+    }
+
+    pub fn edit_ai_profile(&self, index: Option<usize>) {
+        let settings = self.ai_settings();
+        if let Some(index) = index {
+            let Some(profile) = settings.models.get(index).cloned() else {
+                return;
+            };
+            self.ai.edit_profile(Some(index), profile);
+        } else {
+            let endpoint = self.ai.endpoint.get_untracked().string_value();
+            self.ai.edit_profile(
+                None,
+                ruwriter_core::AiPreferences {
+                    endpoint,
+                    ..Default::default()
+                },
+            );
+        }
+        self.ai.settings_open.set(true);
+    }
+
+    pub fn manage_ai(&self) {
+        self.edit_ai_profile(self.ai_settings().selected.first().copied());
+    }
+
     pub fn save_ai_preferences(&self) {
-        let endpoint = self.ai.endpoint.get_untracked().string_value();
-        let model = self.ai.model.get_untracked().string_value();
-        let preferences = ruwriter_core::AiPreferences {
-            endpoint: endpoint.trim().trim_end_matches('/').to_owned(),
-            model: model.trim().to_owned(),
-            tools: self.ai.tools.get_untracked(),
-        };
-        let key = self.ai.api_key.get_untracked().string_value();
-        if crate::ai::requires_key(&preferences.endpoint) && key.trim().is_empty() {
-            self.ai.error.set("请填写 DeepSeek API 密钥。".to_owned());
+        let result = (|| {
+            let address = self.ai.endpoint.get_untracked().string_value();
+            let endpoint = cove_agent::openai_compatible::api_base(&address)
+                .map_err(|error| error.to_string())?
+                .to_owned();
+            let model = self.ai.model.get_untracked().string_value();
+            let profile = ruwriter_core::AiPreferences {
+                endpoint,
+                model: model.trim().to_owned(),
+                tools: self.ai.tools.get_untracked(),
+            };
+            let key = self.ai.api_key.get_untracked().string_value();
+            let key = key.trim();
+            cove_agent::openai_compatible::ChatCompletionsModel::new(
+                &profile.endpoint,
+                &profile.model,
+                Some(key),
+            )
+            .map_err(|error| error.to_string())?;
+            let mut settings = self.ai_settings();
+            let editing = self.ai.editing.get_untracked();
+            if settings.models.iter().enumerate().any(|(index, saved)| {
+                Some(index) != editing
+                    && cove_agent::openai_compatible::api_base(&saved.endpoint).ok()
+                        == Some(profile.endpoint.as_str())
+                    && saved.model == profile.model
+            }) {
+                return Err("该服务下已经保存了这个模型。".to_owned());
+            }
+            let index = if let Some(index) = editing {
+                let item = settings
+                    .models
+                    .get_mut(index)
+                    .ok_or("模型已移除，请重新添加。")?;
+                *item = profile.clone();
+                index
+            } else {
+                let index = settings.models.len();
+                settings.models.push(profile.clone());
+                index
+            };
+            self.store_ai_settings(settings)?;
+            self.ai.save_key(&profile.endpoint, key);
+            self.ai.editing.set(Some(index));
+            self.ai.endpoint.set(TextBuffer::new(&profile.endpoint));
+            self.ai.model.set(TextBuffer::new(&profile.model));
+            Ok(())
+        })();
+        self.ai.error.set(result.err().unwrap_or_default());
+    }
+
+    pub fn remove_ai_profile(&self, index: usize) {
+        let mut settings = self.ai_settings();
+        if index >= settings.models.len() {
             return;
         }
-        let result = cove_agent::openai_compatible::ChatCompletionsModel::new(
-            &preferences.endpoint,
-            &preferences.model,
-            Some(&key),
-        )
-        .map_err(|error| error.to_string())
-        .and_then(|_| self.with_session(|session| session.set_ai_preferences(preferences.clone())));
-        match result {
-            Ok(()) => {
-                self.ai.endpoint.set(TextBuffer::new(&preferences.endpoint));
-                self.ai.model.set(TextBuffer::new(&preferences.model));
-                self.ai.error.set(String::new());
-                if !preferences.tools {
-                    self.ai.scope.set(ResearchScope::Excerpt);
-                }
-                if matches!(
-                    self.ai.response.get_untracked(),
-                    AiResponse::Failed(cove_agent::AgentError::HttpStatus(401))
-                ) {
-                    self.ai.response.set(AiResponse::Idle);
-                }
-                self.ai.settings_open.set(false);
+        settings.models.remove(index);
+        settings.selected.retain(|&selected| selected != index);
+        for selected in &mut settings.selected {
+            if *selected > index {
+                *selected -= 1;
             }
-            Err(error) => self.ai.error.set(format!("无法保存模型设置：{error}")),
         }
+        match self.store_ai_settings(settings) {
+            Ok(()) => self.manage_ai(),
+            Err(error) => self.ai.error.set(error),
+        }
+    }
+
+    pub fn toggle_ai_profile(&self, index: usize) {
+        let mut settings = self.ai_settings();
+        if index >= settings.models.len() {
+            return;
+        }
+        if let Some(position) = settings
+            .selected
+            .iter()
+            .position(|&selected| selected == index)
+        {
+            if settings.selected.len() == 1 {
+                return;
+            }
+            settings.selected.remove(position);
+        } else {
+            if settings.selected.len() >= ruwriter_core::MAX_PARALLEL_AI_MODELS {
+                return;
+            }
+            settings.selected.push(index);
+        }
+        self.ai
+            .error
+            .set(self.store_ai_settings(settings).err().unwrap_or_default());
+    }
+
+    pub fn select_ai_profile(&self, index: usize) {
+        let mut settings = self.ai_settings();
+        if index < settings.models.len() && settings.selected.as_slice() != [index] {
+            settings.selected = vec![index];
+            self.ai
+                .error
+                .set(self.store_ai_settings(settings).err().unwrap_or_default());
+        }
+    }
+
+    fn store_ai_settings(&self, mut settings: ruwriter_core::AiSettings) -> Result<(), String> {
+        settings.normalize_selection();
+        let tools = settings
+            .selected
+            .iter()
+            .all(|&index| settings.models[index].tools);
+        self.with_session(|session| session.set_ai_preferences(settings))?;
+        if !tools {
+            self.ai.scope.set(ResearchScope::Excerpt);
+        }
+        self.revision.update(|value| *value += 1);
+        Ok(())
     }
 
     pub fn ai_project_folder(&self) -> Option<String> {
@@ -948,12 +1058,17 @@ impl Model {
             let scope = self.ai.scope.get_untracked();
             let prepared = self
                 .read(|session| {
-                    let preferences = session.ai_preferences().clone();
+                    let settings = session.ai_preferences();
+                    let profiles: Vec<_> = settings
+                        .selected
+                        .iter()
+                        .filter_map(|&index| settings.models.get(index).cloned())
+                        .collect();
                     if scope == ResearchScope::Excerpt {
-                        return Ok((preferences, None));
+                        return Ok((profiles, None));
                     }
-                    if !preferences.tools {
-                        return Err("跨章节检索需要在模型设置中打开工具调用。".to_owned());
+                    if profiles.iter().any(|profile| !profile.tools) {
+                        return Err("跨章节检索需要为所有已选模型开启工具调用。".to_owned());
                     }
                     let target = self
                         .ai
@@ -1013,7 +1128,7 @@ impl Model {
                         doc.id.clone()
                     };
                     Ok((
-                        preferences,
+                        profiles,
                         Some(ResearchRequest {
                             root: root.to_path_buf(),
                             files,
@@ -1024,16 +1139,19 @@ impl Model {
                     ))
                 })
                 .ok_or_else(|| "无法读取模型设置。".to_owned())??;
-            self.ai.start(&prepared.0, prepared.1)
+            self.ai.start(prepared.0, prepared.1)
         })();
         self.ai.error.set(result.err().unwrap_or_default());
     }
 
-    pub fn apply_ai(&self, replace: bool) {
-        let (Some(target), AiResponse::Ready(result)) = (
+    pub fn apply_ai(&self, index: usize, replace: bool) {
+        let (Some(target), Some(batch)) = (
             self.ai.target.get_untracked(),
-            self.ai.response.get_untracked(),
+            self.ai.batch.get_untracked(),
         ) else {
+            return;
+        };
+        let Some(ModelStatus::Ready(result)) = batch.runs.get(index).map(|run| &run.status) else {
             return;
         };
         let current = self.buffer.get_untracked();
