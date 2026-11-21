@@ -17,7 +17,7 @@ pub use library::{
     SortOrder, WritingMode,
 };
 pub use outline::{Heading, heading_at, headings, is_chapter_line};
-pub use session::{Rescan, Session, ViewOptions};
+pub use session::{AiPreferences, Rescan, Session, ViewOptions};
 pub use snapshots::Snapshot;
 pub use stats::{WritingStats, count};
 pub use sync::{

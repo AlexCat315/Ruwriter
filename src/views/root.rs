@@ -21,6 +21,7 @@ use cove_ui::core::scene::{Align, OpenedDocuments};
 use cove_ui::watch::{DirectoryWatcher, WatchOptions};
 use ruwriter_core::{Session, count};
 
+use super::ai::AiDialog;
 use super::editor::EditorPane;
 use super::history::HistoryDialog;
 use super::info::InfoDialog;
@@ -147,6 +148,7 @@ impl View for RootView {
             sync_status: cx.state(String::new),
             sync_busy: cx.state(|| false),
             sync_failed: cx.state(|| false),
+            ai: crate::ai::AiState::new(cx, session.borrow().ai_preferences()),
         };
 
         // Documents the OS opens with Ruwriter (Finder "Open With", a file
@@ -291,6 +293,9 @@ impl View for RootView {
                     model: model.clone(),
                 }),
                 AnyView::new(HistoryDialog {
+                    model: model.clone(),
+                }),
+                AnyView::new(AiDialog {
                     model: model.clone(),
                 }),
                 AnyView::new(SyncDialog {

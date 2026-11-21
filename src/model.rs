@@ -32,6 +32,8 @@ use ruwriter_core::{
     SortOrder, WritingStats, count, heading_at, headings, parse_tags,
 };
 
+use crate::ai::{AiState, Response as AiResponse, WritingTarget};
+use crate::ai_research::{ManuscriptFile, ResearchRequest, ResearchScope};
 use crate::formatting::{self, Command};
 
 /// Documents longer than this save on a pause instead of on every keystroke;
@@ -161,6 +163,11 @@ pub struct Model {
     pub sync_status: Signal<String>,
     pub sync_busy: Signal<bool>,
     pub sync_failed: Signal<bool>,
+    pub ai: AiState,
+}
+
+fn project_folder(id: &str) -> &str {
+    id.split_once('/').map_or("", |(folder, _)| folder)
 }
 
 fn markdown_filter() -> FilePickerFilter {
@@ -816,6 +823,245 @@ impl Model {
                 model.on_sync_event(event);
             }));
         });
+    }
+
+    // MARK: - Writing assistant
+
+    fn ai_document(&self) -> Option<(PathBuf, String, u64)> {
+        self.read(|session| {
+            let doc = session.active_document()?;
+            (!doc.trashed).then(|| {
+                (
+                    session.library_root().to_path_buf(),
+                    doc.id.clone(),
+                    self.document.get_untracked(),
+                )
+            })
+        })
+        .flatten()
+    }
+
+    pub fn open_ai(&self) {
+        if self.ai.open.get_untracked() {
+            return;
+        }
+        let target = self.ai_document().map(|document| {
+            let buffer = self.buffer.get_untracked();
+            let len = buffer.character_count();
+            let caret = self.caret.get_untracked();
+            let selection = caret
+                .selected_range
+                .map(|(start, end)| start.min(len)..end.min(len))
+                .filter(|range| !range.is_empty());
+            let insertion = selection
+                .as_ref()
+                .map_or(caret.caret_index.min(len), |range| range.end);
+            WritingTarget {
+                document,
+                buffer,
+                selection,
+                insertion,
+            }
+        });
+        let context = target
+            .as_ref()
+            .map_or_else(|| Ok(TextBuffer::empty()), WritingTarget::context);
+        self.ai.include_context.set(
+            target
+                .as_ref()
+                .is_some_and(|target| target.selection.is_some())
+                && context.as_ref().is_ok_and(|text| !text.is_empty()),
+        );
+        self.ai.context.set(context);
+        self.ai.scope.set(ResearchScope::Excerpt);
+        self.ai.viewed_source.set(None);
+        self.ai.target.set(target);
+        self.ai.prompt.set(TextBuffer::empty());
+        self.ai.error.set(String::new());
+        self.ai.open.set(true);
+        self.revision.update(|value| *value += 1);
+    }
+
+    pub fn close_ai(&self) {
+        if self.ai.open.get_untracked() {
+            self.ai.cancel();
+            self.ai.target.set(None);
+            self.ai.viewed_source.set(None);
+            self.ai.context.set(Ok(TextBuffer::empty()));
+            self.ai.prompt.set(TextBuffer::empty());
+            self.ai.open.set(false);
+            self.revision.update(|value| *value += 1);
+        }
+    }
+
+    pub fn save_ai_preferences(&self) {
+        let endpoint = self.ai.endpoint.get_untracked().string_value();
+        let model = self.ai.model.get_untracked().string_value();
+        let preferences = ruwriter_core::AiPreferences {
+            endpoint: endpoint.trim().trim_end_matches('/').to_owned(),
+            model: model.trim().to_owned(),
+            tools: self.ai.tools.get_untracked(),
+        };
+        let key = self.ai.api_key.get_untracked().string_value();
+        if crate::ai::requires_key(&preferences.endpoint) && key.trim().is_empty() {
+            self.ai.error.set("请填写 DeepSeek API 密钥。".to_owned());
+            return;
+        }
+        let result = cove_agent::openai_compatible::ChatCompletionsModel::new(
+            &preferences.endpoint,
+            &preferences.model,
+            Some(&key),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|_| self.with_session(|session| session.set_ai_preferences(preferences.clone())));
+        match result {
+            Ok(()) => {
+                self.ai.endpoint.set(TextBuffer::new(&preferences.endpoint));
+                self.ai.model.set(TextBuffer::new(&preferences.model));
+                self.ai.error.set(String::new());
+                if !preferences.tools {
+                    self.ai.scope.set(ResearchScope::Excerpt);
+                }
+                if matches!(
+                    self.ai.response.get_untracked(),
+                    AiResponse::Failed(cove_agent::AgentError::HttpStatus(401))
+                ) {
+                    self.ai.response.set(AiResponse::Idle);
+                }
+                self.ai.settings_open.set(false);
+            }
+            Err(error) => self.ai.error.set(format!("无法保存模型设置：{error}")),
+        }
+    }
+
+    pub fn ai_project_folder(&self) -> Option<String> {
+        self.read(|session| {
+            session.active_document().and_then(|doc| {
+                (!doc.external && !doc.trashed).then(|| project_folder(&doc.id).to_owned())
+            })
+        })
+        .flatten()
+    }
+
+    pub fn run_ai(&self) {
+        let result = (|| {
+            let scope = self.ai.scope.get_untracked();
+            let prepared = self
+                .read(|session| {
+                    let preferences = session.ai_preferences().clone();
+                    if scope == ResearchScope::Excerpt {
+                        return Ok((preferences, None));
+                    }
+                    if !preferences.tools {
+                        return Err("跨章节检索需要在模型设置中打开工具调用。".to_owned());
+                    }
+                    let target = self
+                        .ai
+                        .target
+                        .get_untracked()
+                        .ok_or_else(|| "请先打开要检索的文稿。".to_owned())?;
+                    let doc = session
+                        .active_document()
+                        .filter(|doc| !doc.trashed)
+                        .ok_or_else(|| "请先打开要检索的文稿。".to_owned())?;
+                    let root = session.library_root();
+                    if root != target.document.0
+                        || doc.id != target.document.1
+                        || self.document.get_untracked() != target.document.2
+                        || self.buffer.get_untracked() != target.buffer
+                    {
+                        return Err("原文稿已变化，请重新打开助手确认检索范围。".to_owned());
+                    }
+                    if scope == ResearchScope::Project && doc.external {
+                        return Err("库外文稿可检索本文稿。作品检索需要先打开库内文稿。".to_owned());
+                    }
+                    let folder = project_folder(&doc.id);
+                    let files = session
+                        .library
+                        .documents
+                        .iter()
+                        .filter(|file| {
+                            if scope == ResearchScope::Document {
+                                file.id == doc.id
+                            } else {
+                                !file.external
+                                    && !file.trashed
+                                    && ruwriter_core::Library::is_within(&file.id, folder)
+                            }
+                        })
+                        .map(|file| ManuscriptFile {
+                            id: if file.external {
+                                file.path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned()
+                            } else {
+                                file.id.clone()
+                            },
+                            title: file.display_title().to_owned(),
+                            path: file.path.clone(),
+                        })
+                        .collect();
+                    let active_id = if doc.external {
+                        doc.path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        doc.id.clone()
+                    };
+                    Ok((
+                        preferences,
+                        Some(ResearchRequest {
+                            root: root.to_path_buf(),
+                            files,
+                            active_id,
+                            active: target.buffer,
+                            caret: target.insertion,
+                        }),
+                    ))
+                })
+                .ok_or_else(|| "无法读取模型设置。".to_owned())??;
+            self.ai.start(&prepared.0, prepared.1)
+        })();
+        self.ai.error.set(result.err().unwrap_or_default());
+    }
+
+    pub fn apply_ai(&self, replace: bool) {
+        let (Some(target), AiResponse::Ready(result)) = (
+            self.ai.target.get_untracked(),
+            self.ai.response.get_untracked(),
+        ) else {
+            return;
+        };
+        let current = self.buffer.get_untracked();
+        if self.ai_document().as_ref() != Some(&target.document) || current != target.buffer {
+            self.ai
+                .error
+                .set("原文稿已变化。可复制结果，或重新打开助手选取范围。".to_owned());
+            return;
+        }
+        let range = if replace {
+            let Some(selection) = target.selection else {
+                return;
+            };
+            selection
+        } else {
+            target.insertion..target.insertion
+        };
+        let text = result.text.string_value();
+        let start = current.utf8_offset_for_character_index(range.start);
+        let updated = current.replace(range.clone(), &text);
+        let caret = updated.character_index_for_utf8_offset(start + text.len());
+        self.close_ai();
+        if self.options().preview {
+            self.toggle_preview();
+        }
+        self.showing_editor.set(true);
+        self.request_edit(range, text, caret, None);
+        self.navigate(caret, None, true);
     }
 
     // MARK: - Cloud sync

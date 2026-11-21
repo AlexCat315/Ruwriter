@@ -1,6 +1,7 @@
 //! View tree. Panes are separate components so a keystroke recomposes only
 //! the views that show what it changed.
 
+mod ai;
 mod editor;
 mod history;
 mod info;

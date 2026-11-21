@@ -58,6 +58,9 @@ jobs:
           path: Cove
           submodules: recursive
 
+      - name: Apply Cove Agent adapter
+        run: git -C ../Cove apply "$GITHUB_WORKSPACE/Ruwriter/patches/cove-agent-openai-compatible.patch"
+
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
 

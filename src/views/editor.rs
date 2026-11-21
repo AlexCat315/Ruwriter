@@ -169,6 +169,13 @@ impl EditorPane {
                 move || focus.toggle_focus(),
             ),
         ]);
+        let ai = model.clone();
+        trailing.push(icon_button(
+            icons::status::sparkles(),
+            "AI 助手",
+            false,
+            move || ai.open_ai(),
+        ));
         trailing.push(AnyView::new(
             MenuButton::new(
                 document_menu(model),

@@ -1,3 +1,5 @@
+mod ai;
+mod ai_research;
 mod app;
 mod dates;
 mod formatting;

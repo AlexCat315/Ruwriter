@@ -17,6 +17,7 @@ members = [".", "crates/core", "xtask"]
 cove-ui = { path = "../Cove" }
 ruwriter-core = { path = "crates/core" }
 cove-http = { path = "../Cove/crates/http" }
+cove-agent = { path = "../Cove/crates/agent", features = ["openai-compatible"] }
 serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]

@@ -50,6 +50,13 @@ impl View for Palette {
             )
             .keywords(["open", "dakai"]),
             command(
+                "AI 助手…",
+                "写作",
+                icons::status::sparkles(),
+                Rc::new(Model::open_ai),
+            )
+            .keywords(["agent", "ai", "润色", "续写", "摘要", "提纲"]),
+            command(
                 "云同步…",
                 "文稿",
                 icons::device::cloud_upload(),

@@ -49,6 +49,25 @@ pub enum Rescan {
     Replaced,
 }
 
+/// Model connection preferences. Credentials and prompts live in the UI session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiPreferences {
+    pub endpoint: String,
+    pub model: String,
+    pub tools: bool,
+}
+
+impl Default for AiPreferences {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:11434/v1".to_owned(),
+            model: String::new(),
+            tools: true,
+        }
+    }
+}
+
 /// Application state kept in the data folder: which library is open and the
 /// user's settings. Version 1 also listed every document; it is migrated.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -58,6 +77,7 @@ pub(crate) struct AppState {
     library_folder: Option<PathBuf>,
     active: Option<String>,
     settings: Settings,
+    ai: AiPreferences,
     external: BTreeMap<String, Meta>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     documents: Vec<LegacyDocument>,
@@ -398,15 +418,30 @@ impl Session {
 
     // MARK: - Persistence
 
+    pub fn ai_preferences(&self) -> &AiPreferences {
+        &self.app.ai
+    }
+
+    pub fn set_ai_preferences(&mut self, preferences: AiPreferences) -> Result<(), String> {
+        let previous = std::mem::replace(&mut self.app.ai, preferences);
+        if let Err(error) = self.write_app() {
+            self.app.ai = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn persist_app(&mut self) {
+        let _ = self.write_app();
+    }
+
+    fn write_app(&mut self) -> Result<(), String> {
         self.app.version = APP_STATE_VERSION;
         self.app.active = self.active.clone();
         self.app.external = self.library.external.clone();
-        if let Ok(bytes) = serde_json::to_vec_pretty(&self.app)
-            && let Ok(json) = String::from_utf8(bytes)
-        {
-            let _ = write_document(&paths::library_index_path(&self.data_root), &json);
-        }
+        let json = serde_json::to_string_pretty(&self.app).map_err(|error| error.to_string())?;
+        write_document(&paths::library_index_path(&self.data_root), &json)
+            .map_err(|error| error.to_string())
     }
 
     /// Writes both state files. Failing to persist a cache never blocks work.

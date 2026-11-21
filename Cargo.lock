@@ -256,6 +256,7 @@ dependencies = [
 name = "cove-agent"
 version = "0.3.2"
 dependencies = [
+ "cove-http",
  "serde",
  "serde_json",
 ]
@@ -1535,6 +1536,7 @@ dependencies = [
 name = "ruwriter"
 version = "0.4.2"
 dependencies = [
+ "cove-agent",
  "cove-http",
  "cove-ui",
  "libc",
