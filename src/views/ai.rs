@@ -1,12 +1,18 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use cove_agent::AgentError;
+use cove_ui::compose::modifiers::interaction::AccessibilityExt;
 use cove_ui::compose::modifiers::layout::{EdgeInsets, FlexExt, LayoutFrameExt, PaddingExt};
 use cove_ui::compose::modifiers::style::{AppearanceExt, SemanticStyleViewExt};
 use cove_ui::compose::primitives::controls::{Button, MenuButton, Toggle};
 use cove_ui::compose::primitives::overlays::{MenuEntry, MenuItem, PopoverPlacement};
 use cove_ui::compose::primitives::text::text_field::{TextFieldBehavior, TextFieldEvents};
-use cove_ui::compose::primitives::text::{Text, TextBuffer, TextField};
+use cove_ui::compose::primitives::text::{
+    MarkdownView, Text, TextBuffer, TextField, TextRun, TextTraits,
+};
 use cove_ui::compose::theme::styles::buttons::{
     ButtonStyleViewExt, PrimaryButtonStyle, ToggleButtonStyle,
 };
@@ -214,95 +220,301 @@ impl AiPanel {
         (rows, action)
     }
 
+    fn brief_tabs(&self) -> AnyView {
+        let page = self.model.ai.brief_page;
+        let selected = self.model.ai.brief_item;
+        AnyView::new(
+            wrap_controls(
+                ["大纲", "角色卡", "关系", "记忆", "DiffData", "文风"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        AnyView::new(
+                            Button::title(label, move || {
+                                page.set(index);
+                                selected.set(0);
+                            })
+                            .selected(page.get() == index)
+                            .button_style(ToggleButtonStyle::default()),
+                        )
+                    })
+                    .collect(),
+            )
+            .padding_edges(14.0, 4.0),
+        )
+    }
+
     fn brief(&self) -> (Vec<AnyView>, AnyView) {
         let ai = &self.model.ai;
-        let notes = |label: &str, signal: Signal<TextBuffer>, height: f32| {
-            AnyView::new(
-                TextField::new(label, signal.binding())
-                    .multiline()
-                    .frame_height(height),
-            )
-        };
-        let mut rows = vec![];
-        if let Some((_, name)) = self.model.ai_work() {
-            rows.push(caption(name));
-        }
-        rows.push(caption(
-            "启用手记后，会把这些内容连同本次任务发给所选模型。",
-        ));
-        rows.push(caption("剧情大纲"));
-        rows.push(notes("已发生的剧情和作者规划", ai.story_outline, 120.0));
-        rows.push(caption("人物小传与关系"));
-        rows.push(notes(
-            "人物身份、关系和当前状态",
-            ai.story_characters,
-            105.0,
-        ));
-        rows.push(caption("待续线索"));
-        rows.push(notes("还没写完的线索", ai.story_threads, 85.0));
-        rows.push(field("题材和类型", ai.story_genre.binding(), false, 240));
-        rows.push(field(
-            "叙事口味与关系节奏",
-            ai.story_tone.binding(),
-            false,
-            420,
-        ));
-        rows.push(notes("接下来想怎么发展", ai.story_direction, 80.0));
-        rows.push(notes("角色说法与谁知道什么", ai.story_claims, 105.0));
-        rows.push(notes(
-            "作者私设、真实动机与揭晓点（仅审稿使用）",
-            ai.story_truth,
-            105.0,
-        ));
-        rows.push(caption("硬设定和既定事实"));
-        rows.push(notes("硬设定和既定事实", ai.canon, 105.0));
-        rows.push(caption("文风要求"));
-        rows.push(notes("文风要求", ai.voice, 85.0));
-        for (index, sample) in ai.voice_samples.get().iter().enumerate() {
-            let remove = ai.voice_samples;
-            let excerpt: String = sample.chars().take(90).collect();
-            rows.push(wrap_controls(vec![
-                caption(excerpt),
-                AnyView::new(Button::title("移除此样段", move || {
-                    remove.update(|samples| {
-                        if index < samples.len() {
-                            samples.remove(index);
+        let mut rows = Vec::new();
+        let page = ai.brief_page;
+        let selected = ai.brief_item;
+        match page.get() {
+            1 => {
+                if let Some(index) =
+                    record_picker(&mut rows, ai.story_cards, selected, "添加角色", |card| {
+                        card.name.clone()
+                    })
+                {
+                    let cards = ai.story_cards;
+                    rows.push(study_field(
+                        "姓名",
+                        record_field(cards, index, |c| &c.name, |c, v| c.name = v),
+                        44.0,
+                    ));
+                    rows.push(study_field(
+                        "表面言行",
+                        record_field(cards, index, |c| &c.surface, |c, v| c.surface = v),
+                        70.0,
+                    ));
+                    rows.push(study_field(
+                        "内核与动机",
+                        record_field(cards, index, |c| &c.motive, |c, v| c.motive = v),
+                        100.0,
+                    ));
+                    rows.push(study_field(
+                        "什么会触发自我保护",
+                        record_field(cards, index, |c| &c.defense, |c, v| c.defense = v),
+                        93.0,
+                    ));
+                    rows.push(study_field(
+                        "不能写反的边界",
+                        record_field(cards, index, |c| &c.boundary, |c, v| c.boundary = v),
+                        93.0,
+                    ));
+                }
+            }
+            2 => {
+                if let Some(index) = record_picker(
+                    &mut rows,
+                    ai.story_relationships,
+                    selected,
+                    "添加关系",
+                    |edge| {
+                        if edge.from.is_empty() && edge.to.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} → {}", edge.from, edge.to)
                         }
-                    });
-                })),
-            ]));
-        }
-        if ai
-            .target
-            .get()
-            .is_some_and(|target| target.selection.is_some())
-        {
-            let take = self.model.clone();
-            rows.push(AnyView::new(Button::title(
-                "把选区加入文风样段",
-                move || take.ai_voice_from_selection(),
-            )));
-        }
-        rows.push(caption("避免的词语或句式（每行一条）"));
-        rows.push(notes("避免的词语或句式", ai.avoid, 72.0));
-        let feedback = self.model.ai_brief().feedback;
-        if !feedback.is_empty() {
-            rows.push(caption("已记住的改法"));
-            for example in feedback {
-                let model = self.model.clone();
-                let excerpt: String = example.after.chars().take(74).collect();
-                rows.push(wrap_controls(vec![
-                    caption(format!("{} · {excerpt}", example.instruction)),
-                    AnyView::new(Button::title("忘记这条改法", move || {
-                        model.forget_ai_revision(&example)
-                    })),
-                ]));
+                    },
+                ) {
+                    let edges = ai.story_relationships;
+                    let cards = ai.story_cards.get();
+                    for (label, field) in [
+                        (
+                            "从",
+                            record_field(edges, index, |e| &e.from, |e, v| e.from = v),
+                        ),
+                        ("到", record_field(edges, index, |e| &e.to, |e, v| e.to = v)),
+                    ] {
+                        let name = field.get().string_value();
+                        let entries = cards
+                            .iter()
+                            .filter(|c| !c.name.trim().is_empty())
+                            .enumerate()
+                            .map(|(i, card)| {
+                                let value = TextBuffer::new(&card.name);
+                                let binding = field.clone();
+                                MenuEntry::Item(
+                                    MenuItem::new(i as u64 + 1, card.name.clone(), move || {
+                                        binding.set(value.clone())
+                                    })
+                                    .selected(card.name == name),
+                                )
+                            })
+                            .collect();
+                        rows.push(wrap_controls(vec![
+                            caption(label),
+                            chooser(
+                                if name.is_empty() {
+                                    "选择角色".into()
+                                } else {
+                                    name
+                                },
+                                entries,
+                                !cards.is_empty(),
+                            ),
+                        ]));
+                    }
+                    rows.push(study_field(
+                        "当前关系",
+                        record_field(edges, index, |e| &e.state, |e, v| e.state = v),
+                        70.0,
+                    ));
+                    rows.push(study_field(
+                        "希望怎样变化",
+                        record_field(edges, index, |e| &e.direction, |e, v| e.direction = v),
+                        95.0,
+                    ));
+                    rows.push(study_field(
+                        "现阶段别跨过的分寸",
+                        record_field(edges, index, |e| &e.boundary, |e, v| e.boundary = v),
+                        95.0,
+                    ));
+                }
+            }
+            3 => {
+                let memories = ai.writing_memories;
+                if let Some(index) =
+                    record_picker(&mut rows, memories, selected, "添加记忆", |entry| {
+                        entry.title.clone()
+                    })
+                {
+                    rows.push(study_field(
+                        "主题",
+                        record_field(memories, index, |m| &m.title, |m, v| m.title = v),
+                        48.0,
+                    ));
+                    rows.push(study_field(
+                        "关联角色或情节",
+                        record_field(memories, index, |m| &m.subject, |m, v| m.subject = v),
+                        48.0,
+                    ));
+                    rows.push(study_field(
+                        "已确认的记忆",
+                        record_field(memories, index, |m| &m.text, |m, v| m.text = v),
+                        110.0,
+                    ));
+                    rows.push(study_field(
+                        "来源或原文位置",
+                        record_field(memories, index, |m| &m.source, |m, v| m.source = v),
+                        66.0,
+                    ));
+                    rows.push(wrap_controls(vec![
+                        AnyView::new(Toggle::labeled(
+                            "置顶",
+                            record_toggle(memories, index, |m| m.pinned, |m, v| m.pinned = v),
+                        )),
+                        AnyView::new(Toggle::labeled(
+                            "待复核",
+                            record_toggle(memories, index, |m| m.held, |m, v| m.held = v),
+                        )),
+                    ]));
+                }
+            }
+            4 => {
+                let feedback = ai.reviewed_feedback;
+                if let Some(index) = record_picker(
+                    &mut rows,
+                    feedback,
+                    selected,
+                    "新建改稿对照",
+                    |entry| entry.instruction.clone(),
+                ) {
+                    rows.push(study_field(
+                        "修改意图",
+                        record_field(
+                            feedback,
+                            index,
+                            |f| &f.instruction,
+                            |f, v| f.instruction = v,
+                        ),
+                        66.0,
+                    ));
+                    rows.push(study_field(
+                        "适用角色、关系或场景",
+                        record_field(feedback, index, |f| &f.subject, |f, v| f.subject = v),
+                        50.0,
+                    ));
+                    rows.push(study_field(
+                        "以后应沿用的改法",
+                        record_field(feedback, index, |f| &f.lesson, |f, v| f.lesson = v),
+                        84.0,
+                    ));
+                    rows.push(study_field(
+                        "改稿来源",
+                        record_field(feedback, index, |f| &f.source, |f, v| f.source = v),
+                        54.0,
+                    ));
+                    if let Some(entry) = feedback.get().get(index)
+                        && let Some(change) =
+                            cove_agent::revision::change_span(&entry.before, &entry.after)
+                    {
+                        rows.push(writing_change(
+                            "移除",
+                            &entry.before,
+                            change.before,
+                            TextTraits::STRIKETHROUGH,
+                        ));
+                        rows.push(writing_change(
+                            "增加",
+                            &entry.after,
+                            change.after,
+                            TextTraits::BOLD,
+                        ));
+                    }
+                    rows.push(study_field(
+                        "改前",
+                        record_field(feedback, index, |f| &f.before, |f, v| f.before = v),
+                        108.0,
+                    ));
+                    rows.push(study_field(
+                        "作者认可的改写",
+                        record_field(feedback, index, |f| &f.after, |f, v| f.after = v),
+                        108.0,
+                    ));
+                    rows.push(AnyView::new(Toggle::labeled(
+                        "暂停用于续写",
+                        record_toggle(feedback, index, |f| f.held, |f, v| f.held = v),
+                    )));
+                }
+            }
+            5 => {
+                rows.push(study_field("文风要求", ai.voice.binding(), 95.0));
+                rows.push(study_field("避免的词语或句式", ai.avoid.binding(), 75.0));
+                if ai
+                    .target
+                    .get()
+                    .is_some_and(|target| target.selection.is_some())
+                {
+                    let take = self.model.clone();
+                    rows.push(wrap_controls(vec![AnyView::new(Button::title(
+                        "用正文选区作为样段",
+                        move || take.ai_voice_from_selection(),
+                    ))]));
+                }
+                for (index, sample) in ai.voice_samples.get().iter().enumerate() {
+                    let remove = ai.voice_samples;
+                    rows.push(wrap_controls(vec![
+                        caption(sample.chars().take(90).collect::<String>()),
+                        AnyView::new(Button::title("移除此样段", move || {
+                            remove.update(|samples| {
+                                if index < samples.len() {
+                                    samples.remove(index);
+                                }
+                            })
+                        })),
+                    ]));
+                }
+            }
+            _ => {
+                rows.push(study_field("剧情大纲", ai.story_outline.binding(), 165.0));
+                rows.push(study_field("待续线索", ai.story_threads.binding(), 92.0));
+                rows.push(study_field("题材", ai.story_genre.binding(), 46.0));
+                rows.push(study_field("叙事口味", ai.story_tone.binding(), 62.0));
+                rows.push(study_field("创作方向", ai.story_direction.binding(), 82.0));
+                rows.push(study_field(
+                    "卡片之外的角色概览",
+                    ai.story_characters.binding(),
+                    82.0,
+                ));
+                rows.push(study_field(
+                    "角色说法与知情范围",
+                    ai.story_claims.binding(),
+                    100.0,
+                ));
+                rows.push(study_field(
+                    "私设与揭晓点 · 审稿用",
+                    ai.story_truth.binding(),
+                    100.0,
+                ));
+                rows.push(study_field("硬设定", ai.canon.binding(), 95.0));
             }
         }
         let save = self.model.clone();
         (
             rows,
-            primary("保存手记", true, move || save.save_ai_brief()),
+            primary("保存作品资料", true, move || save.save_ai_brief()),
         )
     }
 
@@ -310,6 +522,7 @@ impl AiPanel {
         &self,
         preview_context: Signal<bool>,
         show_controls: Signal<bool>,
+        show_beats: Signal<bool>,
     ) -> (Vec<AnyView>, AnyView) {
         let ai = &self.model.ai;
         let batch = ai.batch();
@@ -341,7 +554,7 @@ impl AiPanel {
                         })),
                     ],
                 ));
-                rows.push(assistant_message(answer));
+                rows.push(assistant_message(answer, turn.markdown));
             }
         }
         if let Some(batch) = &batch {
@@ -349,7 +562,7 @@ impl AiPanel {
                 rows.push(error_label(format!("无法保存对话。{error}")));
             }
             rows.push(author_message(&batch.prompt));
-            self.results(&mut rows, batch);
+            self.results(&mut rows, batch, show_beats);
         }
         let mode = if starts_continuation {
             WritingTask::Continue
@@ -436,18 +649,11 @@ impl AiPanel {
                 manage.manage_ai()
             })));
             rows.push(wrap_controls(model_controls));
-            if self.model.ai_work().is_some() {
-                let notes = self.model.clone();
-                let mut brief = vec![AnyView::new(Button::title("作品手记", move || {
-                    notes.edit_ai_brief()
-                }))];
-                if !self.model.ai_brief().is_empty() {
-                    brief.push(AnyView::new(Toggle::labeled(
-                        "采用手记",
-                        ai.use_brief.binding(),
-                    )));
-                }
-                rows.push(wrap_controls(brief));
+            if self.model.ai_work().is_some() && !self.model.ai_brief().is_empty() {
+                rows.push(AnyView::new(Toggle::labeled(
+                    "采用作品资料",
+                    ai.use_brief.binding(),
+                )));
             }
             if can_research && target.is_some() && !polishing {
                 let mut scopes = vec![
@@ -676,8 +882,34 @@ impl AiPanel {
                         })
                         .collect(),
                 ));
-                if let Some((label, content)) = sections.get(current) {
+                if current == 1 && !draft.profile.character_cards.is_empty() {
+                    let cards = draft
+                        .profile
+                        .character_cards
+                        .iter()
+                        .map(|card| {
+                            format!(
+                                "**{}**  \n表面 · {}  \n内核 · {}  \n防御 · {}  \n边界 · {}",
+                                card.name, card.surface, card.motive, card.defense, card.boundary
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    rows.push(AnyView::new(
+                        ScrollView::new(ScrollAxis::Vertical, MarkdownView::new(cards))
+                            .frame_height(185.0),
+                    ));
+                } else if let Some((label, content)) = sections.get(current) {
                     rows.push(text_box(label, TextBuffer::new(content), 145.0));
+                }
+                if !draft.profile.has_character_cards() {
+                    let retry = self.model.clone();
+                    rows.push(wrap_controls(vec![
+                        caption("请先核对角色姓名、动机及关系卡。"),
+                        AnyView::new(Button::title("重新提取角色卡", move || {
+                            retry.prepare_ai_story()
+                        })),
+                    ]));
                 }
                 let direction = self.model.ai.story_direction;
                 rows.push(AnyView::new(
@@ -697,7 +929,8 @@ impl AiPanel {
                 let edit = self.model.clone();
                 let ready = !direction.get().string_value().trim().is_empty()
                     && !draft.profile.genre.trim().is_empty()
-                    && !draft.profile.tone.trim().is_empty();
+                    && !draft.profile.tone.trim().is_empty()
+                    && draft.profile.has_character_cards();
                 let mut actions = vec![primary("确认并续写", ready, move || {
                     confirm.confirm_ai_story()
                 })];
@@ -716,7 +949,7 @@ impl AiPanel {
         }
     }
 
-    fn results(&self, rows: &mut Vec<AnyView>, batch: &Batch) {
+    fn results(&self, rows: &mut Vec<AnyView>, batch: &Batch, show_beats: Signal<bool>) {
         let selected = batch
             .target
             .as_ref()
@@ -756,8 +989,13 @@ impl AiPanel {
                     WritingStage::Review => "正在核对剧情连续性、视角和语气…",
                     WritingStage::Revise => "正在修订当前草稿…",
                 }));
-                if let Some(draft) = run.draft_in_progress() {
-                    rows.push(text_box("当前草稿", draft.text.clone(), 206.0));
+                if !run.streamed_text.is_empty() && !matches!(stage, WritingStage::Review) {
+                    rows.push(assistant_message(
+                        &run.streamed_text,
+                        batch.writing_task() == WritingTask::Request,
+                    ));
+                } else if let Some(draft) = run.draft_in_progress() {
+                    rows.push(assistant_message(&draft.text, false));
                 }
             }
             ModelStatus::Cancelled => rows.push(caption("已停止等待这个模型。")),
@@ -892,7 +1130,10 @@ impl AiPanel {
                             .frame_height((lines as f32 * 22.0 + 20.0).clamp(92.0, 230.0)),
                     ));
                 } else {
-                    rows.push(assistant_message(&result.text));
+                    rows.push(assistant_message(
+                        &result.text,
+                        result.task == WritingTask::Request,
+                    ));
                 }
                 rows.push(wrap_controls(controls));
                 if ai.show_previous.get()
@@ -947,6 +1188,36 @@ impl AiPanel {
                     }
                 }
                 self.review_candidate(rows, result, current, !batch.applied() && !batch.busy());
+                if let Some(plan) = result.scene_plan()
+                    && !plan.character_beats().is_empty()
+                {
+                    let shown = show_beats.get();
+                    rows.push(AnyView::new(Button::title(
+                        if shown {
+                            "收起场景推演"
+                        } else {
+                            "查看场景推演"
+                        },
+                        move || show_beats.set(!shown),
+                    )));
+                    if shown {
+                        for beat in plan.character_beats() {
+                            rows.push(vstack(
+                                4.0,
+                                Align::Stretch,
+                                vec![
+                                    AnyView::new(Text::runs(vec![TextRun::with_traits(
+                                        &beat.character,
+                                        TextTraits::BOLD,
+                                    )])),
+                                    caption(format!("触发 · {}", beat.trigger)),
+                                    caption(format!("反应 · {}", beat.surface_response)),
+                                    caption(format!("关系 · {}", beat.relation_effect)),
+                                ],
+                            ));
+                        }
+                    }
+                }
                 show_sources(rows, result, ai.viewed_source);
             }
         }
@@ -968,15 +1239,18 @@ impl AiPanel {
         }
         let changed = result.text != result.reviewed_text;
         let mut instructions = Vec::new();
+        if result.review.has_character_violation() {
+            rows.push(error_label(
+                "草稿偏离了角色卡或关系边界，修正后才能采纳。".to_owned(),
+            ));
+        }
         if result.review.has_disclosure() {
             rows.push(error_label(
                 "草稿泄露了尚不该揭晓的信息，核对修订后才能采纳。".to_owned(),
             ));
         }
         if result.needs_private_review() {
-            rows.push(caption(
-                "这部作品有作者私设，当前版本需要完成审稿才能采纳。",
-            ));
+            rows.push(caption("当前版本需要核对角色卡和知情边界，才能采纳。"));
         }
         if changed {
             rows.push(caption("草稿已编辑，可以重新审稿。"));
@@ -1044,9 +1318,156 @@ fn author_message(text: &TextBuffer) -> AnyView {
     hstack(0.0, Align::FlexStart, vec![spacer(), AnyView::new(bubble)])
 }
 
-fn assistant_message(text: &TextBuffer) -> AnyView {
+fn writing_change(
+    label: &str,
+    text: &str,
+    range: std::ops::Range<usize>,
+    style: TextTraits,
+) -> AnyView {
+    let start = text.floor_char_boundary(range.start.saturating_sub(105));
+    let end = text.floor_char_boundary((range.end + 105).min(text.len()));
+    let highlighted_end = text.floor_char_boundary((range.start + 620).min(range.end));
     AnyView::new(
-        Text::new(text.string_value())
+        vstack(
+            5.0,
+            Align::Stretch,
+            vec![
+                caption(label),
+                AnyView::new(Text::runs(vec![
+                    TextRun::new(&text[start..range.start]),
+                    TextRun::with_traits(&text[range.start..highlighted_end], style),
+                    TextRun::new(if highlighted_end < range.end {
+                        "…"
+                    } else {
+                        &text[range.end..end]
+                    }),
+                ])),
+            ],
+        )
+        .padding_edges(10.0, 7.0)
+        .semantic_background(SemanticColorRef::surface())
+        .corner_radius(7.0),
+    )
+}
+
+fn study_field(label: &str, value: Binding<TextBuffer>, height: f32) -> AnyView {
+    vstack(
+        4.0,
+        Align::Stretch,
+        vec![
+            caption(label),
+            AnyView::new(
+                TextField::new("", value)
+                    .multiline()
+                    .frame_height(height)
+                    .accessibility_label(label.to_owned()),
+            ),
+        ],
+    )
+}
+
+fn record_field<T: Clone + 'static>(
+    records: Signal<Vec<T>>,
+    index: usize,
+    read: fn(&T) -> &str,
+    write: fn(&mut T, String),
+) -> Binding<TextBuffer> {
+    Binding::new(
+        move || {
+            records.with_untracked(|items| {
+                items
+                    .get(index)
+                    .map_or_else(TextBuffer::empty, |item| TextBuffer::new(read(item)))
+            })
+        },
+        move |text: TextBuffer| {
+            records.update(|items| {
+                if let Some(item) = items.get_mut(index) {
+                    write(item, text.string_value());
+                }
+            })
+        },
+    )
+}
+
+fn record_toggle<T: Clone + 'static>(
+    records: Signal<Vec<T>>,
+    index: usize,
+    read: fn(&T) -> bool,
+    write: fn(&mut T, bool),
+) -> Binding<bool> {
+    Binding::new(
+        move || records.with_untracked(|items| items.get(index).is_some_and(read)),
+        move |checked| {
+            records.update(|items| {
+                if let Some(item) = items.get_mut(index) {
+                    write(item, checked);
+                }
+            })
+        },
+    )
+}
+
+fn record_picker<T: Clone + Default + 'static>(
+    rows: &mut Vec<AnyView>,
+    records: Signal<Vec<T>>,
+    selected: Signal<usize>,
+    add_title: &str,
+    title: impl Fn(&T) -> String,
+) -> Option<usize> {
+    let items = records.get();
+    let index = selected.get().min(items.len().saturating_sub(1));
+    let add = AnyView::new(Button::title(add_title, move || {
+        records.update(|items| {
+            items.push(T::default());
+            selected.set(items.len() - 1);
+        });
+    }));
+    if items.is_empty() {
+        rows.push(wrap_controls(vec![add]));
+        return None;
+    }
+    let title = |item| {
+        let text = title(item);
+        if text.trim().is_empty() {
+            "未命名".to_owned()
+        } else {
+            text
+        }
+    };
+    let entries = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            MenuEntry::Item(
+                MenuItem::new(i as u64 + 1, title(item), move || selected.set(i))
+                    .selected(i == index),
+            )
+        })
+        .collect();
+    rows.push(wrap_controls(vec![
+        chooser(title(&items[index]), entries, true),
+        add,
+        AnyView::new(Button::title("移除", move || {
+            records.update(|items| {
+                if index < items.len() {
+                    items.remove(index);
+                }
+            })
+        })),
+    ]));
+    Some(index)
+}
+
+fn assistant_message(text: &TextBuffer, markdown: bool) -> AnyView {
+    let text = text.string_value();
+    let message = if markdown {
+        AnyView::new(MarkdownView::new(text))
+    } else {
+        AnyView::new(Text::new(text))
+    };
+    AnyView::new(
+        message
             .padding_edges(10.0, 8.0)
             .semantic_background(SemanticColorRef::surface())
             .corner_radius(8.0),
@@ -1215,7 +1636,13 @@ impl View for AiPanel {
         }
         let preview = cx.state(|| false);
         let controls = cx.state(|| false);
-        let scroll = cx.remember(|| RefCell::new(None));
+        let show_beats = cx.state(|| false);
+        let scroll = cx.remember(|| RefCell::new(None::<(_, Option<ScrollRequest>)>));
+        let turn = cx.remember(|| Cell::new(None));
+        let brief_scroll = cx.remember(|| RefCell::new(None::<(_, ScrollRequest)>));
+        let follow_tail = cx.remember(|| Cell::new(true));
+        let last_geometry = cx.remember(|| Cell::new((0_f32, 0_f32)));
+        let jump = cx.state(|| 0_u64);
         let settings = self.model.ai.settings_open.get();
         let brief = self.model.ai.brief_open.get();
         let (mut rows, action) = if settings {
@@ -1223,7 +1650,7 @@ impl View for AiPanel {
         } else if brief {
             self.brief()
         } else {
-            self.writer(preview, controls)
+            self.writer(preview, controls, show_beats)
         };
         let error = self.model.ai.error.get();
         if !error.is_empty() && (settings || brief) {
@@ -1232,7 +1659,7 @@ impl View for AiPanel {
         let title = if settings {
             "AI 模型设置"
         } else if brief {
-            "作品手记"
+            "作品资料"
         } else {
             "写作对话"
         };
@@ -1251,6 +1678,12 @@ impl View for AiPanel {
             spacer(),
         ];
         if !settings && !brief && self.model.ai.target.get().is_some() {
+            if self.model.ai_work().is_some() {
+                let notes = self.model.clone();
+                header.push(AnyView::new(Button::title("作品资料", move || {
+                    notes.edit_ai_brief()
+                })));
+            }
             let import = self.model.clone();
             let export = self.model.clone();
             let busy = self.model.ai.batch().is_some_and(|batch| batch.busy());
@@ -1263,6 +1696,9 @@ impl View for AiPanel {
                     ),
                     MenuEntry::Item(MenuItem::new(2, "导出对话", move || {
                         export.export_ai_chat()
+                    })),
+                    MenuEntry::Item(MenuItem::new(3, "回到最新", move || {
+                        jump.update(|value| *value += 1);
                     })),
                 ],
                 true,
@@ -1295,24 +1731,60 @@ impl View for AiPanel {
                 Some(StoryStatus::Failed(_)) => (3, 0),
                 _ => (0, 0),
             };
-            let key = (
+            let batch = self.model.ai.batch();
+            let last_turn = (
                 self.model.document.get(),
-                controls.get(),
+                jump.get(),
                 story_stage,
-                self.model
-                    .ai
-                    .batch()
-                    .map(|batch| (batch.history.len(), batch.busy(), batch.applied())),
+                batch
+                    .as_ref()
+                    .map(|batch| (batch.history.len(), batch.applied())),
             );
+            let stream = batch.as_ref().and_then(|batch| {
+                batch
+                    .runs
+                    .get(self.model.ai.viewed_result.get())
+                    .map(|run| (run.streamed_text.utf8_length(), batch.busy()))
+            });
+            let key = (last_turn, controls.get(), stream);
+            let follow = follow_tail.clone();
+            let position = last_geometry.clone();
+            body = body.on_geometry_change(move |geometry| {
+                let end = (geometry.content_size.height - geometry.viewport_size.height).max(0.0);
+                let (previous_end, previous_y) = position.replace((end, geometry.offset.y));
+                if (end - previous_end).abs() < 1.0 && (geometry.offset.y - previous_y).abs() > 1.0
+                {
+                    follow.set(end - geometry.offset.y <= 30.0);
+                }
+            });
             let mut previous = scroll.borrow_mut();
             if previous.as_ref().is_none_or(|(last, _)| last != &key) {
-                *previous = Some((key, ScrollRequest::new(Point::new(0.0, 1.0e9), 0.0)));
+                if turn.replace(Some(last_turn)) != Some(last_turn) {
+                    follow_tail.set(true);
+                }
+                let request = follow_tail
+                    .get()
+                    .then(|| ScrollRequest::new(Point::new(0.0, 1.0e9), 0.0));
+                *previous = Some((key, request));
+            }
+            if let Some((_, Some(request))) = &*previous {
+                body = body.scroll_request(request.clone());
+            }
+        } else {
+            *scroll.borrow_mut() = None;
+            turn.set(None);
+        }
+        if brief {
+            let page = self.model.ai.brief_page.get();
+            let mut previous = brief_scroll.borrow_mut();
+            if previous.as_ref().is_none_or(|(prior, _)| *prior != page) {
+                *previous = Some((page, ScrollRequest::new(Point::new(0.0, 0.0), 0.0)));
             }
             if let Some((_, request)) = &*previous {
                 body = body.scroll_request(request.clone());
             }
         } else {
-            *scroll.borrow_mut() = None;
+            *brief_scroll.borrow_mut() = None;
         }
         let body = AnyView::new(body).flex_with(1.0, 1.0, Some(0.0));
         let footer = if settings || brief {
@@ -1333,17 +1805,11 @@ impl View for AiPanel {
             vstack(5.0, Align::Stretch, composer)
         }
         .padding_insets(EdgeInsets::new(8.0, 14.0, 10.0 + self.bottom_inset, 14.0));
-        AnyView::new(
-            vstack(
-                0.0,
-                Align::Stretch,
-                vec![
-                    AnyView::new(heading),
-                    AnyView::new(body),
-                    AnyView::new(footer),
-                ],
-            )
-            .fill(),
-        )
+        let mut panel = vec![AnyView::new(heading)];
+        if brief {
+            panel.push(self.brief_tabs());
+        }
+        panel.extend([AnyView::new(body), AnyView::new(footer)]);
+        AnyView::new(vstack(0.0, Align::Stretch, panel).fill())
     }
 }

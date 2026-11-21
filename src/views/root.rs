@@ -41,7 +41,7 @@ use crate::theme::Mode;
 pub const SIDEBAR_WIDTH: f32 = 216.0;
 pub const LIST_WIDTH: f32 = 300.0;
 pub const OUTLINE_WIDTH: f32 = 240.0;
-pub const AI_PANEL_WIDTH: f32 = 380.0;
+pub const AI_PANEL_WIDTH: f32 = 416.0;
 pub const AI_DOCK_MIN_WIDTH: f32 = 820.0;
 /// Below this width one pane shows at a time.
 pub const SINGLE_PANE_WIDTH: f32 = 640.0;

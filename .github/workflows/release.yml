@@ -58,6 +58,9 @@ jobs:
           path: Cove
           submodules: recursive
 
+      - name: Apply Cove agent changes
+        run: git show HEAD:patches/cove-agent-streaming.patch | git -C ../Cove apply -
+
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
 

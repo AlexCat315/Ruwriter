@@ -22,6 +22,8 @@ struct Archive {
 #[derive(Serialize, Deserialize)]
 struct Turn {
     id: String,
+    #[serde(default)]
+    markdown: bool,
     author: String,
     answer: Option<String>,
     adopted: bool,
@@ -41,6 +43,7 @@ pub fn encode(turns: &[ChatTurn]) -> io::Result<Vec<u8>> {
             .iter()
             .map(|turn| Turn {
                 id: turn.id.clone(),
+                markdown: turn.markdown,
                 author: turn.author.string_value(),
                 answer: turn.answer.as_ref().map(TextBuffer::string_value),
                 adopted: turn.adopted,
@@ -84,6 +87,7 @@ pub fn decode(path: &Path) -> io::Result<Vec<ChatTurn>> {
         .into_iter()
         .map(|turn| ChatTurn {
             id: turn.id,
+            markdown: turn.markdown,
             author: TextBuffer::new(&turn.author),
             answer: turn.answer.map(|answer| TextBuffer::new(&answer)),
             adopted: turn.adopted,
@@ -193,6 +197,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let original = ChatTurn {
             id: new_id(),
+            markdown: true,
             author: TextBuffer::new("再写一段"),
             answer: Some(TextBuffer::new("她问我什么时候回来。")),
             adopted: false,
@@ -212,6 +217,7 @@ mod tests {
         save(root.path(), "uid:1", std::slice::from_ref(&original), None).unwrap();
         let mut reopened = load(root.path(), "uid:1").unwrap();
         assert!(reopened[0].adopted);
+        assert!(reopened[0].markdown);
         assert_eq!(
             reopened[0].answer.as_ref().unwrap().string_value(),
             "她问我什么时候回来。"

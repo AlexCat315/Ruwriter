@@ -219,6 +219,7 @@ pub struct ModelRun {
     pub revision_error: Option<AgentError>,
     revising: Option<Box<WritingResult>>,
     draft_preview: Option<Box<WritingResult>>,
+    pub streamed_text: TextBuffer,
 }
 
 impl ModelRun {
@@ -245,6 +246,7 @@ impl ModelRun {
             before,
             after,
             instruction,
+            ..Default::default()
         })
     }
 }
@@ -266,6 +268,7 @@ pub enum StoryStatus {
 #[derive(Clone)]
 pub struct ChatTurn {
     pub id: String,
+    pub markdown: bool,
     pub author: TextBuffer,
     pub answer: Option<TextBuffer>,
     pub adopted: bool,
@@ -315,6 +318,7 @@ impl Batch {
         };
         Arc::make_mut(&mut history).push(ChatTurn {
             id: self.turn_id.clone(),
+            markdown: self.task == WritingTask::Request,
             author: self.prompt.clone(),
             answer,
             adopted: self.applied(),
@@ -355,30 +359,35 @@ impl WritingResult {
             && (self.task == WritingTask::Request
                 || (!matches!(self.review, Review::Rejected)
                     && !self.review.has_disclosure()
+                    && !self.review.has_character_violation()
                     && !self.needs_private_review()
                     && !ai_continuation::is_non_prose(&text)))
     }
 
     pub fn needs_private_review(&self) -> bool {
-        !self
-            .draft_context
-            .brief
-            .story
-            .author_truth
-            .trim()
-            .is_empty()
+        let story = &self.draft_context.brief.story;
+        (story.has_character_cards() || !story.author_truth.trim().is_empty())
             && (!matches!(self.review, Review::Checked(_))
                 || !self.text.has_same_contents(&self.reviewed_text))
     }
 
-    fn revise_checked_issues(&mut self, model: &AgentModel, on_revision: impl FnOnce()) {
+    pub(crate) fn scene_plan(&self) -> Option<&ScenePlan> {
+        self.draft_context.plan.as_ref()
+    }
+
+    fn revise_checked_issues(
+        &mut self,
+        model: &AgentModel,
+        writer: &AgentModel,
+        on_revision: impl FnOnce(),
+    ) {
         let Some(direction) = self.review_revision_instruction() else {
             return;
         };
         on_revision();
         let context = &self.draft_context;
         let Ok(candidate) = context.revise(
-            model,
+            writer,
             &self.text.string_value(),
             &self.sources,
             &self.revisions,
@@ -412,6 +421,7 @@ struct WritingJob {
     target: Option<WritingTarget>,
     brief: WritingBrief,
     history: Arc<Vec<ChatTurn>>,
+    preview_model: Option<AgentModel>,
 }
 
 #[derive(Clone)]
@@ -442,6 +452,12 @@ pub struct AiState {
     pub story_claims: Signal<TextBuffer>,
     pub story_truth: Signal<TextBuffer>,
     pub story_page: Signal<usize>,
+    pub story_cards: Signal<Vec<ruwriter_core::CharacterCard>>,
+    pub story_relationships: Signal<Vec<ruwriter_core::RelationshipCard>>,
+    pub writing_memories: Signal<Vec<ruwriter_core::WritingMemory>>,
+    pub reviewed_feedback: Signal<Vec<WritingFeedback>>,
+    pub brief_page: Signal<usize>,
+    pub brief_item: Signal<usize>,
     pub avoid: Signal<TextBuffer>,
     pub endpoint: Signal<TextBuffer>,
     pub model: Signal<TextBuffer>,
@@ -499,6 +515,12 @@ impl AiState {
             story_claims: cx.state(TextBuffer::empty),
             story_truth: cx.state(TextBuffer::empty),
             story_page: cx.state(|| 0),
+            story_cards: cx.state(Vec::new),
+            story_relationships: cx.state(Vec::new),
+            writing_memories: cx.state(Vec::new),
+            reviewed_feedback: cx.state(Vec::new),
+            brief_page: cx.state(|| 0),
+            brief_item: cx.state(|| 0),
             avoid: cx.state(TextBuffer::empty),
             endpoint: cx.state(|| TextBuffer::new(&profile.endpoint)),
             model: cx.state(|| TextBuffer::new(&profile.model)),
@@ -907,6 +929,7 @@ impl AiState {
                 for run in &mut batch.runs {
                     if run.status.pending() {
                         run.draft_preview = None;
+                        run.streamed_text = TextBuffer::empty();
                         run.status = run
                             .revising
                             .take()
@@ -999,9 +1022,9 @@ impl AiState {
             .into_iter()
             .enumerate()
             .map(|(index, profile)| {
-                let status = match self.model_adapter(&profile) {
+                let status = match self.configured_model(&profile) {
                     Ok(model) => {
-                        models.push((index, profile.tools, model));
+                        models.push((index, profile.tools, Arc::new(model)));
                         if research.is_some() {
                             ModelStatus::Indexing
                         } else {
@@ -1017,6 +1040,7 @@ impl AiState {
                     revision_error: None,
                     revising: None,
                     draft_preview: None,
+                    streamed_text: TextBuffer::empty(),
                 }
             })
             .collect();
@@ -1071,6 +1095,7 @@ impl AiState {
             target,
             brief,
             history,
+            preview_model: None,
         };
         std::thread::Builder::new()
             .name("ruwriter-writing-agent".into())
@@ -1092,13 +1117,20 @@ impl AiState {
                     }
                 };
                 std::thread::scope(|scope| {
-                    for (index, tools, model) in models {
-                        let model = cancellable(model, &flag);
+                    for (index, tools, adapter) in models {
+                        let model = buffered_model(adapter.clone(), &flag);
                         let worker_flag = flag.clone();
                         let worker_sender = sender.clone();
                         let worker_key = key.clone();
-                        let (prompt, context, research, job) =
+                        let (prompt, context, research, mut job) =
                             (&prompt, context.clone(), research.clone(), job.clone());
+                        job.preview_model = Some(streamed_model(
+                            adapter,
+                            &worker_sender,
+                            &worker_key,
+                            &worker_flag,
+                            index,
+                        ));
                         let worker = std::thread::Builder::new()
                             .name(format!("ruwriter-model-{index}"))
                             .spawn_scoped(scope, move || {
@@ -1125,6 +1157,8 @@ impl AiState {
                                                 batch.runs[index].status =
                                                     ModelStatus::Running(stage);
                                                 batch.runs[index].draft_preview = draft;
+                                                batch.runs[index].streamed_text =
+                                                    TextBuffer::empty();
                                             },
                                         );
                                     },
@@ -1136,6 +1170,7 @@ impl AiState {
                                     move |batch| {
                                         let run = &mut batch.runs[index];
                                         run.draft_preview = None;
+                                        run.streamed_text = TextBuffer::empty();
                                         run.status = match result {
                                             Ok(result) => ModelStatus::Ready(Box::new(result)),
                                             Err(error) => ModelStatus::Failed(error),
@@ -1172,14 +1207,18 @@ impl AiState {
     }
 
     fn model_adapter(&self, profile: &AiPreferences) -> Result<AgentModel, AgentError> {
+        Ok(self.configured_model(profile)?.into_agent_model())
+    }
+
+    fn configured_model(
+        &self,
+        profile: &AiPreferences,
+    ) -> Result<ChatCompletionsModel, AgentError> {
         let key = self.saved_key(&profile.endpoint).string_value();
         if requires_key(&profile.endpoint) && key.is_empty() {
             return Err(AgentError::HttpStatus(401));
         }
-        Ok(
-            ChatCompletionsModel::new(&profile.endpoint, &profile.model, Some(&key))?
-                .into_agent_model(),
-        )
+        ChatCompletionsModel::new(&profile.endpoint, &profile.model, Some(&key))
     }
 
     pub fn refine(&self, index: usize, revision: Option<String>) -> Result<(), AgentError> {
@@ -1200,7 +1239,7 @@ impl AiState {
         {
             return Ok(());
         }
-        let model = self.model_adapter(&run.profile)?;
+        let adapter = Arc::new(self.configured_model(&run.profile)?);
         let draft = (**current).clone();
         if draft.text.string_value().trim().is_empty() {
             return Err(AgentError::Model("请先填入要修改的草稿。".to_owned()));
@@ -1234,15 +1273,20 @@ impl AiState {
         let sender = self.batches.sender();
         let worker_key = key.clone();
         let worker_flag = flag.clone();
-        let model = cancellable(model, &flag);
+        let model = buffered_model(adapter.clone(), &flag);
+        let writer = streamed_model(adapter, &sender, &key, &flag, index);
         if let Err(error) = std::thread::Builder::new()
             .name("ruwriter-draft-refinement".into())
             .spawn(move || {
-                let reviewed = refine_candidate(&model, draft, revision.as_deref(), || {
-                    update_batch(&sender, &worker_key, &worker_flag, move |batch| {
-                        batch.runs[index].status = ModelStatus::Running(WritingStage::Review);
+                let reviewed =
+                    refine_candidate(&model, &writer, draft, revision.as_deref(), |draft| {
+                        let preview = Box::new(draft.clone());
+                        update_batch(&sender, &worker_key, &worker_flag, move |batch| {
+                            batch.runs[index].status = ModelStatus::Running(WritingStage::Review);
+                            batch.runs[index].draft_preview = Some(preview);
+                            batch.runs[index].streamed_text = TextBuffer::empty();
+                        });
                     });
-                });
                 update_batch(&sender, &worker_key, &worker_flag, move |batch| {
                     finish_refinement(&mut batch.runs[index], reviewed, revising);
                 });
@@ -1263,6 +1307,8 @@ impl AiState {
 }
 
 fn finish_refinement(run: &mut ModelRun, result: Result<WritingResult, AgentError>, revised: bool) {
+    run.streamed_text = TextBuffer::empty();
+    run.draft_preview = None;
     let backup = run.revising.take();
     match result {
         Ok(result) => {
@@ -1282,13 +1328,14 @@ fn finish_refinement(run: &mut ModelRun, result: Result<WritingResult, AgentErro
 
 fn refine_candidate(
     model: &AgentModel,
+    writer: &AgentModel,
     mut draft: WritingResult,
     revision: Option<&str>,
-    review_started: impl FnOnce(),
+    review_started: impl FnOnce(&WritingResult),
 ) -> Result<WritingResult, AgentError> {
     if let Some(revision) = revision {
         let revised = draft.draft_context.revise(
-            model,
+            writer,
             &draft.text.string_value(),
             &draft.sources,
             &draft.revisions,
@@ -1297,7 +1344,7 @@ fn refine_candidate(
         Arc::make_mut(&mut draft.revisions).push(revision.to_owned());
         draft.text = TextBuffer::new(&revised);
         draft.original_text = draft.text.clone();
-        review_started();
+        review_started(&draft);
     }
     let text = draft.text.string_value();
     draft.repetition_warning = draft.draft_context.local_warning(&text, &draft.sources);
@@ -1309,9 +1356,57 @@ fn refine_candidate(
     }
     draft.reviewed_text = draft.text.clone();
     if revision.is_some() {
-        draft.revise_checked_issues(model, || {});
+        draft.revise_checked_issues(model, model, || {});
     }
     Ok(draft)
+}
+
+fn buffered_model(adapter: Arc<ChatCompletionsModel>, flag: &Arc<AtomicBool>) -> AgentModel {
+    cancellable(
+        Arc::new(move |messages, tools| adapter.complete(messages, tools)),
+        flag,
+    )
+}
+
+fn streamed_model(
+    adapter: Arc<ChatCompletionsModel>,
+    sender: &SignalSender<Workspaces>,
+    key: &WorkspaceKey,
+    token: &Arc<AtomicBool>,
+    index: usize,
+) -> AgentModel {
+    let (sender, key, token) = (sender.clone(), key.clone(), token.clone());
+    Arc::new(move |messages, tools| {
+        if token.load(Ordering::Relaxed) {
+            return Err(AgentError::Model("请求已取消。".to_owned()));
+        }
+        update_batch(&sender, &key, &token, move |batch| {
+            batch.runs[index].streamed_text = TextBuffer::empty();
+        });
+        let mut text = String::new();
+        let mut published = None;
+        let publish = |text: &str| {
+            let snapshot = TextBuffer::new(text);
+            update_batch(&sender, &key, &token, move |batch| {
+                batch.runs[index].streamed_text = snapshot;
+            });
+        };
+        let result = adapter.complete_stream(messages, tools, |delta| {
+            if token.load(Ordering::Relaxed) {
+                return false;
+            }
+            text.push_str(delta);
+            if published.is_none_or(|last: std::time::Instant| last.elapsed().as_millis() >= 50) {
+                publish(&text);
+                published = Some(std::time::Instant::now());
+            }
+            true
+        });
+        if result.is_ok() && !text.is_empty() {
+            publish(&text);
+        }
+        result
+    })
 }
 
 fn cancellable(model: AgentModel, flag: &Arc<AtomicBool>) -> AgentModel {
@@ -1394,10 +1489,13 @@ fn run_writing_agent(
         target,
         brief,
         history,
+        preview_model,
     } = job;
+    let writer = preview_model.as_ref().unwrap_or(&model);
     let continuing = task == WritingTask::Continue;
     let mut brief = brief;
     brief.feedback = ai_voice::select_feedback(prompt, &context, &brief.feedback);
+    brief.memories = ai_voice::select_memories(prompt, &context, &brief.memories);
     let voice_samples = ai_voice::select_samples(&context, &brief.voice_samples);
     if continuing && context.trim().is_empty() {
         return Err(AgentError::Model("续写需要落笔位置之前的正文。".to_owned()));
@@ -1457,6 +1555,9 @@ fn run_writing_agent(
         }
         if !brief.feedback.is_empty() {
             request["accepted_revisions"] = json!(brief.feedback);
+        }
+        if !brief.memories.is_empty() {
+            request["confirmed_memories"] = json!(brief.memories);
         }
         if !brief.canon.trim().is_empty() {
             request["canon"] = json!(brief.canon);
@@ -1560,7 +1661,11 @@ fn run_writing_agent(
         } else {
             MAX_TOOL_ROUNDS
         },
-        model.clone(),
+        if continuing {
+            model.clone()
+        } else {
+            writer.clone()
+        },
     )?;
     progress(WritingProgress::Stage(if plan_scene || researching {
         WritingStage::Research
@@ -1578,19 +1683,17 @@ fn run_writing_agent(
         );
     let source_texts: Vec<_> = sources.iter().map(|source| source.text.as_str()).collect();
     let plan = if continuing {
-        ScenePlan::parse(&first).map(|mut plan| {
-            plan.keep_grounded(&context, &source_texts, brief.feedback.len());
-            plan
-        })
+        let mut plan = ScenePlan::parse(&first).ok_or_else(|| {
+            AgentError::Model("模型没能整理出接续计划。可以重试，或先补充这一场的走向。".to_owned())
+        })?;
+        plan.keep_grounded(&context, &source_texts, &brief);
+        Some(plan)
     } else {
         None
     };
-    let mut continuity_notes = plan
+    let continuity_notes = plan
         .as_ref()
         .map_or_else(Vec::new, |plan| plan.conflicts.clone());
-    if plan_scene && plan.is_none() {
-        continuity_notes.push("接续计划未能解析。请在采纳前核对章节设定。".to_owned());
-    }
     let recent = if continuing {
         target
             .as_ref()
@@ -1611,7 +1714,7 @@ fn run_writing_agent(
             .chain(source_texts)
             .collect();
         ai_continuation::draft(
-            &model,
+            writer,
             prompt,
             &context,
             plan.clone(),
@@ -1673,7 +1776,7 @@ fn run_writing_agent(
         if matches!(result.review, Review::Rejected) {
             progress(WritingProgress::Stage(WritingStage::Draft));
             let prose = result.draft_context.revise(
-                &model,
+                writer,
                 "",
                 &result.sources,
                 &result.revisions,
@@ -1693,7 +1796,7 @@ fn run_writing_agent(
                 return Err(AgentError::Model(ai_continuation::INVALID_DRAFT.to_owned()));
             }
         } else {
-            result.revise_checked_issues(&model, || {
+            result.revise_checked_issues(&model, writer, || {
                 progress(WritingProgress::Stage(WritingStage::Revise))
             });
         }
@@ -1716,6 +1819,11 @@ mod tests {
                 genre: "悬疑".into(),
                 tone: "克制".into(),
                 direction: "让来访者继续说话".into(),
+                character_cards: vec![ruwriter_core::CharacterCard {
+                    name: "说话人".into(),
+                    motive: "弄清来访者来意".into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             ..Default::default()
@@ -1749,12 +1857,14 @@ mod tests {
         let history = Arc::new(vec![
             ChatTurn {
                 id: ai_chat::new_id(),
+                markdown: true,
                 author: TextBuffer::new("银匣交给了谁？"),
                 answer: Some(TextBuffer::new("交给了晏澄。")),
                 adopted: false,
             },
             ChatTurn {
                 id: ai_chat::new_id(),
+                markdown: true,
                 author: TextBuffer::new("这一条没有答复"),
                 answer: None,
                 adopted: false,
@@ -1932,14 +2042,16 @@ mod tests {
             revision_error: None,
             revising: Some(Box::new(result.clone())),
             draft_preview: None,
+            streamed_text: TextBuffer::empty(),
         };
         finish_refinement(&mut run, Err(AgentError::HttpStatus(503)), true);
         assert!(matches!(&run.status, ModelStatus::Ready(draft) if draft.text == current));
         let refined = refine_candidate(
             &model,
+            &model,
             result.clone(),
             Some("保留缰绳，交代骡子往哪走"),
-            || {},
+            |_| {},
         )
         .unwrap();
         run.revising = Some(Box::new(result));
@@ -2045,6 +2157,7 @@ mod tests {
             instruction: "人物在回避时保留含糊".into(),
             before: "她把身世都说了。".into(),
             after: "她只摇了摇头。".into(),
+            ..Default::default()
         });
         let model: AgentModel = Arc::new(move |messages, _| {
             let input: serde_json::Value = serde_json::from_str(&messages[1].text).unwrap();
@@ -2093,6 +2206,123 @@ mod tests {
             "她把平板扣了过去。我没再往下问。"
         );
         assert!(revised.can_adopt());
+    }
+
+    #[test]
+    fn an_unreadable_scene_plan_never_starts_the_writer() {
+        let planning: AgentModel = Arc::new(|_, _| Ok(AgentReply::Answer("我打算接着写。".into())));
+        let writer: AgentModel = Arc::new(|_, _| panic!("writer started without a scene plan"));
+        let result = run_writing_agent(
+            planning,
+            "续写",
+            "她把钥匙放到了门口。".into(),
+            false,
+            None,
+            WritingJob {
+                task: WritingTask::Continue,
+                brief: story_brief(),
+                preview_model: Some(writer),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert!(matches!(result, Err(AgentError::Model(reason)) if reason.contains("接续计划")));
+    }
+
+    #[test]
+    fn a_scene_cannot_be_adopted_if_it_reverses_the_confirmed_character_motive() {
+        let mut brief = story_brief();
+        brief.story.character_cards = vec![
+            ruwriter_core::CharacterCard {
+                name: "李明".into(),
+                surface: "看似在意实用和生计".into(),
+                motive: "理想主义被现实压制，仍然珍惜创作".into(),
+                ..Default::default()
+            },
+            ruwriter_core::CharacterCard {
+                name: "赵玥".into(),
+                motive: "希望真实喜欢的画被认同".into(),
+                defense: "被说太艺术后，把认真创作说成闲画".into(),
+                ..Default::default()
+            },
+        ];
+        brief.story.relationships = vec![ruwriter_core::RelationshipCard {
+            from: "李明".into(),
+            to: "赵玥".into(),
+            state: "她刚收起平板".into(),
+            direction: "通过理解她的热爱建立信任".into(),
+            boundary: "此处不以卖钱衡量她的画".into(),
+        }];
+        let scene = "“这是不是有些太‘艺术’了？”\n“这些东西平时闲着没事干画着玩的。”\n她收起了平板，重新回沙发上。";
+        let wrong = "“你这画，卖过钱没有？”";
+        let grounded = "我望着她膝上的平板。“刚才那张，能再让我看看吗？”";
+
+        for repair_works in [true, false] {
+            let model: AgentModel = Arc::new(move |messages, _| {
+                let input: serde_json::Value = serde_json::from_str(&messages[1].text).unwrap();
+                assert_eq!(input["story"]["character_cards"][0]["name"], "李明");
+                assert_eq!(input["story"]["relationships"][0]["to"], "赵玥");
+                let reply = if input.get("scene_before_caret").is_some() {
+                    json!({
+                        "carry_from": "赵玥把平板收起",
+                        "settled": ["她已展示过画"],
+                        "advance_to": "李明用具体观察表达兴趣",
+                        "character_beats": [{
+                            "character": "李明",
+                            "trigger": "她因太艺术而收起平板",
+                            "surface_response": "请她再展示一下",
+                            "relation_effect": "让她感到他认真看过"
+                        }]
+                    })
+                    .to_string()
+                } else if input.get("author_truth_for_review_only").is_some() {
+                    assert_eq!(
+                        input["continuity"]["character_beats"][0]["character"],
+                        "李明"
+                    );
+                    let issues = if input["candidate"] == wrong {
+                        json!([{
+                            "kind": "character",
+                            "character": "李明",
+                            "quote": "卖过钱没有",
+                            "reason": "用商业价值评判她刚刚试图藏起来的热爱"
+                        }])
+                    } else {
+                        json!([])
+                    };
+                    json!({"usable":true,"issues":issues}).to_string()
+                } else if let Some(instruction) = input["revision"].as_str() {
+                    assert!(instruction.contains("李明") && instruction.contains("卖过钱没有"));
+                    if repair_works { grounded } else { wrong }.into()
+                } else {
+                    assert_eq!(
+                        input["continuity"]["character_beats"][0]["character"],
+                        "李明"
+                    );
+                    wrong.into()
+                };
+                Ok(AgentReply::Answer(reply))
+            });
+            let result = run_writing_agent(
+                model,
+                "续写",
+                scene.into(),
+                false,
+                None,
+                WritingJob {
+                    task: WritingTask::Continue,
+                    brief: brief.clone(),
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .unwrap();
+            assert_eq!(result.can_adopt(), repair_works);
+            assert_eq!(
+                result.text.string_value(),
+                if repair_works { grounded } else { wrong }
+            );
+        }
     }
 
     #[test]

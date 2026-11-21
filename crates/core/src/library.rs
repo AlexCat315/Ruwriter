@@ -281,6 +281,8 @@ pub struct WritingBrief {
     pub story: StoryProfile,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub feedback: Vec<WritingFeedback>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<WritingMemory>,
 }
 
 impl WritingBrief {
@@ -291,6 +293,7 @@ impl WritingBrief {
             && self.voice_samples.is_empty()
             && self.story.is_empty()
             && self.feedback.is_empty()
+            && self.memories.is_empty()
     }
 }
 
@@ -304,6 +307,10 @@ pub struct StoryProfile {
     pub tone: String,
     pub direction: String,
     pub character_claims: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub character_cards: Vec<CharacterCard>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<RelationshipCard>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub author_truth: String,
 }
@@ -318,10 +325,29 @@ impl StoryProfile {
             && !self.genre.trim().is_empty()
             && !self.tone.trim().is_empty()
             && !self.direction.trim().is_empty()
+            && self.has_character_cards()
     }
 
     pub fn has_material(&self) -> bool {
-        !self.outline.trim().is_empty() && !self.characters.trim().is_empty()
+        !self.outline.trim().is_empty()
+            && (!self.characters.trim().is_empty() || !self.character_cards.is_empty())
+    }
+
+    pub fn has_character_cards(&self) -> bool {
+        let mut names = BTreeSet::new();
+        !self.character_cards.is_empty()
+            && self.character_cards.iter().all(|card| {
+                !card.name.trim().is_empty()
+                    && !card.motive.trim().is_empty()
+                    && names.insert(card.name.trim())
+            })
+            && self.relationships.iter().all(|edge| {
+                let (from, to) = (edge.from.trim(), edge.to.trim());
+                from != to
+                    && names.contains(from)
+                    && names.contains(to)
+                    && !edge.direction.trim().is_empty()
+            })
     }
 
     pub fn public_view(&self) -> Self {
@@ -332,11 +358,47 @@ impl StoryProfile {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CharacterCard {
+    pub name: String,
+    pub surface: String,
+    pub motive: String,
+    pub defense: String,
+    pub boundary: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RelationshipCard {
+    pub from: String,
+    pub to: String,
+    pub state: String,
+    pub direction: String,
+    pub boundary: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WritingFeedback {
     pub instruction: String,
     pub before: String,
     pub after: String,
+    pub subject: String,
+    pub lesson: String,
+    pub source: String,
+    pub held: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WritingMemory {
+    pub title: String,
+    pub subject: String,
+    pub text: String,
+    pub source: String,
+    pub pinned: bool,
+    pub held: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
