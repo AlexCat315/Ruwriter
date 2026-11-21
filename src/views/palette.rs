@@ -55,7 +55,14 @@ impl View for Palette {
                 icons::status::sparkles(),
                 Rc::new(Model::open_ai),
             )
-            .keywords(["agent", "ai", "润色", "续写", "摘要", "提纲"]),
+            .keywords(["agent", "ai", "润色", "摘要", "提纲"]),
+            command(
+                "AI 续写…",
+                "写作",
+                icons::status::sparkles(),
+                Rc::new(Model::open_ai_continuation),
+            )
+            .keywords(["继续写", "接着写", "xuxie", "continue"]),
             command(
                 "云同步…",
                 "文稿",

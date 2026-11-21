@@ -1541,6 +1541,7 @@ dependencies = [
  "cove-ui",
  "libc",
  "ruwriter-core",
+ "serde",
  "serde_json",
  "tempfile",
 ]

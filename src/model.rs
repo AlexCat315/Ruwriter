@@ -32,7 +32,7 @@ use ruwriter_core::{
     SortOrder, WritingStats, count, heading_at, headings, parse_tags,
 };
 
-use crate::ai::{AiState, ModelStatus, WritingTarget};
+use crate::ai::{AiState, ModelStatus, WritingTarget, WritingTask};
 use crate::ai_research::{ManuscriptFile, ResearchRequest, ResearchScope};
 use crate::formatting::{self, Command};
 
@@ -842,6 +842,14 @@ impl Model {
     }
 
     pub fn open_ai(&self) {
+        self.open_ai_task(WritingTask::Request);
+    }
+
+    pub fn open_ai_continuation(&self) {
+        self.open_ai_task(WritingTask::Continue);
+    }
+
+    fn open_ai_task(&self, task: WritingTask) {
         if self.ai.open.get_untracked() {
             return;
         }
@@ -866,18 +874,22 @@ impl Model {
         let context = target
             .as_ref()
             .map_or_else(|| Ok(TextBuffer::empty()), WritingTarget::context);
-        self.ai.include_context.set(
-            target
-                .as_ref()
-                .is_some_and(|target| target.selection.is_some())
-                && context.as_ref().is_ok_and(|text| !text.is_empty()),
-        );
+        let attach = target.as_ref().is_some_and(|target| {
+            if task == WritingTask::Continue {
+                target
+                    .continuation_context()
+                    .is_ok_and(|text| !text.is_empty())
+            } else {
+                target.selection.is_some() && context.as_ref().is_ok_and(|text| !text.is_empty())
+            }
+        });
+        self.ai.include_context.set(attach);
         self.ai.context.set(context);
         self.ai.scope.set(ResearchScope::Excerpt);
         self.ai.viewed_source.set(None);
         self.ai.target.set(target);
         self.ai.prompt.set(TextBuffer::empty());
-        self.ai.continuing.set(false);
+        self.ai.task.set(task);
         self.ai.error.set(String::new());
         self.ai.open.set(true);
         self.revision.update(|value| *value += 1);
@@ -1055,7 +1067,11 @@ impl Model {
 
     pub fn run_ai(&self) {
         let result = (|| {
-            let scope = self.ai.scope.get_untracked();
+            let scope = if self.ai.task.get_untracked() == WritingTask::Polish {
+                ResearchScope::Excerpt
+            } else {
+                self.ai.scope.get_untracked()
+            };
             let prepared = self
                 .read(|session| {
                     let settings = session.ai_preferences();
@@ -1154,6 +1170,11 @@ impl Model {
         let Some(ModelStatus::Ready(result)) = batch.runs.get(index).map(|run| &run.status) else {
             return;
         };
+        if (result.task == WritingTask::Continue && replace)
+            || (result.task == WritingTask::Polish && !replace)
+        {
+            return;
+        }
         let current = self.buffer.get_untracked();
         if self.ai_document().as_ref() != Some(&target.document) || current != target.buffer {
             self.ai
@@ -1170,6 +1191,9 @@ impl Model {
             target.insertion..target.insertion
         };
         let text = result.text.string_value();
+        if text.trim().is_empty() {
+            return;
+        }
         let start = current.utf8_offset_for_character_index(range.start);
         let updated = current.replace(range.clone(), &text);
         let caret = updated.character_index_for_utf8_offset(start + text.len());

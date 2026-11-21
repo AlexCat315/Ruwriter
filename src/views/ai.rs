@@ -15,7 +15,7 @@ use cove_ui::core::{Binding, Signal};
 use ruwriter_core::{AiPreferences, AiSettings, MAX_PARALLEL_AI_MODELS};
 
 use super::ui::{hstack, spacer, vstack};
-use crate::ai::{AiState, Batch, Catalog, ModelStatus, WritingResult, requires_key};
+use crate::ai::{AiState, Batch, Catalog, ModelStatus, WritingResult, WritingTask, requires_key};
 use crate::ai_research::ResearchScope;
 use crate::model::Model;
 
@@ -23,21 +23,24 @@ pub struct AiDialog {
     pub model: Model,
 }
 
-const WRITING_ACTIONS: [(&str, Option<&str>); 5] = [
-    (
-        "润色",
-        Some("润色提供的文稿片段，保留事实、人物和叙述视角。只给出润色后的正文。"),
-    ),
-    ("续写", None),
+const WRITING_ACTIONS: [(&str, WritingTask, Option<&str>); 5] = [
+    ("续写", WritingTask::Continue, None),
+    ("润色", WritingTask::Polish, None),
     (
         "摘要",
+        WritingTask::Request,
         Some("概括当前文稿片段（或当前章节）的主要事件和人物进展。"),
     ),
-    ("提纲", Some("根据当前文稿片段（或当前章节）提取章节提纲。")),
+    (
+        "提纲",
+        WritingTask::Request,
+        Some("根据当前文稿片段（或当前章节）提取章节提纲。"),
+    ),
     (
         "查连续性",
+        WritingTask::Request,
         Some(
-            "对照授权范围内的前文，检查当前文稿片段（或当前章节）涉及的人物、时间线、物品归属和未收束伏笔。优先报告有原文证据的冲突，附上引用和修订建议；如证据不足，请指出具体缺口。",
+            "对照前文，检查人物、时间线、物品归属和未收束伏笔。优先报告有原文证据的冲突，附上引用和修订建议。证据不足时指出缺口。",
         ),
     ),
 ];
@@ -228,7 +231,9 @@ impl AiDialog {
         let batch = ai.batch.get();
         let busy = batch.as_ref().is_some_and(Batch::busy);
         let chosen = ai.include_context.get();
-        let continuing = ai.continuing.get();
+        let mode = ai.task.get();
+        let continuing = mode == WritingTask::Continue;
+        let polishing = mode == WritingTask::Polish;
         let general_context = ai.context.get();
         let has_general_context = general_context.as_ref().is_ok_and(|text| !text.is_empty());
         let target = ai.target.get();
@@ -253,29 +258,23 @@ impl AiDialog {
                 .iter()
                 .all(|&index| preferences.models[index].tools);
         let scope = ai.scope.get();
-        let researching = scope != ResearchScope::Excerpt;
+        let researching = !polishing && scope != ResearchScope::Excerpt;
         let folder = self.model.ai_project_folder();
         let actions: Vec<_> = WRITING_ACTIONS
             .into_iter()
-            .filter(|(label, _)| researching || *label != "查连续性")
-            .map(|(label, prompt)| {
-                let continuation = prompt.is_none();
-                let enabled = if continuation {
-                    target.is_some()
-                } else {
-                    has_general_context || (researching && label != "润色")
+            .filter(|(label, _, _)| researching || *label != "查连续性")
+            .map(|action| {
+                let attach = match action.1 {
+                    WritingTask::Continue => has_tail,
+                    WritingTask::Polish => selected && has_general_context,
+                    WritingTask::Request => has_general_context,
                 };
-                task(
-                    label,
-                    prompt,
-                    ai,
-                    if continuation {
-                        has_tail
-                    } else {
-                        has_general_context
-                    },
-                    !busy && enabled,
-                )
+                let enabled = if action.1 == WritingTask::Request {
+                    has_general_context || researching
+                } else {
+                    target.is_some()
+                };
+                task(action, ai, attach, !busy && enabled)
             })
             .collect();
         let manage = self.model.clone();
@@ -286,9 +285,8 @@ impl AiDialog {
         model_controls.push(AnyView::new(
             Button::title("管理模型", move || manage.manage_ai()).enabled(!busy),
         ));
-        let mut rows = vec![wrap_controls(model_controls)];
-        rows.push(wrap_controls(actions));
-        if can_research && target.is_some() {
+        let mut rows = vec![wrap_controls(actions), wrap_controls(model_controls)];
+        if can_research && target.is_some() && !polishing {
             let mut scopes = vec![
                 ("仅片段", ResearchScope::Excerpt),
                 ("本文稿", ResearchScope::Document),
@@ -334,12 +332,18 @@ impl AiDialog {
             };
             rows.push(caption(scope_note));
         }
+        if continuing && let Some(target) = &target {
+            rows.push(caption(target.continuation_anchor().map_or_else(
+                || "从当前光标位置起写".to_owned(),
+                |anchor| format!("接在「{anchor}」后"),
+            )));
+        }
         rows.push(AnyView::new(
             TextField::new(
-                if continuing {
-                    "下一步剧情（可选）"
-                } else {
-                    "输入写作要求"
+                match mode {
+                    WritingTask::Continue => "接下来发生什么？可留空",
+                    WritingTask::Polish => "润色要求（可选）",
+                    WritingTask::Request => "输入写作要求",
                 },
                 ai.prompt.binding(),
             )
@@ -352,27 +356,31 @@ impl AiDialog {
             .frame_height(76.0),
         ));
         if has_context {
-            let mut controls = vec![AnyView::new(
-                Toggle::labeled(
-                    if continuing && selected {
-                        "附带选区末尾（最多 600 字符）"
-                    } else if continuing {
-                        "附带光标前文（最多 600 字符）"
-                    } else if selected {
-                        "附带选区"
-                    } else {
-                        "附带光标前文（最多 2,000 字符）"
-                    },
-                    ai.include_context.binding(),
-                )
-                .enabled(!busy),
-            )];
-            if chosen {
+            let mut controls = if polishing {
+                vec![caption("润色当前选区")]
+            } else {
+                vec![AnyView::new(
+                    Toggle::labeled(
+                        if continuing && selected {
+                            "参考选区末尾（最多 1,800 字符）"
+                        } else if continuing {
+                            "参考落笔前文（最多 1,800 字符）"
+                        } else if selected {
+                            "附带选区"
+                        } else {
+                            "附带光标前文（最多 2,000 字符）"
+                        },
+                        ai.include_context.binding(),
+                    )
+                    .enabled(!busy),
+                )]
+            };
+            if chosen || polishing {
                 controls.push(AnyView::new(Button::title(
                     if preview_context.get() {
-                        "收起前文"
+                        "收起原文"
                     } else {
-                        "预览前文"
+                        "查看参考原文"
                     },
                     move || preview_context.update(|shown| *shown = !*shown),
                 )));
@@ -380,7 +388,7 @@ impl AiDialog {
             rows.push(wrap_controls(controls));
         }
         match context {
-            Ok(text) if chosen && !text.is_empty() && preview_context.get() => {
+            Ok(text) if (chosen || polishing) && !text.is_empty() && preview_context.get() => {
                 rows.push(text_box("将提供的文稿片段", text, 88.0))
             }
             Err(message) => rows.push(caption(message)),
@@ -400,9 +408,17 @@ impl AiDialog {
                 if preferences.selected.len() > 1 {
                     "并行生成"
                 } else {
-                    "发送"
+                    match mode {
+                        WritingTask::Continue => "生成续写",
+                        WritingTask::Polish => "生成润色",
+                        WritingTask::Request => "发送",
+                    }
                 },
-                (continuing && chosen && has_context) || !ai.prompt.get().is_empty(),
+                if polishing {
+                    selected && has_context
+                } else {
+                    (continuing && chosen && has_context) || !ai.prompt.get().is_empty()
+                },
                 move || send.run_ai(),
             )
         };
@@ -467,29 +483,64 @@ impl AiDialog {
             }
             ModelStatus::Failed(error) => rows.push(error_label(format!("请求失败。{error}"))),
             ModelStatus::Ready(result) => {
-                rows.push(caption("生成结果"));
-                let repeats = result.repetition_warning.is_some();
-                if let Some(warning) = result.repetition_warning.as_ref() {
-                    rows.push(error_label(warning.clone()));
+                let modified = result.text != result.original_text;
+                let repeats = !modified && result.repetition_warning.is_some();
+                let binding = ai.draft_binding(batch, current);
+                let mut header = vec![caption("草稿可直接编辑")];
+                if modified {
+                    let original = result.original_text.clone();
+                    let restore = binding.clone();
+                    header.push(AnyView::new(Button::title("恢复初稿", move || {
+                        restore.set(original.clone())
+                    })));
                 }
-                rows.push(text_box("生成结果", result.text.clone(), 145.0));
+                rows.push(wrap_controls(header));
+                if let Some(warning) = &result.repetition_warning {
+                    rows.push(if modified {
+                        caption(warning)
+                    } else {
+                        error_label(warning.clone())
+                    });
+                }
+                rows.push(AnyView::new(
+                    TextField::new("生成结果", binding)
+                        .multiline()
+                        .frame_height(145.0),
+                ));
                 show_sources(rows, result, ai.viewed_source);
                 if has_target {
                     let insert = self.model.clone();
                     let replace = self.model.clone();
-                    let mut buttons = vec![AnyView::new(Button::title(
-                        if repeats { "仍然插入" } else { "插入" },
-                        move || insert.apply_ai(current, false),
-                    ))];
-                    if selected {
-                        buttons.push(AnyView::new(Button::title(
+                    let ready = !result.text.is_empty();
+                    let mut buttons = Vec::new();
+                    if result.task == WritingTask::Polish {
+                        if selected {
+                            buttons.push(primary("替换选区", ready, move || {
+                                replace.apply_ai(current, true)
+                            }));
+                        }
+                    } else if result.task == WritingTask::Continue {
+                        buttons.push(primary(
                             if repeats {
-                                "仍然替换选区"
+                                "仍然接在这里"
                             } else {
-                                "替换选区"
+                                "接在这里"
                             },
-                            move || replace.apply_ai(current, true),
-                        )));
+                            ready,
+                            move || insert.apply_ai(current, false),
+                        ));
+                    } else {
+                        buttons.push(primary("插入", ready, move || {
+                            insert.apply_ai(current, false)
+                        }));
+                        if selected {
+                            buttons.push(AnyView::new(
+                                Button::title("替换选区", move || {
+                                    replace.apply_ai(current, true);
+                                })
+                                .enabled(ready),
+                            ));
+                        }
                     }
                     rows.push(wrap_controls(buttons));
                 }
@@ -636,28 +687,32 @@ fn show_sources(rows: &mut Vec<AnyView>, result: &WritingResult, viewed: Signal<
 }
 
 fn task(
-    label: &str,
-    instruction: Option<&'static str>,
+    (label, mode, instruction): (&str, WritingTask, Option<&'static str>),
     ai: &AiState,
     attach: bool,
     enabled: bool,
 ) -> AnyView {
-    let (continuing, prompt, include) = (ai.continuing, ai.prompt, ai.include_context);
-    let selected = instruction.is_none() && continuing.get();
+    let (current, prompt, include, error) = (ai.task, ai.prompt, ai.include_context, ai.error);
+    let selected = mode != WritingTask::Request && current.get() == mode;
     let button = Button::title(label, move || {
+        if mode == WritingTask::Polish && !attach {
+            error.set("先在正文里选中要润色的文字，再打开助手。".to_owned());
+            return;
+        }
+        error.set(String::new());
         if let Some(instruction) = instruction {
-            continuing.set(false);
+            current.set(WritingTask::Request);
             prompt.set(TextBuffer::new(instruction));
             include.set(attach);
         } else {
-            let active = continuing.get_untracked();
-            continuing.set(!active);
+            let active = current.get_untracked() == mode;
+            current.set(if active { WritingTask::Request } else { mode });
             include.set(!active && attach);
-            let current = prompt.get_untracked().string_value();
+            let typed = prompt.get_untracked().string_value();
             if !active
                 && WRITING_ACTIONS
                     .iter()
-                    .any(|(_, instruction)| *instruction == Some(current.as_str()))
+                    .any(|(_, _, instruction)| *instruction == Some(typed.as_str()))
             {
                 prompt.set(TextBuffer::empty());
             }
@@ -665,7 +720,7 @@ fn task(
     })
     .selected(selected)
     .enabled(enabled);
-    if instruction.is_none() {
+    if mode != WritingTask::Request {
         AnyView::new(button.button_style(ToggleButtonStyle::default()))
     } else {
         AnyView::new(button)

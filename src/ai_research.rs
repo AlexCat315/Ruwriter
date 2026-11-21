@@ -195,6 +195,10 @@ impl ResearchRequest {
             ));
         }
         let caret = self.active.utf8_offset_for_character_index(self.caret);
+        let active_document = index
+            .documents
+            .iter()
+            .position(|doc| doc.id == self.active_id);
         let current = index
             .chapters
             .iter()
@@ -212,6 +216,9 @@ impl ResearchRequest {
         Ok(ResearchRun {
             index,
             current,
+            active_document,
+            caret,
+            before_caret: false,
             used_bytes: 0,
             evidence: Vec::new(),
         })
@@ -317,13 +324,51 @@ impl ManuscriptIndex {
 pub struct ResearchRun {
     index: Arc<ManuscriptIndex>,
     current: Option<usize>,
+    active_document: Option<usize>,
+    caret: usize,
+    before_caret: bool,
     used_bytes: usize,
     evidence: Vec<(Passage, Source)>,
 }
 
 impl ResearchRun {
+    pub fn restrict_to_preceding_text(&mut self) {
+        self.before_caret = true;
+    }
+
+    fn readable_end(&self, chapter: &Chapter) -> usize {
+        if self.before_caret && self.active_document == Some(chapter.document) {
+            chapter.end.min(self.caret)
+        } else {
+            chapter.end
+        }
+    }
+
+    fn readable_chapters(&self) -> usize {
+        self.index
+            .chapters
+            .iter()
+            .filter(|chapter| chapter.start < self.readable_end(chapter))
+            .count()
+    }
+
+    fn readable_title<'a>(&self, chapter: &'a Chapter) -> &'a str {
+        let stop = self.readable_end(chapter);
+        if stop < chapter.end {
+            let doc = &self.index.documents[chapter.document];
+            let end_of_line = doc.lines
+                .get(doc.lines.partition_point(|&byte| byte <= chapter.start))
+                .copied()
+                .unwrap_or(chapter.end);
+            if stop < end_of_line {
+                return "当前段落";
+            }
+        }
+        &chapter.title
+    }
+
     pub fn coverage(&self) -> String {
-        let count = self.index.chapters.len();
+        let count = self.readable_chapters();
         let files = self.index.documents.len();
         let skipped = self.index.skipped;
         if skipped == 0 {
@@ -339,11 +384,13 @@ impl ResearchRun {
         let mut context = self.coverage();
         if let Some(current) = self.current {
             let chapter = &self.index.chapters[current];
-            context.push_str(&format!(
-                " 当前落笔位置在章节 {}（{}）。",
-                current + 1,
-                chapter.title
-            ));
+            if chapter.start < self.readable_end(chapter) {
+                context.push_str(&format!(
+                    " 当前落笔位置在章节 {}（{}）。",
+                    current + 1,
+                    self.readable_title(chapter)
+                ));
+            }
         }
         context
     }
@@ -398,23 +445,26 @@ impl ResearchRun {
     }
 
     fn list(&self, from: usize, limit: usize) -> Value {
-        let total = self.index.chapters.len();
+        let total = self.readable_chapters();
         let first = from.saturating_sub(1);
-        let entries: Vec<_> = self
+        let mut available = self
             .index
             .chapters
             .iter()
             .enumerate()
             .skip(first)
+            .filter(|(_, chapter)| chapter.start < self.readable_end(chapter));
+        let entries: Vec<_> = available
+            .by_ref()
             .take(limit)
             .map(|(id, chapter)| {
                 let doc = &self.index.documents[chapter.document];
-                json!({"chapter": id + 1, "title": chapter.title, "file": doc.id,
+                json!({"chapter": id + 1, "title": self.readable_title(chapter), "file": doc.id,
                     "line": doc.lines.partition_point(|&byte| byte <= chapter.start)})
             })
             .collect();
-        let next = first + entries.len() + 1;
-        json!({"total": total, "chapters": entries, "next": (next <= total).then_some(next)})
+        let next = available.next().map(|(id, _)| id + 1);
+        json!({"total": total, "chapters": entries, "next": next})
     }
 
     fn search(&mut self, query: &str, limit: usize) -> Value {
@@ -423,6 +473,9 @@ impl ResearchRun {
         let mut results = Vec::new();
         for hit in hits {
             let passage = self.index.passages[hit];
+            if passage.end > self.readable_end(&self.index.chapters[passage.chapter]) {
+                continue;
+            }
             let count = by_chapter.entry(passage.chapter).or_default();
             if *count == 2 {
                 continue;
@@ -443,16 +496,17 @@ impl ResearchRun {
         let Some(section) = self.index.chapters.get(id) else {
             return json!({"error": "章节不存在。"});
         };
-        if offset >= section.end - section.start {
+        let stop = self.readable_end(section);
+        if offset >= stop.saturating_sub(section.start) {
             return json!({"error": "偏移超出本章。"});
         }
         let text = &self.index.documents[section.document].text;
         let start = text.ceil_char_boundary(section.start + offset);
-        if start == section.end {
+        if start >= stop {
             return json!({"error": "偏移超出本章。"});
         }
-        let end = text.floor_char_boundary((start + max).min(section.end));
-        let next = (end < section.end).then_some(end - section.start);
+        let end = text.floor_char_boundary((start + max).min(stop));
+        let next = (end < stop).then_some(end - section.start);
         json!({
             "passage": self.reference(Passage { chapter: id, start, end }),
             "next_offset_bytes": next,
@@ -468,7 +522,7 @@ impl ResearchRun {
             } else {
                 let source = Source {
                     id: format!("R{}", self.evidence.len() + 1),
-                    title: chapter.title.clone(),
+                    title: self.readable_title(chapter).to_owned(),
                     file: doc.id.clone(),
                     first_line: doc.lines.partition_point(|&byte| byte <= passage.start),
                     last_line: doc.lines.partition_point(|&byte| byte < passage.end).max(1),
