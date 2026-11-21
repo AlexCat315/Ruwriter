@@ -1,8 +1,50 @@
+diff --git a/Docs/gallery-audit.md b/Docs/gallery-audit.md
+index 0a671893..687ca532 100644
+--- a/Docs/gallery-audit.md
++++ b/Docs/gallery-audit.md
+@@ -805,6 +805,7 @@ Swift 目录没有、Rust 新增的 8 页：SingleLineText、CompletionPopover
+ | Timeline | 共享 Rust 行为与场景回归 | 本轮未作原生设备验收 | Website/src/content/components/timeline.md |
+ | TabView | 共享 Rust 行为与场景回归 | 本轮未作原生设备验收 | Website/src/content/components/tab-view.md |
+ | DateRangeCalendar | 共享 Rust 行为与场景回归 | 本轮未作原生设备验收 | Website/src/content/components/date-range.md |
++| TextField / 滚动选区 | 场景测试覆盖滚动后的光标位置、重绘前的滚轮事件和跨段选区替换 | macOS Ruwriter DevTools 验证滚动后点击光标、正反向跨段拖选、替换与撤销 | Website/src/content/components/text-field.md |
+ | TextField / Code gutter | 挂载控件与正文共用几何；真实场景指针点击、输入框 F9/折叠快捷键、标记重基 | 本轮未作原生键盘或 IME 验收 | Website/src/content/components/text-field.md |
+
+ 未增加按平台跳过的生产实现；原生 Windows、Linux、iOS、Android 的设备验收继续独立跟踪。
+diff --git a/Website/src/content/components/text-field.md b/Website/src/content/components/text-field.md
+index fa712663..71dec2d8 100644
+--- a/Website/src/content/components/text-field.md
++++ b/Website/src/content/components/text-field.md
+@@ -42,6 +42,8 @@ fn editor(cx: &Scope) -> impl View {
+
+ 垂直字段按行盒测量，随内容增高到 `max_visible_lines`，之后固定高度并滚动。显式换行也会让默认横向字段增高，直到同一个上限。滚动到上限后，滚轮以 `MULTILINE_WHEEL_STEP`（30pt）为一格移动视口；未溢出时滚轮继续传给外层滚动视图。
+
++滚动后的点击和拖选以屏幕上已绘制的行位置为准。点击自动折行的行尾时，光标留在点击的那一行。
++
+ ```rust
+ fn notes(cx: &Scope) -> impl View {
+     let text = cx.state(|| TextBuffer::new(""));
 diff --git a/crates/compose/src/primitives/text/text_field/text_field.rs b/crates/compose/src/primitives/text/text_field/text_field.rs
-index 82981d19..89b0e086 100644
+index 82981d19..66e729a4 100644
 --- a/crates/compose/src/primitives/text/text_field/text_field.rs
 +++ b/crates/compose/src/primitives/text/text_field/text_field.rs
-@@ -1207,7 +1207,7 @@ fn update_gutter_controls(node: &Node, field: &TextField) {
+@@ -15,7 +15,7 @@ use crate::primitives::text::code::minimap::{
+     MINIMAP_WIDTH, MinimapGeometry, ink_runs, strip_color,
+ };
+ use crate::primitives::text::text_buffer::TextBuffer;
+-use crate::primitives::text::text_document_layout::TextDocumentLayout;
++use crate::primitives::text::text_document_layout::{TextDocumentLayout, TextLineGeometry};
+ use crate::primitives::text::text_edit_history::{Snapshot, TextEditHistory, TextEditKind};
+ use crate::primitives::text::text_editing_commands::TextEditingCommands;
+ use crate::theme::styles::components::AnyTextFieldStyle;
+@@ -57,6 +57,7 @@ use super::text_field_options::{
+     TextFieldEditRequest, TextFieldLayout, TextFieldNavigationRequest, TextFieldSize,
+ };
+
++const PAINTED_TEXT_VIEWPORT: &str = "__textfield_painted_viewport";
+ const SCROLLBAR_HOVERED: &str = "__textfield_scrollbar_hovered";
+ const FOCUS_REQUEST_ID: &str = "__textfield_focus_request_id";
+ const CARET_REQUEST_ID: &str = "__textfield_caret_request_id";
+@@ -1207,7 +1208,7 @@ fn update_gutter_controls(node: &Node, field: &TextField) {
  /// height.
  #[derive(Clone, PartialEq)]
  struct MeasureInputs {
@@ -11,7 +53,7 @@ index 82981d19..89b0e086 100644
      placeholder: String,
      axis: TextFieldAxis,
      wraps_lines: bool,
-@@ -1225,7 +1225,7 @@ struct MeasureInputs {
+@@ -1225,7 +1226,7 @@ struct MeasureInputs {
  /// field scrolls.
  fn install_measure(layout: &LayoutNode, field: TextField) {
      let inputs = MeasureInputs {
@@ -20,7 +62,7 @@ index 82981d19..89b0e086 100644
          placeholder: field.placeholder.clone(),
          axis: field.layout.axis,
          wraps_lines: field.layout.wraps_lines,
-@@ -1615,7 +1615,8 @@ fn committed_input_area(
+@@ -1615,7 +1616,8 @@ fn committed_input_area(
          if vertical { width } else { f32::INFINITY },
          rendered.shows_placeholder,
      );
@@ -30,7 +72,7 @@ index 82981d19..89b0e086 100644
      let (caret_x, row) = document.caret(
          rendered.cursor_index,
          selection.line_end_affinity && !rendered.is_composing,
-@@ -1624,7 +1625,12 @@ fn committed_input_area(
+@@ -1624,7 +1626,12 @@ fn committed_input_area(
      let height = (node.frame().height - 2.0 * field.vertical_inset(line_height)).max(line_height);
      state.scroll.visible_height = height;
      state.scroll.content_height = document.index().row_count() as f32 * line_height;
@@ -44,7 +86,7 @@ index 82981d19..89b0e086 100644
      state.scroll.horizontal.viewport_width = width;
      state.scroll.horizontal.leading_inset = inset + addons.leading();
      if state.scroll.needs_caret_reveal {
-@@ -1635,7 +1641,10 @@ fn committed_input_area(
+@@ -1635,7 +1642,10 @@ fn committed_input_area(
              state.scroll.horizontal.offset = caret_x.max(0.0);
          }
          let top = row as f32 * line_height;
@@ -56,7 +98,7 @@ index 82981d19..89b0e086 100644
              // Keep the caret row in the middle of the viewport. At the very
              // start and end the clamp leaves the document flush with the edge.
              state.scroll.offset_y =
-@@ -1661,6 +1670,30 @@ fn committed_input_area(
+@@ -1661,17 +1671,72 @@ fn committed_input_area(
      })
  }
  
@@ -64,7 +106,7 @@ index 82981d19..89b0e086 100644
 +fn document_layout(
 +    node: &Node,
 +    buffer: TextBuffer,
-+    geometry: crate::primitives::text::text_document_layout::TextLineGeometry,
++    geometry: TextLineGeometry,
 +) -> Rc<RefCell<TextDocumentLayout>> {
 +    let document = match node.attachment::<Rc<RefCell<TextDocumentLayout>>>(DOCUMENT_LAYOUT_KEY) {
 +        Some(document) => {
@@ -84,27 +126,140 @@ index 82981d19..89b0e086 100644
 +    document
 +}
 +
++/// The row index and origin used by the frame the pointer can actually see.
++#[derive(Clone)]
++struct PaintedTextViewport {
++    buffer: TextBuffer,
++    geometry: TextLineGeometry,
++    rows: super::text_visual_line_index::TextVisualLineIndex,
++    text_origin: Point,
++}
++
  fn pointer_character(
      node: &Node,
      field: &TextField,
-@@ -1712,11 +1745,12 @@ fn pointer_character(
+     state: &Rc<RefCell<FieldState>>,
+     point: Point,
+-) -> Option<usize> {
++) -> Option<(usize, bool)> {
+     let environment = TextEnvironmentHolder::current()?;
++    let local = node.convert_from_window(point);
++    let mut state = state.borrow_mut();
++    if !state.composition.is_active()
++        && let Some(painted) = node.attachment::<PaintedTextViewport>(PAINTED_TEXT_VIEWPORT)
++        && state.buffer == painted.buffer
++    {
++        let x = local.x - painted.text_origin.x;
++        let row = ((local.y - painted.text_origin.y) / painted.geometry.line_height.max(1.0))
++            .max(0.0) as usize;
++        let (line, subrow) = painted.rows.location_at_row(row);
++        let document = document_layout(node, painted.buffer, painted.geometry);
++        let measured = document.borrow_mut().measured_line(line, &environment);
++        let column = measured.character(subrow, x);
++        // A soft wrap shares a caret index between the end of one row and
++        // the start of the next. Keep the clicked side of that boundary.
++        let affinity =
++            measured.caret(column, false).1 != subrow && measured.caret(column, true).1 == subrow;
++        return Some((
++            state.buffer.character_index_for_line(line, column),
++            affinity,
++        ));
++    }
++
+     let theme = theme_for_node(node);
+     let token = resolved_text_style(node, &theme);
+     let line_height = token.line_height;
+-    let mut state = state.borrow_mut();
+     let addons = field.addon_layouts(
+         node,
+         &theme,
+@@ -1697,7 +1762,7 @@ fn pointer_character(
+         true,
+     );
+     if rendered.shows_placeholder {
+-        return Some(0);
++        return Some((0, false));
+     }
+     let geometry = document_geometry(
+         &field.inputs(&theme),
+@@ -1712,17 +1777,18 @@ fn pointer_character(
          },
          false,
      );
 -    let mut document = TextDocumentLayout::new(rendered.buffer, geometry);
-+    let document = document_layout(node, rendered.buffer, geometry);
-+    let mut document = document.borrow_mut();
-     let origin = node.absolute_origin();
+-    let origin = node.absolute_origin();
 -    let x = point.x - origin.x - leading + state.scroll.horizontal.offset;
 -    let row = ((point.y - origin.y - field.vertical_inset(line_height) + state.scroll.offset_y)
 -        .max(0.0)
-+    let painted_offset = node.content_offset();
-+    let x = point.x - origin.x - leading + painted_offset.x;
-+    let row = ((point.y - origin.y - field.vertical_inset(line_height) + painted_offset.y).max(0.0)
++    let document = document_layout(node, rendered.buffer, geometry);
++    let mut document = document.borrow_mut();
++    let offset = node.content_offset();
++    let x = local.x - leading + offset.x;
++    let row = ((local.y - field.vertical_inset(line_height) + offset.y).max(0.0)
          / line_height.max(1.0)) as usize;
-     Some(
+-    Some(
++    Some((
          document
-@@ -2482,7 +2516,7 @@ fn install_interaction(
+             .character(row, x, &environment)
+             .min(current.character_count()),
+-    )
++        false,
++    ))
+ }
+
+ /// Characters Cocoa's IME uses inside a marked pinyin composition but commits
+@@ -1961,7 +2027,7 @@ fn install_interaction(
+                         state.selection.anchor = Some(0);
+                         state.selection.cursor_index = state.buffer.character_count();
+                         state.record_activity();
+-                    } else if let Some(index) = click_index {
++                    } else if let Some((index, affinity)) = click_index {
+                         let mut state = pointer_state.borrow_mut();
+                         state.clear_composition();
+                         if event.clicks >= 2 {
+@@ -1978,9 +2044,13 @@ fn install_interaction(
+                             state.record_activity();
+                         } else {
+                             state.move_cursor(index, event.modifiers.has_shift(), None);
++                            state.selection.line_end_affinity = affinity;
+                         }
+                     }
+                     let mut state = pointer_state.borrow_mut();
++                    // A click in the viewport must not move the text under a
++                    // drag before its next motion event arrives.
++                    state.scroll.needs_caret_reveal = false;
+                     state.is_dragging = true;
+                     state.is_focused = true;
+                     drop(state);
+@@ -2027,13 +2097,20 @@ fn install_interaction(
+                 {
+                     return EventResult::Ignored;
+                 }
+-                if let Some(index) = pointer_character(
+-                    &owner,
+-                    &motion_field,
+-                    &motion_state,
+-                    Point::new(event.x, event.y),
+-                ) {
+-                    motion_state.borrow_mut().move_cursor(index, true, None);
++                let point = Point::new(event.x, event.y);
++                if let Some((index, affinity)) =
++                    pointer_character(&owner, &motion_field, &motion_state, point)
++                {
++                    let mut state = motion_state.borrow_mut();
++                    state.move_cursor(index, true, None);
++                    state.selection.line_end_affinity = affinity;
++                    let local = owner.convert_from_window(point);
++                    let frame = owner.frame();
++                    state.scroll.needs_caret_reveal = local.y < 0.0
++                        || local.y >= frame.height
++                        || local.x < 0.0
++                        || local.x >= frame.width;
++                    drop(state);
+                     notify_caret(&owner, &motion_state);
+                     owner.mark_render_dirty(cove_core::scene::InvalidationSource::style_set(
+                         "textFieldSelection",
+@@ -2482,7 +2559,7 @@ fn install_interaction(
  /// Displayed-row geometry for caret commands that step by row instead of by
  /// logical line: soft-wrapped fields, Home/End affinity and page moves.
  struct NavigationContext {
@@ -113,7 +268,7 @@ index 82981d19..89b0e086 100644
      environment: TextEnvironment,
      line_height: f32,
      vertical_inset: f32,
-@@ -2524,7 +2558,7 @@ fn navigation_context(
+@@ -2524,7 +2601,7 @@ fn navigation_context(
          state.buffer.is_empty(),
      );
      Some(NavigationContext {
@@ -122,7 +277,7 @@ index 82981d19..89b0e086 100644
          environment,
          line_height,
          vertical_inset: field.vertical_inset(line_height),
-@@ -2581,7 +2615,7 @@ fn refresh_scroll_metrics(node: &Node, field: &TextField, state: &Rc<RefCell<Fie
+@@ -2581,7 +2658,7 @@ fn refresh_scroll_metrics(node: &Node, field: &TextField, state: &Rc<RefCell<Fie
      let Some(context) = context else {
          return;
      };
@@ -131,7 +286,7 @@ index 82981d19..89b0e086 100644
      let visible = (node.frame().height - 2.0 * context.vertical_inset).max(context.line_height);
      let content = rows * context.line_height;
      let mut state = state.borrow_mut();
-@@ -2622,11 +2656,22 @@ fn apply_key(
+@@ -2622,11 +2699,22 @@ fn apply_key(
      let scancode = event.scancode;
      let caret = state.selection.cursor_index;
      let preferred_x = state.selection.preferred_caret_x();
@@ -159,7 +314,7 @@ index 82981d19..89b0e086 100644
  
      match scancode {
          // A code field consumes Tab to indent; every other field yields it to
-@@ -2681,7 +2726,7 @@ fn apply_key(
+@@ -2681,7 +2769,7 @@ fn apply_key(
                  // Command-Up/Down own the document bounds.
                  match context.as_mut() {
                      Some(ctx) => {
@@ -168,7 +323,7 @@ index 82981d19..89b0e086 100644
                          let environment = &ctx.environment;
                          line_boundary(
                              &state.buffer,
-@@ -2735,7 +2780,7 @@ fn apply_key(
+@@ -2735,7 +2823,7 @@ fn apply_key(
              }
              let moved = match context.as_mut() {
                  Some(ctx) => {
@@ -177,7 +332,7 @@ index 82981d19..89b0e086 100644
                      let environment = &ctx.environment;
                      move_cursor_vertically(
                          &state.buffer,
-@@ -2776,7 +2821,7 @@ fn apply_key(
+@@ -2776,7 +2864,7 @@ fn apply_key(
                  Some(ctx) => {
                      let line_height = ctx.line_height;
                      let vertical_inset = ctx.vertical_inset;
@@ -186,7 +341,7 @@ index 82981d19..89b0e086 100644
                      let environment = &ctx.environment;
                      move_cursor_by_page(
                          &state.buffer,
-@@ -2828,7 +2873,7 @@ fn apply_key(
+@@ -2828,7 +2916,7 @@ fn apply_key(
              }
              let target = match context.as_mut() {
                  Some(ctx) => {
@@ -195,7 +350,7 @@ index 82981d19..89b0e086 100644
                      let environment = &ctx.environment;
                      line_boundary(
                          &state.buffer,
-@@ -3094,11 +3139,8 @@ fn render(
+@@ -3094,11 +3182,8 @@ fn render(
          },
          render_state.shows_placeholder,
      );
@@ -209,7 +364,7 @@ index 82981d19..89b0e086 100644
      let vertical_inset = field.vertical_inset(line_height);
      state.scroll.visible_height = (frame.height - vertical_inset * 2.0).max(line_height);
      update_scroll(&mut state.scroll, &document, line_height);
-@@ -3121,7 +3163,10 @@ fn render(
+@@ -3121,7 +3206,10 @@ fn render(
              &environment,
          );
          let top = caret_row as f32 * line_height;
@@ -221,7 +376,40 @@ index 82981d19..89b0e086 100644
              state.scroll.offset_y = (top + line_height / 2.0 - state.scroll.visible_height / 2.0)
                  .clamp(0.0, state.scroll.max_y);
          } else {
-@@ -3507,11 +3552,7 @@ fn render(
+@@ -3139,6 +3227,7 @@ fn render(
+         ((state.scroll.offset_y / line_height.max(1.0)).floor() as usize).saturating_sub(1);
+     let row_count = ((state.scroll.visible_height / line_height.max(1.0)).ceil() as usize) + 3;
+     let layout = document.visible_layout(first_row, row_count, &environment);
++    let painted_rows = document.index().clone();
+     state.scroll.horizontal.synchronize(
+         &render_state.buffer,
+         &geometry,
+@@ -3173,6 +3262,15 @@ fn render(
+         origin.x + inset + addons.leading() - state.scroll.horizontal.offset,
+         origin.y + vertical_inset - state.scroll.offset_y,
+     );
++    node.set_attachment(
++        PAINTED_TEXT_VIEWPORT,
++        PaintedTextViewport {
++            buffer: render_state.buffer.clone(),
++            geometry,
++            rows: painted_rows,
++            text_origin: Point::new(text_origin.x - origin.x, text_origin.y - origin.y),
++        },
++    );
+     let text_color = field
+         .decoration
+         .text_color
+@@ -3374,7 +3472,7 @@ fn render(
+             &environment,
+         );
+         let caret_color = field.decoration.cursor_color.unwrap_or(theme.colors.accent);
+-        let top = text_origin.y + (row as f32 - first_row as f32) * line_height;
++        let top = text_origin.y + row as f32 * line_height;
+         if let Some(session) = node.first_resource::<TextCompletionSession>() {
+             let absolute = node.absolute_frame();
+             session.update_anchor(Rect::new(
+@@ -3507,11 +3605,7 @@ fn render(
          text_color,
          &theme,
      );
@@ -234,7 +422,7 @@ index 82981d19..89b0e086 100644
      node.set_attachment(
          RENDER_CACHE_KEY,
          RenderCacheEntry {
-@@ -3519,14 +3560,14 @@ fn render(
+@@ -3519,14 +3613,14 @@ fn render(
                  root: first_row,
                  visible_first_row: first_row,
                  visible_row_count: row_count,
@@ -251,7 +439,7 @@ index 82981d19..89b0e086 100644
              },
              layout,
              document: shared_document.clone(),
-@@ -3595,7 +3636,10 @@ fn draw_range(
+@@ -3595,7 +3689,10 @@ fn draw_range(
          let overlaps_text = lower < line_end && upper > line_start;
          let selects_line_break = lower <= line_end && upper > line_end && line_break_at(line_end);
          let x_low = super::text_field_layout_engine::row_x_at_byte(line, lower.max(line_start));
@@ -281,10 +469,10 @@ index a3b2b2af..1bb645fa 100644
  }
  
 diff --git a/crates/compose/tests/text_field_tests.rs b/crates/compose/tests/text_field_tests.rs
-index 03d02a65..e026df38 100644
+index 03d02a65..9d0cd92d 100644
 --- a/crates/compose/tests/text_field_tests.rs
 +++ b/crates/compose/tests/text_field_tests.rs
-@@ -1326,6 +1326,78 @@ fn drag_acquires_and_releases_capture() {
+@@ -1326,6 +1326,203 @@ fn drag_acquires_and_releases_capture() {
      });
  }
  
@@ -356,6 +544,131 @@ index 03d02a65..e026df38 100644
 +        assert_eq!(state.borrow().selection_range(), Some((0, index)));
 +        handlers.text.unwrap()("Replacement\n", EventPhase::Target);
 +        assert_eq!(rig.text(), format!("Replacement\n{second}"));
++        PointerCaptureHolder::set_current(previous);
++    });
++}
++
++#[test]
++fn scrolled_caret_and_drag_follow_the_visible_text() {
++    with_rig(|rig| {
++        let source = (0..60)
++            .map(|line| format!("Paragraph {line:02}"))
++            .collect::<Vec<_>>()
++            .join("\n");
++        rig.set(&source);
++        TextEnvironmentHolder::set_current(Some(test_text_environment(16.0, 20.0)));
++        let previous = PointerCaptureHolder::current();
++        PointerCaptureHolder::set_current(Some(Rc::new(PointerCapture::new())));
++        let padding = 8.0;
++        let cursor = Color::from_rgba8(139, 47, 73, 255);
++        rig.install(
++            TextField::new("", rig.binding())
++                .layout(vertical())
++                .decoration(TextFieldDecoration {
++                    content_padding: Some(
++                        cove_ui_compose::primitives::text::text_field::TextFieldContentPadding::new(
++                            padding, padding,
++                        ),
++                    ),
++                    cursor_color: Some(cursor),
++                    ..Default::default()
++                }),
++        );
++        rig.graph.compute_layout(200.0, 180.0);
++        let node = rig.field();
++        let state = state_of(&node).unwrap();
++        let handlers = rig.handlers(&node);
++        let pointer = handlers.pointer.unwrap();
++        let motion = handlers.motion.unwrap();
++        let scroll = handlers.wheel.unwrap();
++        use cove_ui_compose::primitives::text::text_field::{
++            RenderCacheEntry, text_field_layout_engine::RENDER_CACHE_KEY,
++        };
++        let painted = || {
++            node.attachment::<RenderCacheEntry>(RENDER_CACHE_KEY)
++                .unwrap()
++        };
++        draw(&node);
++        scroll(&wheel(-8.25), EventPhase::Target);
++        draw(&node);
++
++        let frame = node.absolute_frame();
++        let offset = node.content_offset().y;
++        let cache = painted();
++        let height = cache.key.line_height;
++        assert!(offset > height);
++        let visible = |cache: &RenderCacheEntry| {
++            cache
++                .layout
++                .lines
++                .iter()
++                .filter_map(|line| {
++                    let y = padding + line.top_y - offset;
++                    (y >= 0.0 && y + height < frame.height)
++                        .then_some((line.start_cluster as usize, y))
++                })
++                .collect::<Vec<_>>()
++        };
++        let rows = visible(&cache);
++        let (first, first_top) = rows[0];
++        let (last, last_top) = rows[2];
++        let x = frame.x + 2.0;
++        let y = |top| frame.y + top + height / 2.0;
++        pointer(
++            &press(x, y(first_top), 1),
++            PointerPhase::Down,
++            EventPhase::Target,
++        );
++        pointer(
++            &press(x, y(first_top), 1),
++            PointerPhase::Up,
++            EventPhase::Target,
++        );
++        let frame_with_caret = draw(&node);
++        assert_eq!(state.borrow().selection.cursor_index, first);
++        assert_eq!(node.content_offset().y, offset);
++        let caret_top = frame_with_caret
++            .vertices()
++            .iter()
++            .filter(|vertex| vertex.color == cursor.rgba8())
++            .map(|vertex| vertex.y)
++            .reduce(f32::min)
++            .expect("a clicked row shows the insertion caret");
++        assert!(
++            (caret_top - first_top).abs() < 0.1,
++            "{caret_top} != {first_top}"
++        );
++
++        // The next wheel event updates the live viewport before it paints.
++        // Input against the current frame must still hit the old visible rows.
++        scroll(&wheel(-1.0), EventPhase::Target);
++        assert_ne!(node.content_offset().y, offset);
++        pointer(
++            &press(x, y(last_top), 1),
++            PointerPhase::Down,
++            EventPhase::Target,
++        );
++        motion(
++            &MouseMotionEvent {
++                x,
++                y: y(first_top),
++                delta_x: 0.0,
++                delta_y: first_top - last_top,
++                kind: Default::default(),
++            },
++            EventPhase::Target,
++        );
++        pointer(
++            &press(x, y(first_top), 1),
++            PointerPhase::Up,
++            EventPhase::Target,
++        );
++        assert_eq!(state.borrow().selection_range(), Some((first, last)));
++        handlers.text.unwrap()("Replacement\n", EventPhase::Target);
++        assert_eq!(
++            rig.text(),
++            format!("{}Replacement\n{}", &source[..first], &source[last..])
++        );
 +        PointerCaptureHolder::set_current(previous);
 +    });
 +}
