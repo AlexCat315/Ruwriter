@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  COVE_REF: 8d4e82e399b9887b20947a39ed80c4dbf56682d8
+  COVE_REF: 05e0b436c24cd87e7a8bbb71adb377299af9cef1
   RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
@@ -57,9 +57,6 @@ jobs:
           ref: ${{ env.COVE_REF }}
           path: Cove
           submodules: recursive
-
-      - name: Apply Cove editor fix
-        run: git -C ../Cove apply "$GITHUB_WORKSPACE/Ruwriter/patches/cove-text-field-layout.patch"
 
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install

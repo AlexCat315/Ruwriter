@@ -48,10 +48,10 @@ fn resolve_remote(
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty());
-    if let Some(id) = configured {
-        if let Some(remote) = fetch(client, token, id)? {
-            return Ok(Some(remote));
-        }
+    if let Some(id) = configured
+        && let Some(remote) = fetch(client, token, id)?
+    {
+        return Ok(Some(remote));
     }
     if let Some(id) = find_gist(client, token, &request.library_id)? {
         return fetch(client, token, &id)?

@@ -65,7 +65,7 @@ pub enum SyncEvent {
         library: PathBuf,
         snapshot: Vec<SyncDocument>,
         conflicts: Vec<PathBuf>,
-        result: Result<SyncReport, String>,
+        result: Box<Result<SyncReport, String>>,
     },
 }
 
@@ -940,7 +940,7 @@ impl Model {
                     library,
                     snapshot: request.local,
                     conflicts,
-                    result,
+                    result: Box::new(result),
                 })
             });
         });
@@ -988,7 +988,7 @@ impl Model {
                     }
                     return;
                 }
-                let applied = result.and_then(|report| {
+                let applied = (*result).and_then(|report| {
                     self.flush_sync_save()
                         .map_err(|error| format!("同步后保存失败：{error}"))?;
                     let before = self.editor_identity();

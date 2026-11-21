@@ -1,6 +1,6 @@
 [package]
 name = "ruwriter"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.99.1"
 publish = false
@@ -8,7 +8,7 @@ publish = false
 [package.metadata.cove]
 id = "dev.cyke.ruwriter"
 name = "Ruwriter"
-build = 5
+build = 6
 
 [workspace]
 members = [".", "crates/core", "xtask"]

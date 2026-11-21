@@ -82,7 +82,7 @@ impl View for LibrarySidebar {
             ),
         ];
         if expanded {
-            children.push(settings_panel(&self.model, settings_open.clone()));
+            children.push(settings_panel(&self.model, settings_open));
         }
         children.push(footer(&self.model, settings_open));
         vstack(0.0, Align::Stretch, children)
@@ -397,7 +397,7 @@ fn footer(model: &Model, open: Signal<bool>) -> AnyView {
     let _ = model.sync_status.get();
     let expanded = open.get();
     let status = sync_status_text(model);
-    let toggle = open.clone();
+    let toggle = open;
     let toggle_model = model.clone();
     let trigger_label = AnyView::new(
         hstack(
@@ -489,7 +489,7 @@ fn settings_panel(model: &Model, open: cove_ui::core::Signal<bool>) -> AnyView {
     let current = model.settings().appearance;
 
     let sync_model = model.clone();
-    let close_panel = open.clone();
+    let close_panel = open;
     let close_revision = model.clone();
     let sync_row = panel_row(
         hstack(
@@ -552,7 +552,7 @@ fn settings_panel(model: &Model, open: cove_ui::core::Signal<bool>) -> AnyView {
         AppearancePreference::Dark,
     ] {
         let (label, _) = appearance_label(preference);
-        let close = open.clone();
+        let close = open;
         let m = model.clone();
         let rev = model.clone();
         let selected = current == preference;

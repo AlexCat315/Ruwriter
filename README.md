@@ -60,13 +60,7 @@ Ruwriter 在每次同步时向 `gh` 读取一次凭据，用完即丢，不落�
 
 ## 构建
 
-`../Cove` 必须存在并完成过一次 `cargo cove setup`。
-
-使用发布工作流固定的 Cove 版本时，从 Ruwriter 根目录应用编辑器补丁：
-
-```sh
-git -C ../Cove apply "$(pwd)/patches/cove-text-field-layout.patch"
-```
+`../Cove` 必须存在并完成过一次 `cargo cove setup`。发布工作流按 `.github/workflows/release.yml` 里的 `COVE_REF` 检出 Cove 的对应提交，不再额外打补丁。
 
 ```sh
 cargo build --workspace

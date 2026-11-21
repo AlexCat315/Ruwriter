@@ -1533,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "ruwriter"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cove-http",
  "cove-ui",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "ruwriter-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
