@@ -1355,8 +1355,12 @@ impl Model {
         let Some(batch) = self.ai.current_batch().filter(|batch| !batch.busy()) else {
             return;
         };
+        self.update_ai_target(false);
         self.ai.task.set(batch.writing_task());
-        self.ai.prompt.set(batch.prompt);
+        self.ai.follow_draft.set(false);
+        self.ai
+            .prompt
+            .set(batch.retry_prompt(self.ai.target.get_untracked().as_ref()));
         self.run_ai();
     }
 
@@ -1459,6 +1463,14 @@ impl Model {
                     .get(&work)
                     .cloned()
                     .unwrap_or_default();
+                example.subject = brief
+                    .story
+                    .character_cards
+                    .iter()
+                    .map(|card| card.name.trim())
+                    .filter(|name| !name.is_empty() && example.instruction.contains(name))
+                    .collect::<Vec<_>>()
+                    .join("、");
                 if !brief.feedback.contains(&example) {
                     brief.feedback.push(example);
                     session

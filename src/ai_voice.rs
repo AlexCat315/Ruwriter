@@ -54,50 +54,81 @@ pub fn select_feedback(
     records: &[ruwriter_core::WritingFeedback],
 ) -> Vec<ruwriter_core::WritingFeedback> {
     use cove_agent::retrieval::SearchIndex;
-    use ruwriter_core::WritingFeedback;
+    let query = format!("{request} {}", recent_text(scene, 600));
+    let lowercase_query = query.to_lowercase();
     let records: Vec<_> = records
         .iter()
+        .rev()
         .filter(|record| {
-            !record.held && (!record.lesson.trim().is_empty() || record.before != record.after)
+            !record.held
+                && (!record.lesson.trim().is_empty() || record.before != record.after)
+                && scope_matches(&record.subject, &lowercase_query)
         })
+        .map(revision_excerpt)
         .collect();
     let mut index = SearchIndex::default();
     for record in &records {
         index.add(
             &format!("{} {}", record.subject, record.instruction),
-            &format!("{} {}", record.lesson, record.after),
+            &format!("{} {} {}", record.lesson, record.before, record.after),
         );
     }
-    let sentence = scene.trim_end().lines().last().unwrap_or_default();
-    let query = format!("{request} {sentence}");
-    let mut selected = index.search(&query, 3);
+    let ranked = index.search(&query, records.len());
+    let mut selected = Vec::new();
+    for index in ranked
+        .iter()
+        .copied()
+        .chain(0..records.len())
+        .filter(|&index| !records[index].subject.trim().is_empty())
+        .chain(ranked.iter().copied())
+    {
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+        if selected.len() == 3 {
+            break;
+        }
+    }
+    // Older work-wide examples may have no keywords.
     if selected.is_empty() {
-        selected.extend(
-            (0..records.len())
-                .rev()
-                .filter(|&index| records[index].subject.trim().is_empty())
-                .take(2),
-        );
+        selected.extend((0..records.len()).take(2));
     }
     selected
         .into_iter()
-        .map(|index| {
-            let record = &records[index];
-            let common = cove_agent::revision::change_span(&record.before, &record.after)
-                .map_or(0, |span| span.before.start);
-            let excerpt = |text: &str| {
-                let start = text.floor_char_boundary(common.saturating_sub(180));
-                let end = text.floor_char_boundary((common + 1800).min(text.len()));
-                text[start..end].to_owned()
-            };
-            WritingFeedback {
-                instruction: record.instruction.clone(),
-                before: excerpt(&record.before),
-                after: excerpt(&record.after),
-                ..(*record).clone()
-            }
-        })
+        .map(|index| records[index].clone())
         .collect()
+}
+
+fn scope_matches(subject: &str, query: &str) -> bool {
+    subject.trim().is_empty()
+        || subject
+            .split([',', '，', '、', '；', ';', '\n'])
+            .map(str::trim)
+            .any(|term| !term.is_empty() && query.contains(&term.to_lowercase()))
+}
+
+fn revision_excerpt(record: &ruwriter_core::WritingFeedback) -> ruwriter_core::WritingFeedback {
+    let common = cove_agent::revision::change_span(&record.before, &record.after)
+        .map_or(0, |span| span.before.start);
+    let excerpt = |text: &str| {
+        let start = text.floor_char_boundary(common.saturating_sub(180));
+        let end = text.floor_char_boundary((common + 1800).min(text.len()));
+        text[start..end].to_owned()
+    };
+    ruwriter_core::WritingFeedback {
+        before: excerpt(&record.before),
+        after: excerpt(&record.after),
+        ..record.clone()
+    }
+}
+
+fn recent_text(text: &str, count: usize) -> &str {
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(count)
+        .map_or(0, |(start, _)| start);
+    &text[start..]
 }
 
 pub fn select_memories(
@@ -113,12 +144,7 @@ pub fn select_memories(
     for entry in &active {
         index.add(&format!("{} {}", entry.title, entry.subject), &entry.text);
     }
-    let recent = scene
-        .char_indices()
-        .rev()
-        .nth(400)
-        .map_or(0, |(start, _)| start);
-    let query = format!("{request} {}", &scene[recent..]);
+    let query = format!("{request} {}", recent_text(scene, 400));
     let ranked = index.search(&query, 8);
     let mut budget: usize = 12 * 1024;
     let mut selected = std::collections::BTreeSet::new();
@@ -186,9 +212,10 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let selected = select_feedback("她会怎么回答", "赵玥合上了平板。", &revisions);
+        let selected = select_feedback("续写", "赵玥合上了平板。\n我没再说话。", &revisions);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].lesson, revisions[2].lesson);
+        assert!(select_feedback("续写", "她按下通讯开关。", &revisions).is_empty());
     }
 
     #[test]

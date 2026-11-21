@@ -20,7 +20,7 @@ use ruwriter_core::{AiPreferences, AiSettings, StoryProfile, WritingBrief, Writi
 use serde_json::json;
 
 use crate::ai_chat;
-use crate::ai_continuation::{self, SCENE_CHARACTERS, ScenePlan};
+use crate::ai_continuation::{self, SCENE_CHARACTERS, ScenePlan, SceneQuestion};
 use crate::ai_research::{
     self, ResearchCache, ResearchRequest, ResearchRun, ResearchScope, Source,
 };
@@ -174,19 +174,31 @@ pub enum WritingTask {
 }
 
 pub fn is_continuation_command(input: &str) -> bool {
-    matches!(
-        input.trim().trim_end_matches(['。', '！', '!', '？', '?']),
-        "续写" | "继续续写" | "继续写" | "接着写" | "重新续写" | "续写一段"
-    ) || input
-        .trim()
-        .split_once(['：', ':'])
-        .is_some_and(|(command, _)| command.trim() == "续写")
+    scene_confirmation(input).is_some()
+        || matches!(
+            input.trim().trim_end_matches(['。', '！', '!', '？', '?']),
+            "续写" | "继续续写" | "继续写" | "接着写" | "重新续写" | "续写一段"
+        )
+        || input
+            .trim()
+            .split_once(['：', ':'])
+            .is_some_and(|(command, _)| command.trim() == "续写")
+}
+
+pub fn scene_confirmation(input: &str) -> Option<&str> {
+    let input = input.trim();
+    if input == "先确认" {
+        return Some("");
+    }
+    let (command, request) = input.split_once(['：', ':'])?;
+    (command.trim() == "先确认").then(|| request.trim())
 }
 
 #[derive(Clone)]
 pub enum ModelStatus {
     Indexing,
     Running(WritingStage),
+    NeedsDirection(SceneQuestion),
     Ready(Box<WritingResult>),
     Failed(AgentError),
     Cancelled,
@@ -209,6 +221,18 @@ pub enum WritingStage {
 enum WritingProgress<'a> {
     Stage(WritingStage),
     Reviewing(&'a WritingResult),
+}
+
+#[derive(Debug)]
+enum WritingRunError {
+    Agent(AgentError),
+    NeedsDirection(SceneQuestion),
+}
+
+impl From<AgentError> for WritingRunError {
+    fn from(error: AgentError) -> Self {
+        Self::Agent(error)
+    }
 }
 
 #[derive(Clone)]
@@ -281,6 +305,7 @@ pub struct Batch {
     pub runs: Vec<ModelRun>,
     task: WritingTask,
     pub prompt: TextBuffer,
+    instruction: String,
     pub history: Arc<Vec<ChatTurn>>,
     turn_id: String,
     selected: usize,
@@ -309,11 +334,65 @@ impl Batch {
         })
     }
 
+    pub fn scene_question(&self, index: usize) -> Option<&SceneQuestion> {
+        match &self.runs.get(index)?.status {
+            ModelStatus::NeedsDirection(question) => Some(question),
+            _ => None,
+        }
+    }
+
+    fn same_scene(&self, target: Option<&WritingTarget>) -> bool {
+        self.target
+            .as_ref()
+            .zip(target)
+            .is_some_and(|(prior, now)| {
+                prior.document == now.document
+                    && prior.insertion == now.insertion
+                    && prior.selection == now.selection
+                    && prior.buffer.has_same_contents(&now.buffer)
+            })
+    }
+
+    pub fn retry_prompt(&self, target: Option<&WritingTarget>) -> TextBuffer {
+        if self.task == WritingTask::Continue && self.same_scene(target) {
+            TextBuffer::new(&self.instruction)
+        } else {
+            self.prompt.clone()
+        }
+    }
+
+    fn next_instruction(
+        &self,
+        index: usize,
+        target: Option<&WritingTarget>,
+        answer: &str,
+    ) -> Result<String, String> {
+        let Some(question) = self.scene_question(index) else {
+            return Ok(answer.to_owned());
+        };
+        if !self.same_scene(target) {
+            return Err("落笔位置已变化。移回原处回答，或从「续写」开启新一轮。".to_owned());
+        }
+        if answer.trim().is_empty() {
+            return Err("请先回答这一场的方向。".to_owned());
+        }
+        Ok(format!(
+            "{}\n\n场景问题：{}\n作者本轮明确回答：{}",
+            scene_confirmation(&self.instruction).unwrap_or(&self.instruction),
+            question.question,
+            answer.trim(),
+        ))
+    }
+
     fn transcript(&self, selected: usize) -> Arc<Vec<ChatTurn>> {
         let mut history = self.history.clone();
         let index = self.adopted.unwrap_or(selected);
         let answer = match self.runs.get(index).map(|run| &run.status) {
             Some(ModelStatus::Ready(result)) => Some(result.text.clone()),
+            Some(ModelStatus::NeedsDirection(question)) => Some(TextBuffer::new(&format!(
+                "「{}」\n\n{}",
+                question.quote, question.question
+            ))),
             _ => None,
         };
         Arc::make_mut(&mut history).push(ChatTurn {
@@ -1006,6 +1085,16 @@ impl AiState {
         let prompt = self.prompt.get_untracked().string_value();
         let task = self.task.get_untracked();
         let target = self.target.get_untracked();
+        let instruction = match &previous {
+            Some(batch) if task == WritingTask::Continue && self.follow_draft.get_untracked() => {
+                batch.next_instruction(
+                    self.viewed_result.get_untracked(),
+                    target.as_ref(),
+                    &prompt,
+                )?
+            }
+            _ => prompt.clone(),
+        };
         if prompt.trim().is_empty() && task == WritingTask::Request {
             return Err("请输入写作要求。".to_owned());
         }
@@ -1071,6 +1160,7 @@ impl AiState {
                     runs,
                     task,
                     prompt: TextBuffer::new(displayed_prompt),
+                    instruction: instruction.clone(),
                     history: history.clone(),
                     turn_id: ai_chat::new_id(),
                     selected: 0,
@@ -1123,7 +1213,7 @@ impl AiState {
                         let worker_sender = sender.clone();
                         let worker_key = key.clone();
                         let (prompt, context, research, mut job) =
-                            (&prompt, context.clone(), research.clone(), job.clone());
+                            (&instruction, context.clone(), research.clone(), job.clone());
                         job.preview_model = Some(streamed_model(
                             adapter,
                             &worker_sender,
@@ -1173,7 +1263,12 @@ impl AiState {
                                         run.streamed_text = TextBuffer::empty();
                                         run.status = match result {
                                             Ok(result) => ModelStatus::Ready(Box::new(result)),
-                                            Err(error) => ModelStatus::Failed(error),
+                                            Err(WritingRunError::Agent(error)) => {
+                                                ModelStatus::Failed(error)
+                                            }
+                                            Err(WritingRunError::NeedsDirection(question)) => {
+                                                ModelStatus::NeedsDirection(question)
+                                            }
                                         };
                                     },
                                 );
@@ -1483,7 +1578,7 @@ fn run_writing_agent(
     mut research: Option<ResearchRun>,
     job: WritingJob,
     progress: impl Fn(WritingProgress<'_>),
-) -> Result<WritingResult, AgentError> {
+) -> Result<WritingResult, WritingRunError> {
     let WritingJob {
         task,
         target,
@@ -1493,17 +1588,17 @@ fn run_writing_agent(
     } = job;
     let writer = preview_model.as_ref().unwrap_or(&model);
     let continuing = task == WritingTask::Continue;
+    let confirmation = continuing.then(|| scene_confirmation(prompt)).flatten();
+    let prompt = confirmation.unwrap_or(prompt);
     let mut brief = brief;
     brief.feedback = ai_voice::select_feedback(prompt, &context, &brief.feedback);
     brief.memories = ai_voice::select_memories(prompt, &context, &brief.memories);
     let voice_samples = ai_voice::select_samples(&context, &brief.voice_samples);
     if continuing && context.trim().is_empty() {
-        return Err(AgentError::Model("续写需要落笔位置之前的正文。".to_owned()));
+        return Err(AgentError::Model("续写需要落笔位置之前的正文。".to_owned()).into());
     }
     if continuing && !brief.story.is_ready() {
-        return Err(AgentError::Model(
-            "请先确认这部作品的剧情和人物。".to_owned(),
-        ));
+        return Err(AgentError::Model("请先确认这部作品的剧情和人物。".to_owned()).into());
     }
     let plan_scene = continuing;
     let mut instructions = match task {
@@ -1683,11 +1778,17 @@ fn run_writing_agent(
         );
     let source_texts: Vec<_> = sources.iter().map(|source| source.text.as_str()).collect();
     let plan = if continuing {
-        let mut plan = ScenePlan::parse(&first).ok_or_else(|| {
-            AgentError::Model("模型没能整理出接续计划。可以重试，或先补充这一场的走向。".to_owned())
-        })?;
-        plan.keep_grounded(&context, &source_texts, &brief);
-        Some(plan)
+        if let Some(question) = SceneQuestion::parse(&first, &context) {
+            return Err(WritingRunError::NeedsDirection(question));
+        }
+        let plan = ScenePlan::grounded(&first, &context, &source_texts, &brief);
+        if confirmation.is_some() {
+            return Err(WritingRunError::NeedsDirection(plan.map_or_else(
+                |_| SceneQuestion::for_confirmation(&context),
+                |plan| plan.confirmation(&context),
+            )));
+        }
+        Some(plan?)
     } else {
         None
     };
@@ -1724,7 +1825,7 @@ fn run_writing_agent(
         )?
     } else {
         if first.trim().is_empty() {
-            return Err(AgentError::Model("模型未返回可用的结果。".to_owned()));
+            return Err(AgentError::Model("模型未返回可用的结果。".to_owned()).into());
         }
         if task == WritingTask::Polish {
             ai_continuation::check_prose(&first)?;
@@ -1793,7 +1894,7 @@ fn run_writing_agent(
                     .draft_context
                     .review(&model, &prose, &result.sources, &result.revisions);
             if matches!(result.review, Review::Rejected) {
-                return Err(AgentError::Model(ai_continuation::INVALID_DRAFT.to_owned()));
+                return Err(AgentError::Model(ai_continuation::INVALID_DRAFT.to_owned()).into());
             }
         } else {
             result.revise_checked_issues(&model, writer, || {
@@ -1957,7 +2058,7 @@ mod tests {
                 model, "续写", "我挂断了电话，".to_owned(), false, None,
                 WritingJob { task: WritingTask::Continue, brief: story_brief(), ..Default::default() }, |_| {},
             ),
-            Err(AgentError::Model(message)) if message == ai_continuation::INVALID_DRAFT
+              Err(WritingRunError::Agent(AgentError::Model(message))) if message == ai_continuation::INVALID_DRAFT
         ));
         assert_eq!(retries.load(Ordering::Relaxed), 1);
     }
@@ -2144,7 +2245,9 @@ mod tests {
             },
             |_| {},
         );
-        assert!(matches!(result, Err(AgentError::Model(reason)) if reason.contains("先确认")));
+        assert!(
+            matches!(result, Err(WritingRunError::Agent(AgentError::Model(reason))) if reason.contains("先确认"))
+        );
     }
 
     #[test]
@@ -2209,6 +2312,125 @@ mod tests {
     }
 
     #[test]
+    fn a_grounded_question_pauses_the_writer_and_author_answers_keep_the_original_request() {
+        let scene = "她说没事，合上了平板。";
+        let buffer = TextBuffer::new(scene);
+        let target = WritingTarget {
+            document: (PathBuf::from("library"), "chapter.txt".into(), 0),
+            insertion: buffer.character_count(),
+            buffer,
+            selection: None,
+        };
+        let planner: AgentModel = Arc::new(|_, _| {
+            Ok(AgentReply::Answer(r#"{"clarification":{"quote":"合上了平板","question":"李明听出了她在掩饰，还是以为她真的没事？"}}"#.into()))
+        });
+        let writer: AgentModel = Arc::new(|_, _| panic!("unanswered question reached the writer"));
+        let result = run_writing_agent(
+            planner,
+            "以李明的视角接一拍",
+            scene.into(),
+            false,
+            None,
+            WritingJob {
+                task: WritingTask::Continue,
+                brief: story_brief(),
+                preview_model: Some(writer),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let Err(WritingRunError::NeedsDirection(question)) = result else {
+            panic!("expected a question grounded in the manuscript");
+        };
+        assert_eq!(question.quote, "合上了平板");
+        let batch = Batch {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            task: WritingTask::Continue,
+            target: Some(target.clone()),
+            prompt: TextBuffer::new("以李明的视角接一拍"),
+            instruction: "以李明的视角接一拍".into(),
+            history: Arc::new(Vec::new()),
+            turn_id: "question".into(),
+            selected: 0,
+            archive_error: None,
+            scope: ResearchScope::Excerpt,
+            adopted: None,
+            pre_adoption: None,
+            runs: vec![ModelRun {
+                profile: AiPreferences::default(),
+                status: ModelStatus::NeedsDirection(question),
+                previous: None,
+                revision_error: None,
+                revising: None,
+                draft_preview: None,
+                streamed_text: TextBuffer::empty(),
+            }],
+        };
+        assert!(!batch.busy() && !batch.can_revise(0));
+        assert!(batch.transcript(0)[0].answer.is_some());
+        let answer = "听出来了，但只问能不能再看一眼。";
+        let resumed = batch.next_instruction(0, Some(&target), answer).unwrap();
+        assert!(resumed.starts_with("以李明的视角接一拍") && resumed.ends_with(answer));
+        assert!(batch.next_instruction(0, Some(&target), "").is_err());
+        let moved = WritingTarget {
+            insertion: 2,
+            ..target
+        };
+        assert!(batch.next_instruction(0, Some(&moved), answer).is_err());
+    }
+
+    #[test]
+    fn explicit_confirmation_pauses_even_when_the_model_returns_a_complete_plan() {
+        let planner: AgentModel = Arc::new(|messages, _| {
+            let input: serde_json::Value = serde_json::from_str(&messages[1].text).unwrap();
+            assert_eq!(input["next_beat"], "保留距离感");
+            Ok(AgentReply::Answer(
+                r#"{"carry_from":"她收起平板","settled":[],"advance_to":"李明只说一句"}"#.into(),
+            ))
+        });
+        let writer: AgentModel =
+            Arc::new(|_, _| panic!("explicit confirmation reached the writer"));
+        let result = run_writing_agent(
+            planner,
+            "先确认：保留距离感",
+            "她收起了平板。".into(),
+            false,
+            None,
+            WritingJob {
+                task: WritingTask::Continue,
+                brief: story_brief(),
+                preview_model: Some(writer),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert!(
+            matches!(result, Err(WritingRunError::NeedsDirection(question))
+            if question.quote == "她收起了平板。" && question.question.contains("李明只说一句"))
+        );
+        let invalid: AgentModel =
+            Arc::new(|_, _| Ok(AgentReply::Answer("我不知道怎么接。".into())));
+        let result = run_writing_agent(
+            invalid,
+            "先确认",
+            "她收起了平板。".into(),
+            false,
+            None,
+            WritingJob {
+                task: WritingTask::Continue,
+                brief: story_brief(),
+                preview_model: Some(Arc::new(|_, _| panic!("invalid plan reached the writer"))),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert!(
+            matches!(result, Err(WritingRunError::NeedsDirection(question))
+            if question.quote == "她收起了平板。" && question.question.contains("希望人物怎么回应"))
+        );
+    }
+
+    #[test]
     fn an_unreadable_scene_plan_never_starts_the_writer() {
         let planning: AgentModel = Arc::new(|_, _| Ok(AgentReply::Answer("我打算接着写。".into())));
         let writer: AgentModel = Arc::new(|_, _| panic!("writer started without a scene plan"));
@@ -2226,7 +2448,9 @@ mod tests {
             },
             |_| {},
         );
-        assert!(matches!(result, Err(AgentError::Model(reason)) if reason.contains("接续计划")));
+        assert!(
+            matches!(result, Err(WritingRunError::Agent(AgentError::Model(reason))) if reason.contains("接续计划"))
+        );
     }
 
     #[test]
@@ -2270,6 +2494,7 @@ mod tests {
                         "character_beats": [{
                             "character": "李明",
                             "trigger": "她因太艺术而收起平板",
+                            "trigger_quote": "她收起了平板",
                             "surface_response": "请她再展示一下",
                             "relation_effect": "让她感到他认真看过"
                         }]

@@ -26,7 +26,7 @@ use ruwriter_core::{AiPreferences, AiSettings, MAX_PARALLEL_AI_MODELS};
 use super::ui::{hstack, spacer, vstack};
 use crate::ai::{
     Batch, Catalog, ModelStatus, StoryStatus, WritingResult, WritingStage, WritingTask,
-    is_continuation_command, requires_key,
+    is_continuation_command, requires_key, scene_confirmation,
 };
 use crate::ai_research::ResearchScope;
 use crate::ai_review::Review;
@@ -412,7 +412,7 @@ impl AiPanel {
                         66.0,
                     ));
                     rows.push(study_field(
-                        "适用角色、关系或场景",
+                        "适用关键词（用顿号分隔）",
                         record_field(feedback, index, |f| &f.subject, |f, v| f.subject = v),
                         50.0,
                     ));
@@ -531,6 +531,11 @@ impl AiPanel {
         let busy = batch.as_ref().is_some_and(Batch::busy);
         let index = ai.viewed_result.get();
         let prompt = ai.prompt.get().string_value();
+        let confirming = scene_confirmation(&prompt).is_some();
+        let has_question = batch
+            .as_ref()
+            .is_some_and(|batch| batch.scene_question(index).is_some());
+        let answering = ai.follow_draft.get() && has_question;
         let following =
             ai.follow_draft.get() && batch.as_ref().is_some_and(|batch| batch.can_revise(index));
         let starts_continuation = following && is_continuation_command(&prompt);
@@ -564,7 +569,7 @@ impl AiPanel {
             rows.push(author_message(&batch.prompt));
             self.results(&mut rows, batch, show_beats);
         }
-        let mode = if starts_continuation {
+        let mode = if starts_continuation || answering {
             WritingTask::Continue
         } else {
             ai.task.get()
@@ -603,7 +608,16 @@ impl AiPanel {
         };
 
         let mut modes = Vec::new();
-        if batch.as_ref().is_some_and(|batch| batch.can_revise(index)) {
+        if has_question {
+            let model = self.model.clone();
+            modes.push(MenuEntry::Item(
+                MenuItem::new(1, "补充场景方向", move || {
+                    model.ai.task.set(WritingTask::Continue);
+                    model.ai.follow_draft.set(true);
+                })
+                .selected(answering),
+            ));
+        } else if batch.as_ref().is_some_and(|batch| batch.can_revise(index)) {
             let follow = ai.follow_draft;
             modes.push(MenuEntry::Item(
                 MenuItem::new(1, "修改当前草稿", move || follow.set(true)).selected(revising),
@@ -623,13 +637,40 @@ impl AiPanel {
                     MenuItem::new(i as u64 + 2, label, move || {
                         model.ai.follow_draft.set(false);
                         model.ai.task.set(task);
+                        if let Some(request) =
+                            scene_confirmation(&model.ai.prompt.get_untracked().string_value())
+                        {
+                            model.ai.prompt.set(TextBuffer::new(request));
+                        }
                         model.refresh_ai_target();
                     })
-                    .selected(!revising && mode == task),
+                    .selected(!answering && !confirming && !revising && mode == task),
                 ));
             }
         }
-        let mode_label = if revising {
+        if target.is_some() {
+            let model = self.model.clone();
+            modes.push(MenuEntry::Item(
+                MenuItem::new(5, "先确认本场", move || {
+                    let prompt = model.ai.prompt.get_untracked().string_value();
+                    if scene_confirmation(&prompt).is_none() {
+                        model
+                            .ai
+                            .prompt
+                            .set(TextBuffer::new(&format!("先确认：{prompt}")));
+                    }
+                    model.ai.task.set(WritingTask::Continue);
+                    model.ai.follow_draft.set(false);
+                    model.refresh_ai_target();
+                })
+                .selected(confirming && continuing && !answering),
+            ));
+        }
+        let mode_label = if answering {
+            "补充场景方向"
+        } else if confirming && continuing {
+            "先确认本场"
+        } else if revising {
             "修改当前草稿"
         } else {
             match mode {
@@ -743,7 +784,7 @@ impl AiPanel {
         let ready = !busy
             && !preparing_story
             && !(needs_story && matches!(story, Some(StoryStatus::Ready(_))))
-            && if revising {
+            && if revising || answering {
                 !prompt.trim().is_empty()
             } else {
                 match mode {
@@ -766,7 +807,9 @@ impl AiPanel {
         } else {
             let submit = send.clone();
             primary(
-                if needs_story {
+                if answering {
+                    "回答并继续"
+                } else if needs_story {
                     "先梳理作品"
                 } else {
                     "发送"
@@ -794,11 +837,12 @@ impl AiPanel {
         }
         composer.push(AnyView::new(
             TextField::new(
-                match (revising, mode) {
-                    (true, _) => "接着说你想怎么改…",
-                    (false, WritingTask::Continue) => "这一段接下来发生什么？",
-                    (false, WritingTask::Polish) => "这段正文要怎么改？",
-                    (false, WritingTask::Request) => "问一个关于作品的问题…",
+                match (answering, revising, mode) {
+                    (true, _, _) => "补充这一场的方向…",
+                    (_, true, _) => "接着说你想怎么改…",
+                    (_, _, WritingTask::Continue) => "这一段接下来发生什么？",
+                    (_, _, WritingTask::Polish) => "这段正文要怎么改？",
+                    (_, _, WritingTask::Request) => "问一个关于作品的问题…",
                 },
                 ai.prompt.binding(),
             )
@@ -999,6 +1043,13 @@ impl AiPanel {
                 }
             }
             ModelStatus::Cancelled => rows.push(caption("已停止等待这个模型。")),
+            ModelStatus::NeedsDirection(question) => {
+                rows.push(caption(format!("原文 · 「{}」", question.quote)));
+                rows.push(assistant_message(
+                    &TextBuffer::new(&question.question),
+                    false,
+                ));
+            }
             ModelStatus::Failed(AgentError::HttpStatus(401 | 403)) => {
                 let missing = ai.missing_key(&run.profile.endpoint);
                 rows.push(error_label(if missing {
@@ -1189,7 +1240,7 @@ impl AiPanel {
                 }
                 self.review_candidate(rows, result, current, !batch.applied() && !batch.busy());
                 if let Some(plan) = result.scene_plan()
-                    && !plan.character_beats().is_empty()
+                    && (!plan.character_beats().is_empty() || !plan.revision_lessons().is_empty())
                 {
                     let shown = show_beats.get();
                     rows.push(AnyView::new(Button::title(
@@ -1211,8 +1262,19 @@ impl AiPanel {
                                         TextTraits::BOLD,
                                     )])),
                                     caption(format!("触发 · {}", beat.trigger)),
+                                    caption(format!("原文 · 「{}」", beat.trigger_quote.trim())),
                                     caption(format!("反应 · {}", beat.surface_response)),
                                     caption(format!("关系 · {}", beat.relation_effect)),
+                                ],
+                            ));
+                        }
+                        for lesson in plan.revision_lessons() {
+                            rows.push(vstack(
+                                4.0,
+                                Align::Stretch,
+                                vec![
+                                    caption(format!("沿用改法 · {}", lesson.lesson)),
+                                    caption(format!("改稿依据 · 「{}」", lesson.basis.trim())),
                                 ],
                             ));
                         }
@@ -1493,6 +1555,7 @@ fn status_title(status: &ModelStatus) -> &'static str {
             WritingStage::Revise => "修订中",
         },
         ModelStatus::Ready(_) => "完成",
+        ModelStatus::NeedsDirection(_) => "待回答",
         ModelStatus::Failed(_) => "失败",
         ModelStatus::Cancelled => "已停止",
     }
