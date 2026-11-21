@@ -59,7 +59,11 @@ jobs:
           submodules: recursive
 
       - name: Apply Cove Agent adapter
-        run: git -C ../Cove apply "$GITHUB_WORKSPACE/Ruwriter/patches/cove-agent-openai-compatible.patch"
+        run: |
+          # Read the blob straight from Git so the patch keeps its LF endings;
+          # Windows runners check text files out as CRLF, which git apply rejects.
+          git show HEAD:patches/cove-agent-openai-compatible.patch > ../cove-agent.patch
+          git -C ../Cove apply ../cove-agent.patch
 
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
