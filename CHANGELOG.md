@@ -22,8 +22,8 @@
 ### Cove 改动
 
 - `cove-package` 的 `bundle_windows` 新增 MSVC 运行库 staging：按目标架构（x64 / arm64 / x86）从 `VCToolsRedistDir`、`VCToolsInstallDir` 或 vswhere 定位最新 `Microsoft.VC14*.CRT`，复制 CRT DLL；找不到时报出可操作的错误，而不是产出缺 DLL 的应用目录。
-- `cove-agent` 增加 OpenAI 兼容适配、检索与重复检测，`cove-http` 与焦点链配套调整；发布时以 `patches/cove-agent-openai-compatible.patch` 应用在固定 Cove 提交上。
-- 固定的 Cove 提交为 `b541b9f`：`05e0b43` 加一笔 Windows 打包修复；AI 适配层补丁在它之上应用。
+- `cove-agent` 增加 OpenAI 兼容适配、检索与重复检测，`cove-http` 与焦点链配套调整；这些已并入 Cove main，Ruwriter 不再带补丁。
+- 固定的 Cove 提交为 `8105fec9`：`05e0b43` 之上是 AI 适配层两笔提交和一笔 Windows 打包修复。
 
 ## 0.4.2 — 2026-11-21
 

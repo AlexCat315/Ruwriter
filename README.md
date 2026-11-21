@@ -78,13 +78,7 @@ Ruwriter 在每次同步时向 `gh` 读取一次凭据，用完即丢，不落�
 
 ## 构建
 
-`../Cove` 必须存在并完成过一次 `cargo cove setup`。发布工作流按 `.github/workflows/release.yml` 里的 `COVE_REF` 检出 Cove 的对应提交，再应用依赖补丁。
-
-如使用发布工作流固定的 Cove 版本，在构建前应用同一个补丁。
-
-```sh
-git -C ../Cove apply "$(pwd)/patches/cove-agent-openai-compatible.patch"
-```
+`../Cove` 必须存在并完成过一次 `cargo cove setup`。AI 助手依赖 Cove 的 `cove-agent` 适配层，它已在 Cove main 上；发布工作流按 `.github/workflows/release.yml` 里的 `COVE_REF` 检出对应提交，不打补丁。
 
 ```sh
 cargo build --workspace

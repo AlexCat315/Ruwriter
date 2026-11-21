@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  COVE_REF: b541b9f0581bf6011677d8000c764cf8cf7334e7
+  COVE_REF: 8105fec9cd8c7aedf4ce80364c671fc966f672ca
   RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
@@ -57,13 +57,6 @@ jobs:
           ref: ${{ env.COVE_REF }}
           path: Cove
           submodules: recursive
-
-      - name: Apply Cove Agent adapter
-        run: |
-          # Read the blob straight from Git so the patch keeps its LF endings;
-          # Windows runners check text files out as CRLF, which git apply rejects.
-          git show HEAD:patches/cove-agent-openai-compatible.patch > ../cove-agent.patch
-          git -C ../Cove apply ../cove-agent.patch
 
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
