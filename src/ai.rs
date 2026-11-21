@@ -88,7 +88,7 @@ pub enum WritingTask {
 pub enum ModelStatus {
     Indexing,
     Running,
-    Ready(WritingResult),
+    Ready(Box<WritingResult>),
     Failed(AgentError),
     Cancelled,
 }
@@ -476,7 +476,7 @@ impl AiState {
                                 );
                                 update_batch(&worker_sender, &worker_flag, move |batch| {
                                     batch.runs[index].status = match result {
-                                        Ok(result) => ModelStatus::Ready(result),
+                                        Ok(result) => ModelStatus::Ready(Box::new(result)),
                                         Err(error) => ModelStatus::Failed(error),
                                     };
                                 });
@@ -826,6 +826,7 @@ mod tests {
                 "第一章 雨夜".to_owned(),
                 true,
                 None,
+                WritingTask::Request,
                 None
             )
             .unwrap()

@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  COVE_REF: 05e0b436c24cd87e7a8bbb71adb377299af9cef1
+  COVE_REF: b541b9f0581bf6011677d8000c764cf8cf7334e7
   RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
@@ -97,6 +97,22 @@ jobs:
 
       - name: Build desktop package
         run: cargo xtask package ${{ matrix.platform }} --release --output dist
+
+      - name: Verify bundled MSVC runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deps = & dumpbin /nologo /dependents "dist\Ruwriter\ruwriter.exe" |
+            Select-String -Pattern '^\s+([A-Za-z0-9_.-]+\.dll)$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $runtime = $deps | Where-Object { $_ -match '^(?i)(vcruntime|msvcp|concrt)' }
+          if (-not $runtime) { throw "ruwriter.exe has no MSVC runtime imports" }
+          foreach ($dll in $runtime) {
+            if (-not (Test-Path (Join-Path "dist/Ruwriter" $dll))) {
+              throw "dist/Ruwriter/$dll is missing: cargo xtask package did not stage the MSVC runtime"
+            }
+          }
+          "Bundled MSVC runtime: $($runtime -join ', ')"
 
       - name: Build macOS dmg
         if: runner.os == 'macOS'

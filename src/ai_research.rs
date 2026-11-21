@@ -356,7 +356,8 @@ impl ResearchRun {
         let stop = self.readable_end(chapter);
         if stop < chapter.end {
             let doc = &self.index.documents[chapter.document];
-            let end_of_line = doc.lines
+            let end_of_line = doc
+                .lines
                 .get(doc.lines.partition_point(|&byte| byte <= chapter.start))
                 .copied()
                 .unwrap_or(chapter.end);
