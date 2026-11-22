@@ -429,13 +429,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let target = WritingTarget {
             document: (root.path().to_owned(), "chapter.txt".into(), 1),
-            buffer: TextBuffer::new("她合上了平板。\n接着把杯子放到桌上。"),
+            buffer: TextBuffer::new("她合上了本子。\n接着把杯子放到桌上。"),
             selection: Some(1..7),
             insertion: 7,
         };
         let anchor = SceneAnchor::capture(&target).unwrap();
         let question = SceneQuestion {
-            quote: "合上了平板".into(),
+            quote: "合上了本子".into(),
             question: "她是在犹豫，还是想结束话题？".into(),
         };
         let waiting = ChatTurn {
@@ -471,7 +471,7 @@ mod tests {
         let restored = saved.anchor.restore(&reopened).unwrap();
         assert_eq!(restored.selection, Some(1..7));
         let edited = WritingTarget {
-            buffer: TextBuffer::new("她压住了平板。\n接着把杯子放到桌上。"),
+            buffer: TextBuffer::new("她压住了本子。\n接着把杯子放到桌上。"),
             ..reopened.clone()
         };
         assert!(saved.anchor.restore(&edited).is_none());

@@ -313,6 +313,8 @@ impl WritingBrief {
 #[serde(default)]
 pub struct StoryProfile {
     pub outline: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detailed_outline: String,
     pub characters: String,
     pub open_threads: String,
     pub genre: String,

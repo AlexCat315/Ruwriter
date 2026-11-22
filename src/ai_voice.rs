@@ -182,17 +182,17 @@ mod tests {
             WritingMemory {
                 held: true,
                 pinned: true,
-                ..memory("赵玥", "旧设定")
+                ..memory("阿青", "旧设定")
             },
-            memory("赵玥", "把真心当作随手一笔"),
+            memory("阿青", "把真心当作随手一笔"),
         ];
-        let selected = select_memories("赵玥", "她收起了平板", &entries);
+        let selected = select_memories("阿青", "她收起了本子", &entries);
         assert_eq!(
             selected
                 .iter()
                 .map(|entry| entry.title.as_str())
                 .collect::<Vec<_>>(),
-            ["全书", "赵玥"]
+            ["全书", "阿青"]
         );
         let revisions = [
             WritingFeedback {
@@ -201,18 +201,18 @@ mod tests {
                 ..Default::default()
             },
             WritingFeedback {
-                subject: "赵玥".into(),
+                subject: "阿青".into(),
                 lesson: "旧写法".into(),
                 held: true,
                 ..Default::default()
             },
             WritingFeedback {
-                subject: "赵玥".into(),
-                lesson: "被质疑时，她会把热爱说成兴趣。".into(),
+                subject: "阿青".into(),
+                lesson: "被质疑时，她会把认真准备说成随手做的。".into(),
                 ..Default::default()
             },
         ];
-        let selected = select_feedback("续写", "赵玥合上了平板。\n我没再说话。", &revisions);
+        let selected = select_feedback("续写", "阿青合上了本子。\n我没再说话。", &revisions);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].lesson, revisions[2].lesson);
         assert!(select_feedback("续写", "她按下通讯开关。", &revisions).is_empty());

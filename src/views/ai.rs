@@ -731,6 +731,11 @@ impl AiPanel {
             }
             _ => {
                 rows.push(study_field("剧情大纲", ai.story_outline.binding(), 165.0));
+                rows.push(study_field(
+                    "细纲 · 近期章节要发生的事",
+                    ai.story_detailed_outline.binding(),
+                    135.0,
+                ));
                 rows.push(study_field("待续线索", ai.story_threads.binding(), 92.0));
                 rows.push(study_field("题材", ai.story_genre.binding(), 46.0));
                 rows.push(study_field("叙事口味", ai.story_tone.binding(), 62.0));
@@ -839,6 +844,13 @@ impl AiPanel {
         let has_question = batch
             .as_ref()
             .is_some_and(|batch| batch.scene_question(index).is_some());
+        let user_question = batch
+            .as_ref()
+            .and_then(|batch| batch.runs.get(index))
+            .and_then(|run| match &run.status {
+                ModelStatus::NeedsUserAnswer(question) => Some(question.clone()),
+                _ => None,
+            });
         let answering = ai.follow_draft.get() && has_question;
         let following =
             ai.follow_draft.get() && batch.as_ref().is_some_and(|batch| batch.can_revise(index));
@@ -980,11 +992,6 @@ impl AiPanel {
                 })
                 .selected(answering),
             ));
-        } else if batch.as_ref().is_some_and(|batch| batch.can_revise(index)) {
-            let follow = ai.follow_draft;
-            modes.push(MenuEntry::Item(
-                MenuItem::new(1, "修改当前草稿", move || follow.set(true)).selected(revising),
-            ));
         }
         for (i, (label, task, enabled)) in [
             ("续写", WritingTask::Continue, target.is_some()),
@@ -1011,28 +1018,8 @@ impl AiPanel {
                 ));
             }
         }
-        if target.is_some() {
-            let model = self.model.clone();
-            modes.push(MenuEntry::Item(
-                MenuItem::new(5, "先确认本场", move || {
-                    let prompt = model.ai.prompt.get_untracked().string_value();
-                    if scene_confirmation(&prompt).is_none() {
-                        model
-                            .ai
-                            .prompt
-                            .set(TextBuffer::new(&format!("先确认：{prompt}")));
-                    }
-                    model.ai.task.set(WritingTask::Continue);
-                    model.ai.follow_draft.set(false);
-                    model.refresh_ai_target();
-                })
-                .selected(confirming && continuing && !answering),
-            ));
-        }
         let mode_label = if answering {
             "补充场景方向"
-        } else if confirming && continuing {
-            "先确认本场"
         } else if revising {
             "修改当前草稿"
         } else {
@@ -1134,7 +1121,22 @@ impl AiPanel {
                 }
             };
         let model = self.model.clone();
+        let answer_question = user_question.clone();
         let send: Rc<dyn Fn()> = Rc::new(move || {
+            if let Some(question) = answer_question.clone() {
+                let answer = model.ai.prompt.get_untracked().string_value();
+                if answer.trim().is_empty() {
+                    return;
+                }
+                match model.ai.answer_user_question(&question.id, answer) {
+                    Ok(()) => {
+                        model.ai.prompt.set(TextBuffer::empty());
+                        model.ai.follow_draft.set(true);
+                    }
+                    Err(error) => model.ai.error.set(error),
+                }
+                return;
+            }
             follow_request.update(|value| *value += 1);
             model.send_ai_message();
         });
@@ -1157,7 +1159,9 @@ impl AiPanel {
             primary("从文末开始", true, move || model.continue_ai_at_end())
         } else {
             let submit = send.clone();
-            if needs_story && ready {
+            if user_question.is_some() {
+                send_button("回答", ready && !prompt.trim().is_empty(), false, move || submit())
+            } else if needs_story && ready {
                 primary("先梳理作品", true, move || submit())
             } else {
                 send_button(
@@ -1237,12 +1241,16 @@ impl AiPanel {
                 ],
             ));
         }
-        let input_label = match (answering, revising, mode) {
-            (true, _, _) => "补充这一场的方向…",
-            (_, true, _) => "接着说你想怎么改…",
-            (_, _, WritingTask::Continue) => "这一段接下来发生什么？",
-            (_, _, WritingTask::Polish) => "这段正文要怎么改？",
-            (_, _, WritingTask::Request) => "问一个关于作品的问题…",
+        let input_label = if user_question.is_some() {
+            "也可以直接写下你的选择…"
+        } else {
+            match (answering, revising, mode) {
+                (true, _, _) => "补充这一场的方向…",
+                (_, true, _) => "接着说你想怎么改…",
+                (_, _, WritingTask::Continue) => "这一段接下来发生什么？",
+                (_, _, WritingTask::Polish) => "这段正文要怎么改？",
+                (_, _, WritingTask::Request) => "问一个关于作品的问题…",
+            }
         };
         let lines = prompt
             .lines()
@@ -1679,6 +1687,62 @@ impl AiPanel {
                     )]));
                 }
             }
+            ModelStatus::NeedsUserAnswer(question) => {
+                if !question.header.trim().is_empty() {
+                    rows.push(caption(question.header.clone()));
+                }
+                rows.push(assistant_message(
+                    &TextBuffer::new(&question.question),
+                    false,
+                ));
+                let multiple = question.multiple;
+                let options = question
+                    .options
+                    .iter()
+                    .enumerate()
+                    .map(|(option_index, option)| {
+                        let ai = ai.clone();
+                        let model = self.model.clone();
+                        let id = question.id.clone();
+                        let answer = if option.description.trim().is_empty() {
+                            option.label.clone()
+                        } else {
+                            format!("{}｜{}", option.label, option.description)
+                        };
+                        let label = option.label.clone();
+                        let append = option.label.clone();
+                        let action = move || {
+                            if multiple {
+                                let current = model.ai.prompt.get_untracked().string_value();
+                                if current.contains(&append) {
+                                    return;
+                                }
+                                let next = if current.trim().is_empty() {
+                                    append.clone()
+                                } else {
+                                    format!("{current}、{append}")
+                                };
+                                model.ai.prompt.set(TextBuffer::new(&next));
+                                return;
+                            }
+                            if let Err(error) = ai.answer_user_question(&id, answer.clone()) {
+                                ai.error.set(error);
+                            }
+                        };
+                        if question.recommended == Some(option_index) {
+                            primary(&label, true, action)
+                        } else {
+                            AnyView::new(Button::title(label, action).button_style(GhostButtonStyle))
+                        }
+                    })
+                    .collect();
+                rows.push(wrap_controls(options));
+                rows.push(caption(if multiple {
+                    "可多选；选完点「回答」，也可以直接输入。"
+                } else {
+                    "也可以直接在下面输入你的答案。"
+                }));
+            }
             ModelStatus::NeedsDirection(question) => {
                 rows.push(caption(format!("原文 · 「{}」", question.quote)));
                 rows.push(assistant_message(
@@ -1842,6 +1906,21 @@ impl AiPanel {
                         },
                     )));
                 }
+                if !batch.applied() && batch.can_revise(current) && result.task != WritingTask::Request
+                {
+                    let ai_state = self.model.ai.clone();
+                    let task = self.model.ai.task;
+                    let follow = self.model.ai.follow_draft;
+                    more.push(MenuEntry::Item(MenuItem::new(
+                        5,
+                        "让 AI 改这版",
+                        move || {
+                            task.set(WritingTask::Continue);
+                            follow.set(true);
+                            ai_state.flash_feedback("在输入框写下要改的地方。");
+                        },
+                    )));
+                }
                 if !more.is_empty() {
                     controls.push(glyph_menu("草稿操作", more));
                 }
@@ -1980,19 +2059,17 @@ impl AiPanel {
         let count = if changed {
             0
         } else {
-            issues.len()
-                + result.continuity_notes.len()
-                + usize::from(result.repetition_warning.is_some())
+            issues.len() + usize::from(result.repetition_warning.is_some())
         };
         let title = if changed {
-            "草稿已编辑，待重新审稿".to_owned()
+            "已按意见改过，再审一遍".to_owned()
         } else {
             match &result.review {
                 Review::Rejected => "回复尚未交付正文".to_owned(),
                 Review::Incomplete => "本轮审稿未完成".to_owned(),
                 Review::NotRequested => "待审稿".to_owned(),
-                Review::Checked(_) if count == 0 => "审稿未发现具体问题".to_owned(),
-                Review::Checked(_) => format!("{count} 项待核对"),
+                Review::Checked(_) if count == 0 => "审稿没发现具体问题".to_owned(),
+                Review::Checked(_) => format!("{count} 处要改"),
             }
         };
         let mut controls = vec![AnyView::new(
@@ -2025,9 +2102,6 @@ impl AiPanel {
             details.push(caption("采纳前需核对角色卡和知情边界。"));
         }
         if count > 0 && show_details {
-            for note in result.continuity_notes.iter() {
-                details.push(caption(format!("接续待核对 · {note}")));
-            }
             if let Some(warning) = &result.repetition_warning {
                 details.push(error_label(warning.clone()));
             }
@@ -2267,7 +2341,7 @@ fn status_title(status: &ModelStatus) -> &'static str {
             WritingStage::Revise => "修订中",
         },
         ModelStatus::Ready(_) => "完成",
-        ModelStatus::NeedsDirection(_) => "待回答",
+        ModelStatus::NeedsDirection(_) | ModelStatus::NeedsUserAnswer(_) => "待回答",
         ModelStatus::Failed(_) => "失败",
         ModelStatus::Cancelled => "已停止",
     }

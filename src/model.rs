@@ -1508,12 +1508,6 @@ impl Model {
             } else {
                 self.ai.scope.get_untracked()
             };
-            if self.ai.task.get_untracked() == WritingTask::Continue && !brief.story.is_ready() {
-                if matches!(self.ai.story_status(), Some(StoryStatus::Ready(_))) {
-                    return Err("请先确认这部作品的剧情和人物。".to_owned());
-                }
-                return self.prepare_story_request();
-            }
             let prepared = self.ai_inputs(scope)?;
             self.ai
                 .start(prepared.0, prepared.1, brief, history.clone())
@@ -1649,6 +1643,9 @@ impl Model {
     fn fill_ai_story(&self, story: &ruwriter_core::StoryProfile) {
         self.ai.story_outline.set(TextBuffer::new(&story.outline));
         self.ai
+            .story_detailed_outline
+            .set(TextBuffer::new(&story.detailed_outline));
+        self.ai
             .story_characters
             .set(TextBuffer::new(&story.characters));
         self.ai
@@ -1673,6 +1670,7 @@ impl Model {
         let text = |field: Signal<TextBuffer>| field.get_untracked().string_value();
         ruwriter_core::StoryProfile {
             outline: text(self.ai.story_outline),
+            detailed_outline: text(self.ai.story_detailed_outline),
             characters: text(self.ai.story_characters),
             open_threads: text(self.ai.story_threads),
             genre: text(self.ai.story_genre),

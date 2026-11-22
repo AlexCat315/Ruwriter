@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::ai_chat;
-use crate::ai_continuation::{self, SCENE_CHARACTERS, ScenePlan, SceneQuestion};
+use crate::ai_continuation::{self, ScenePlan, SceneQuestion};
 use crate::ai_research::{
     self, ResearchCache, ResearchRequest, ResearchRun, ResearchScope, Source,
 };
@@ -30,13 +30,10 @@ use crate::ai_scene::{self, LocalTurn, PendingScene, SceneAnchor, SceneAnswer};
 use crate::ai_story::{self, StoryDraft};
 use crate::ai_voice;
 
-const PRECEDING_CHARACTERS: usize = 2000;
-const REPETITION_REVIEW_CHARACTERS: usize = 6000;
-const MAX_CONTEXT_BYTES: usize = 48 * 1024;
 const MAX_TOOL_ROUNDS: usize = 6;
 const MAX_RESEARCH_ROUNDS: usize = 12;
 const ANSWER_AUDIT_MIN_CHARS: usize = 100;
-const ANSWER_AUDIT_CONTEXT_CHARS: usize = 6000;
+const MAX_EDITOR_ROUNDS: usize = 3;
 
 #[derive(Clone)]
 pub struct WritingTarget {
@@ -48,24 +45,27 @@ pub struct WritingTarget {
 
 impl WritingTarget {
     pub fn context(&self) -> Result<TextBuffer, &'static str> {
-        let range = self
-            .selection
-            .clone()
-            .unwrap_or_else(|| self.insertion.saturating_sub(PRECEDING_CHARACTERS)..self.insertion);
+        self.context_within(usize::MAX)
+    }
+
+    fn context_within(&self, characters: usize) -> Result<TextBuffer, &'static str> {
+        let range = self.selection.clone().unwrap_or_else(|| {
+            self.insertion
+                .saturating_sub(characters.min(self.insertion))
+                ..self.insertion
+        });
         self.fragment(range)
     }
 
     pub fn continuation_context(&self) -> Result<TextBuffer, &'static str> {
+        self.continuation_context_within(usize::MAX)
+    }
+
+    fn continuation_context_within(&self, characters: usize) -> Result<TextBuffer, &'static str> {
         let start = self.selection.as_ref().map_or_else(
-            || self.insertion.saturating_sub(SCENE_CHARACTERS),
+            || self.insertion.saturating_sub(characters.min(self.insertion)),
             |range| range.start,
         );
-        let end_byte = self.buffer.utf8_offset_for_character_index(self.insertion);
-        let budget_start = end_byte.saturating_sub(MAX_CONTEXT_BYTES);
-        let mut start = start.max(self.buffer.character_index_for_utf8_offset(budget_start));
-        if self.buffer.utf8_offset_for_character_index(start) < budget_start {
-            start += 1;
-        }
         self.fragment(start..self.insertion)
     }
 
@@ -74,15 +74,26 @@ impl WritingTarget {
         task: WritingTask,
         attach_for_question: bool,
     ) -> Result<String, &'static str> {
+        self.writing_context_within(task, attach_for_question, usize::MAX)
+    }
+
+    fn writing_context_within(
+        &self,
+        task: WritingTask,
+        attach_for_question: bool,
+        characters: usize,
+    ) -> Result<String, &'static str> {
         let text = match task {
-            WritingTask::Continue => self.continuation_context()?.string_value(),
+            WritingTask::Continue => self.continuation_context_within(characters)?.string_value(),
             WritingTask::Polish => {
                 if self.selection.is_none() {
                     return Err("请先在正文中选中要润色的文字。");
                 }
-                self.context()?.string_value()
+                self.context_within(characters)?.string_value()
             }
-            WritingTask::Request if attach_for_question => self.context()?.string_value(),
+            WritingTask::Request if attach_for_question => {
+                self.context_within(characters)?.string_value()
+            }
             WritingTask::Request => String::new(),
         };
         match task {
@@ -145,11 +156,6 @@ impl WritingTarget {
     }
 
     fn fragment(&self, range: Range<usize>) -> Result<TextBuffer, &'static str> {
-        let bytes = self.buffer.utf8_offset_for_character_index(range.end)
-            - self.buffer.utf8_offset_for_character_index(range.start);
-        if bytes > MAX_CONTEXT_BYTES {
-            return Err("选区或前文过长，请缩小范围后重新打开助手。");
-        }
         Ok(TextBuffer::new(&self.buffer.substring(range)))
     }
 }
@@ -199,11 +205,30 @@ pub fn scene_confirmation(input: &str) -> Option<&str> {
     (command.trim() == "先确认").then(|| request.trim())
 }
 
+#[derive(Clone, Default)]
+pub struct UserOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone)]
+pub struct UserQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<UserOption>,
+    pub multiple: bool,
+    pub recommended: Option<usize>,
+}
+
+pub type AskUser = Arc<dyn Fn(UserQuestion) -> Option<String> + Send + Sync>;
+
 #[derive(Clone)]
 pub enum ModelStatus {
     Indexing,
     Running(WritingStage),
     NeedsDirection(SceneQuestion),
+    NeedsUserAnswer(UserQuestion),
     Ready(Box<WritingResult>),
     Failed(AgentError),
     Cancelled,
@@ -514,28 +539,35 @@ impl WritingResult {
         &mut self,
         model: &AgentModel,
         writer: &AgentModel,
-        on_revision: impl FnOnce(),
+        mut on_revision: impl FnMut(),
     ) {
-        let Some(direction) = self.review_revision_instruction() else {
-            return;
-        };
-        on_revision();
-        let context = &self.draft_context;
-        let Ok(candidate) = context.revise(
-            writer,
-            &self.text.string_value(),
-            &self.sources,
-            &self.revisions,
-            &direction,
-        ) else {
-            return;
-        };
-        let warning = context.local_warning(&candidate, &self.sources);
-        if warning.is_some() && self.repetition_warning.is_none() {
-            return;
-        }
-        let review = context.review(model, &candidate, &self.sources, &self.revisions);
-        if self.review.is_improved_by(&review) {
+        let mut announced = false;
+        for _ in 0..MAX_EDITOR_ROUNDS {
+            let Some(direction) = self.review_revision_instruction() else {
+                break;
+            };
+            if !announced {
+                on_revision();
+                announced = true;
+            }
+            let context = &self.draft_context;
+            let Ok(candidate) = context.revise(
+                writer,
+                &self.text.string_value(),
+                &self.sources,
+                &self.revisions,
+                &direction,
+            ) else {
+                break;
+            };
+            let warning = context.local_warning(&candidate, &self.sources);
+            if warning.is_some() && self.repetition_warning.is_none() {
+                break;
+            }
+            let review = context.review(model, &candidate, &self.sources, &self.revisions);
+            if !self.review.is_improved_by(&review) {
+                break;
+            }
             self.text = TextBuffer::new(&candidate);
             self.original_text = self.text.clone();
             self.reviewed_text = self.text.clone();
@@ -550,13 +582,29 @@ impl WritingResult {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct WritingJob {
     task: WritingTask,
     target: Option<WritingTarget>,
     brief: WritingBrief,
     history: Arc<Vec<ChatTurn>>,
     preview_model: Option<AgentModel>,
+    review_model: Option<AgentModel>,
+    ask_user: Option<AskUser>,
+}
+
+impl Default for WritingJob {
+    fn default() -> Self {
+        Self {
+            task: WritingTask::default(),
+            target: None,
+            brief: WritingBrief::default(),
+            history: Arc::new(Vec::new()),
+            preview_model: None,
+            review_model: None,
+            ask_user: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -581,6 +629,7 @@ pub struct AiState {
     pub voice_samples: Signal<Vec<String>>,
     pub brief_work: Signal<Option<(PathBuf, String)>>,
     pub story_outline: Signal<TextBuffer>,
+    pub story_detailed_outline: Signal<TextBuffer>,
     pub story_characters: Signal<TextBuffer>,
     pub story_threads: Signal<TextBuffer>,
     pub story_genre: Signal<TextBuffer>,
@@ -625,6 +674,7 @@ pub struct AiState {
     pub follow_after_write: Signal<Option<PendingDraftEdit>>,
     pub error: Signal<String>,
     pub archive_read_error: Signal<String>,
+    answers: Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<String>>>>,
 }
 
 impl AiState {
@@ -647,6 +697,7 @@ impl AiState {
             voice_samples: cx.state(Vec::new),
             brief_work: cx.state(|| None),
             story_outline: cx.state(TextBuffer::empty),
+            story_detailed_outline: cx.state(TextBuffer::empty),
             story_characters: cx.state(TextBuffer::empty),
             story_threads: cx.state(TextBuffer::empty),
             story_genre: cx.state(TextBuffer::empty),
@@ -691,6 +742,7 @@ impl AiState {
             follow_after_write: cx.state(|| None),
             error: cx.state(String::new),
             archive_read_error: cx.state(String::new),
+            answers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -936,6 +988,16 @@ impl AiState {
     /// A short-lived confirmation in the composer area. Repeating the same
     /// message restarts the timer; a later message is never cleared by an
     /// older timer.
+    pub fn answer_user_question(&self, id: &str, answer: String) -> Result<(), String> {
+        let sender = self
+            .answers
+            .lock()
+            .map_err(|_| "提问状态已失效。".to_owned())?
+            .remove(id)
+            .ok_or_else(|| "这个问题已经回答过了。".to_owned())?;
+        sender.send(answer).map_err(|_| "生成已停止。".to_owned())
+    }
+
     pub fn flash_feedback(&self, message: impl Into<String>) {
         let message = message.into();
         self.feedback.set(message.clone());
@@ -1469,6 +1531,7 @@ impl AiState {
         self.viewed_result.set(0);
         self.clear_revision();
         let key = self.workspace.get_untracked();
+        let turn = turn_id.clone();
         self.batches.update(|batches| {
             batches.insert(
                 key.clone(),
@@ -1507,12 +1570,15 @@ impl AiState {
 
         let sender = self.batches.sender();
         let cache = self.cache.clone();
+        let answers = self.answers.clone();
         let job = WritingJob {
             task,
             target,
             brief,
             history,
             preview_model: None,
+            review_model: None,
+            ask_user: None,
         };
         std::thread::Builder::new()
             .name("ruwriter-writing-agent".into())
@@ -1534,7 +1600,12 @@ impl AiState {
                     }
                 };
                 std::thread::scope(|scope| {
-                    for (index, tools, adapter) in models {
+                    let review_adapters: Vec<_> = models
+                        .iter()
+                        .map(|(_, _, adapter)| adapter.clone())
+                        .collect();
+                    let reviewer_count = review_adapters.len();
+                    for (position, (index, tools, adapter)) in models.into_iter().enumerate() {
                         let model = buffered_model(adapter.clone(), &flag);
                         let worker_flag = flag.clone();
                         let worker_sender = sender.clone();
@@ -1545,6 +1616,47 @@ impl AiState {
                             research.clone(),
                             job.clone(),
                         );
+                        let ask_answers = answers.clone();
+                        let ask_sender = worker_sender.clone();
+                        let ask_key = worker_key.clone();
+                        let ask_flag = worker_flag.clone();
+                        let ask_turn = turn.clone();
+                        job.ask_user = Some(Arc::new(move |mut question: UserQuestion| {
+                            question.id = format!("{ask_turn}-{index}-{}", ai_chat::new_id());
+                            let id = question.id.clone();
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            if let Ok(mut answers) = ask_answers.lock() {
+                                answers.insert(id.clone(), sender);
+                            } else {
+                                return None;
+                            }
+                            let shown = question.clone();
+                            update_batch(&ask_sender, &ask_key, &ask_flag, move |batch| {
+                                batch.runs[index].status = ModelStatus::NeedsUserAnswer(shown);
+                            });
+                            let answer = loop {
+                                if ask_flag.load(Ordering::Relaxed) {
+                                    break None;
+                                }
+                                match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+                                    Ok(answer) => break Some(answer),
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                        break None;
+                                    }
+                                }
+                            };
+                            if let Ok(mut answers) = ask_answers.lock() {
+                                answers.remove(&id);
+                            }
+                            if answer.is_some() {
+                                update_batch(&ask_sender, &ask_key, &ask_flag, move |batch| {
+                                    batch.runs[index].status =
+                                        ModelStatus::Running(WritingStage::Draft);
+                                });
+                            }
+                            answer
+                        }));
                         job.preview_model = Some(streamed_model(
                             adapter,
                             &worker_sender,
@@ -1552,6 +1664,12 @@ impl AiState {
                             &worker_flag,
                             index,
                         ));
+                        job.review_model = (reviewer_count > 1).then(|| {
+                            let reviewer = review_adapters
+                                [(position + 1) % reviewer_count]
+                                .clone();
+                            buffered_model(reviewer, &flag)
+                        });
                         let worker = std::thread::Builder::new()
                             .name(format!("ruwriter-model-{index}"))
                             .spawn_scoped(scope, move || {
@@ -1846,8 +1964,62 @@ fn cancellable(model: AgentModel, flag: &Arc<AtomicBool>) -> AgentModel {
     })
 }
 
+fn parse_user_questions(input: serde_json::Value) -> Result<Vec<UserQuestion>, AgentError> {
+    let raw = match input.get("questions").and_then(serde_json::Value::as_array) {
+        Some(questions) => questions.clone(),
+        None => vec![input],
+    };
+    if raw.is_empty() || raw.len() > 4 {
+        return Err(AgentError::InvalidResult);
+    }
+    raw.into_iter()
+        .map(|raw| {
+            let question = raw["question"]
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .ok_or(AgentError::InvalidResult)?
+                .to_owned();
+            let header = raw["header"]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or_default()
+                .chars()
+                .take(24)
+                .collect::<String>();
+            let options = raw["options"]
+                .as_array()
+                .ok_or(AgentError::InvalidResult)?
+                .iter()
+                .map(|option| {
+                    let label = option["label"].as_str().unwrap_or_default().trim();
+                    let description = option["description"].as_str().unwrap_or_default().trim();
+                    (!label.is_empty()).then(|| UserOption {
+                        label: label.to_owned(),
+                        description: description.to_owned(),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .filter(|options| (2..=4).contains(&options.len()))
+                .ok_or(AgentError::InvalidResult)?;
+            let recommended = raw["recommended"]
+                .as_u64()
+                .map(|index| index as usize)
+                .filter(|index| *index < options.len());
+            let multiple = raw["multiple"].as_bool().unwrap_or(false);
+            Ok(UserQuestion {
+                id: String::new(),
+                header,
+                question,
+                options,
+                multiple,
+                recommended,
+            })
+        })
+        .collect()
+}
+
 fn recent_messages(history: &[ChatTurn]) -> Vec<AgentMessage> {
-    let mut budget = 32_usize * 1024;
     let mut messages = Vec::new();
     for turn in history.iter().rev() {
         let Some(answer) = &turn.answer else {
@@ -1855,10 +2027,6 @@ fn recent_messages(history: &[ChatTurn]) -> Vec<AgentMessage> {
         };
         let author = turn.author.string_value();
         let answer = answer.string_value();
-        let Some(remaining) = budget.checked_sub(author.len() + answer.len()) else {
-            break;
-        };
-        budget = remaining;
         messages.push(AgentMessage::text(AgentRole::Assistant, answer));
         messages.push(AgentMessage::user(author));
     }
@@ -1895,7 +2063,7 @@ fn audit_request_answer(
     sources: &[&str],
     answer: &str,
 ) -> Result<Option<String>, AgentError> {
-    let excerpt = tail_chars(context, ANSWER_AUDIT_CONTEXT_CHARS);
+    let excerpt = context;
     let evidence = sources
         .iter()
         .take(3)
@@ -2003,8 +2171,13 @@ fn run_writing_agent(
         brief,
         history,
         preview_model,
+        review_model,
+        ask_user,
     } = job;
     let writer = preview_model.as_ref().unwrap_or(&model);
+    // The editor is a fresh context, and when several models are selected it is
+    // deliberately a different provider from the one that drafted.
+    let reviewer = review_model.as_ref().unwrap_or(&model);
     let continuing = task == WritingTask::Continue;
     let confirmation = continuing.then(|| scene_confirmation(prompt)).flatten();
     let prompt = confirmation.unwrap_or(prompt);
@@ -2026,6 +2199,11 @@ fn run_writing_agent(
     }.to_owned();
     if !brief.canon.trim().is_empty() {
         instructions.push_str("\ncanon 是作者确认的作品设定。旧稿或推测与其冲突时，采用已确认的设定，并在接续计划记录疑点。");
+    }
+    if task == WritingTask::Request && !brief.is_empty() {
+        instructions.push_str(
+            "\nstory 是作者确认的大纲、细纲、人设和关系，confirmed_memories 是作者保留的长期记忆，accepted_revisions 是作者认可的改稿对照。涉及人物动机、关系、旧事和后续走向时先核对这些资料；区分已经发生的事与计划中的事，不要忽略或改写它们。",
+        );
     }
     let initial_evidence = if let Some(run) = &mut research {
         instructions.push('\n');
@@ -2078,6 +2256,15 @@ fn run_writing_agent(
         request.to_string()
     } else if !brief.is_empty() {
         let mut request = json!({"request": prompt, "canon": brief.canon, "voice": brief.voice, "avoid": brief.avoid});
+        if !brief.story.is_empty() {
+            request["story"] = json!(brief.story.public_view());
+        }
+        if !brief.memories.is_empty() {
+            request["confirmed_memories"] = json!(brief.memories);
+        }
+        if !brief.feedback.is_empty() {
+            request["accepted_revisions"] = json!(brief.feedback);
+        }
         if task == WritingTask::Polish && !voice_samples.is_empty() {
             request["author_examples"] = json!(voice_samples);
         }
@@ -2133,6 +2320,61 @@ fn run_writing_agent(
     if use_tools && research.is_some() {
         tools.extend(ai_research::tools());
     }
+    let ask_tool = ask_user;
+    if ask_tool.is_some() {
+        let option = JsonSchema::object(
+            [
+                ("label".to_owned(), JsonSchema::string(Some(1), Some(24))),
+                (
+                    "description".to_owned(),
+                    JsonSchema::string(Some(0), Some(120)),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            vec!["label".to_owned(), "description".to_owned()],
+        );
+        let question = JsonSchema::object(
+            [
+                ("header".to_owned(), JsonSchema::string(Some(1), Some(12))),
+                (
+                    "question".to_owned(),
+                    JsonSchema::string(Some(1), Some(200)),
+                ),
+                (
+                    "options".to_owned(),
+                    JsonSchema::array_of(option, Some(4)),
+                ),
+                ("multiple".to_owned(), JsonSchema::boolean()),
+                (
+                    "recommended".to_owned(),
+                    JsonSchema::integer(Some(0.0), Some(3.0)),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            vec![
+                "header".to_owned(),
+                "question".to_owned(),
+                "options".to_owned(),
+            ],
+        );
+        let schema = JsonSchema::object(
+            [(
+                "questions".to_owned(),
+                JsonSchema::array_of(question, Some(4)),
+            )]
+            .into_iter()
+            .collect(),
+            vec!["questions".to_owned()],
+        );
+        tools.push(AgentTool::new(
+            "ask_user",
+            "需要作者才能决定、原稿和资料又无法判断时，向作者提问，最多一次问四个问题。每个问题给出短标题和二到四个可执行选项；推荐项可标 recommended，允许多选时设 multiple。作者也可以自由输入，不要预填答案。能从原稿查到的事实不要问。",
+            schema,
+            true,
+        ));
+    }
     let researching = research.is_some();
     let research = Arc::new(std::sync::Mutex::new(research));
     let tool_research = research.clone();
@@ -2144,6 +2386,24 @@ fn run_writing_agent(
     let toolbox = AgentToolbox::new(
         tools,
         Arc::new(move |name, input| {
+            if name == "ask_user" {
+                let ask = ask_tool
+                    .as_ref()
+                    .ok_or_else(|| AgentError::UnknownTool(name.to_owned()))?;
+                let questions = parse_user_questions(input.clone())?;
+                let mut answers = serde_json::Map::new();
+                for question in questions {
+                    let key = if question.header.is_empty() {
+                        question.question.clone()
+                    } else {
+                        question.header.clone()
+                    };
+                    let answer = ask(question)
+                        .ok_or_else(|| AgentError::Model("作者没有回答这个问题。".to_owned()))?;
+                    answers.insert(key, json!(answer));
+                }
+                return Ok(AgentToolResult::encode(&json!({ "answers": answers }), false));
+            }
             let mut research = tool_research
                 .lock()
                 .map_err(|_| AgentError::InvalidResult)?;
@@ -2217,9 +2477,7 @@ fn run_writing_agent(
         target
             .as_ref()
             .and_then(|target| {
-                let before = target
-                    .insertion
-                    .saturating_sub(REPETITION_REVIEW_CHARACTERS);
+                let before = 0;
                 target.fragment(before..target.insertion).ok()
             })
             .map(|text| text.string_value())
@@ -2254,10 +2512,14 @@ fn run_writing_agent(
         && !context.trim().is_empty()
         && answer.chars().count() >= ANSWER_AUDIT_MIN_CHARS
     {
-        // A failed audit must never lose the answer the author already received.
-        if let Ok(Some(revised)) =
-            audit_request_answer(&model, prompt, &context, &source_texts, &answer)
-        {
+        // Keep the author's answer if the editor model fails; only replace it when
+        // a full, similarly sized revision comes back.
+        for _ in 0..2 {
+            let Ok(Some(revised)) =
+                audit_request_answer(reviewer, prompt, &context, &source_texts, &answer)
+            else {
+                break;
+            };
             answer = revised;
         }
     }
@@ -2302,7 +2564,7 @@ fn run_writing_agent(
         result.review =
             result
                 .draft_context
-                .review(&model, answer.trim(), &result.sources, &result.revisions);
+                .review(reviewer, answer.trim(), &result.sources, &result.revisions);
         if matches!(result.review, Review::Rejected) {
             progress(WritingProgress::Stage(WritingStage::Draft));
             let prose = result.draft_context.revise(
@@ -2321,12 +2583,12 @@ fn run_writing_agent(
             result.review =
                 result
                     .draft_context
-                    .review(&model, &prose, &result.sources, &result.revisions);
+                    .review(reviewer, &prose, &result.sources, &result.revisions);
             if matches!(result.review, Review::Rejected) {
                 return Err(AgentError::Model(ai_continuation::INVALID_DRAFT.to_owned()).into());
             }
         } else {
-            result.revise_checked_issues(&model, writer, || {
+            result.revise_checked_issues(reviewer, writer, || {
                 progress(WritingProgress::Stage(WritingStage::Revise))
             });
         }
@@ -2343,7 +2605,7 @@ mod tests {
     fn story_brief() -> WritingBrief {
         WritingBrief {
             story: StoryProfile {
-                outline: "主角在门口收到一通电话。".to_owned(),
+                outline: "主角在楼下收到一通电话。".to_owned(),
                 characters: "说话人和来访者。".to_owned(),
                 open_threads: "来访者还有事情要说。".to_owned(),
                 genre: "悬疑".into(),
@@ -2378,22 +2640,26 @@ mod tests {
                 let call = calls.fetch_add(1, Ordering::SeqCst);
                 if call == 0 {
                     Ok(AgentReply::Answer(
-                        "好的，以下是回答。赵玥在第一章就说出了自己早就知道闻笙是作家，所以她才会主动搬到隔壁，并一直替闻笙保守这个秘密。".repeat(2),
+                        "好的，以下是回答。阿青在第一章就提到了阿川会修钟表，所以她才来找阿川帮忙。".repeat(3),
+                    ))
+                } else if call == 1 {
+                    assert!(messages[0].text.contains("终稿校对员"));
+                    assert!(messages[1].text.contains("阿青在第一章就提到了"));
+                    Ok(AgentReply::Answer(
+                        r#"{"verdict":"revise","revised":"阿青没有在第一章提到这件事。原文只写到她在巷口停下，随后问了一句天气，并没有写阿川会修钟表，也没有写她知情。"}"#
+                            .to_owned(),
                     ))
                 } else {
                     assert!(messages[0].text.contains("终稿校对员"));
-                    assert!(messages[1].text.contains("赵玥在第一章就说出了"));
-                    Ok(AgentReply::Answer(
-                        r#"{"verdict":"revise","revised":"赵玥没有在第一章说出这件事。原文只写到她在门口停下，随后问了一句租金，并没有提到闻笙的作家身份，也没有写她知情。"}"#
-                            .to_owned(),
-                    ))
+                    assert!(messages[1].text.contains("阿青没有在第一章提到"));
+                    Ok(AgentReply::Answer(r#"{"verdict":"keep"}"#.to_owned()))
                 }
             })
         };
         let result = run_writing_agent(
             model,
-            "赵玥知道闻笙是作家吗？",
-            "第一章 雨夜\n赵玥在门口停下，问他租金多少。".to_owned(),
+            "阿青知道阿川会修钟表吗？",
+            "第一章 雨夜\n阿青在巷口停下，问了一句天气。".to_owned(),
             false,
             None,
             WritingJob {
@@ -2405,9 +2671,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             result.text.string_value(),
-            "赵玥没有在第一章说出这件事。原文只写到她在门口停下，随后问了一句租金，并没有提到闻笙的作家身份，也没有写她知情。"
+            "阿青没有在第一章提到这件事。原文只写到她在巷口停下，随后问了一句天气，并没有写阿川会修钟表，也没有写她知情。"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -2734,7 +3000,7 @@ mod tests {
         let mut brief = story_brief();
         let truth = "她是为了拒绝父亲安排的联姻才离家。";
         brief.story.author_truth = truth.to_owned();
-        brief.story.character_claims = "她说在公司画广告。叙述者只听到这句。".to_owned();
+        brief.story.character_claims = "她说在店里做设计。叙述者只听到这句。".to_owned();
         brief.feedback.push(WritingFeedback {
             instruction: "人物在回避时保留含糊".into(),
             before: "她把身世都说了。".into(),
@@ -2746,7 +3012,7 @@ mod tests {
             assert!(input["story"].get("author_truth").is_none());
             assert_eq!(
                 input["story"]["character_claims"],
-                "她说在公司画广告。叙述者只听到这句。"
+                "她说在店里做设计。叙述者只听到这句。"
             );
             assert_eq!(input["accepted_revisions"][0]["after"], "她只摇了摇头。");
             let answer = if input.get("author_truth_for_review_only").is_some() {
@@ -2759,10 +3025,10 @@ mod tests {
             } else {
                 assert!(!messages[1].text.contains("联姻"));
                 if input.get("scene_before_caret").is_some() {
-                    r#"{"carry_from":"她讲完画的事","settled":[],"advance_to":"我停一停再问"}"#
+                    r#"{"carry_from":"她讲完工作的事","settled":[],"advance_to":"我停一停再问"}"#
                 } else if input.get("revision").is_some() {
                     assert!(input["revision"].as_str().unwrap().contains("超出当前视角"));
-                    "她把平板扣了过去。我没再往下问。"
+                    "她把本子扣了过去。我没再往下问。"
                 } else {
                     "她从前确实是广告设计师。"
                 }
@@ -2772,7 +3038,7 @@ mod tests {
         let revised = run_writing_agent(
             model,
             "这段继续写",
-            "她说在公司画广告。".into(),
+            "她说在店里做设计。".into(),
             false,
             None,
             WritingJob {
@@ -2785,14 +3051,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             revised.text.string_value(),
-            "她把平板扣了过去。我没再往下问。"
+            "她把本子扣了过去。我没再往下问。"
         );
         assert!(revised.can_adopt());
     }
 
     #[test]
     fn a_grounded_question_pauses_the_writer_and_author_answers_keep_the_original_request() {
-        let scene = "她说没事，合上了平板。";
+        let scene = "她说没事，合上了本子。";
         let buffer = TextBuffer::new(scene);
         let target = WritingTarget {
             document: (PathBuf::from("library"), "chapter.txt".into(), 0),
@@ -2801,12 +3067,12 @@ mod tests {
             selection: None,
         };
         let planner: AgentModel = Arc::new(|_, _| {
-            Ok(AgentReply::Answer(r#"{"clarification":{"quote":"合上了平板","question":"李明听出了她在掩饰，还是以为她真的没事？"}}"#.into()))
+            Ok(AgentReply::Answer(r#"{"clarification":{"quote":"合上了本子","question":"阿诚听出了她在掩饰，还是以为她真的没事？"}}"#.into()))
         });
         let writer: AgentModel = Arc::new(|_, _| panic!("unanswered question reached the writer"));
         let result = run_writing_agent(
             planner,
-            "以李明的视角接一拍",
+            "以阿诚的视角接一拍",
             scene.into(),
             false,
             None,
@@ -2821,13 +3087,13 @@ mod tests {
         let Err(WritingRunError::NeedsDirection(question)) = result else {
             panic!("expected a question grounded in the manuscript");
         };
-        assert_eq!(question.quote, "合上了平板");
+        assert_eq!(question.quote, "合上了本子");
         let batch = Batch {
             cancelled: Arc::new(AtomicBool::new(false)),
             task: WritingTask::Continue,
             target: Some(target.clone()),
-            prompt: TextBuffer::new("以李明的视角接一拍"),
-            instruction: "以李明的视角接一拍".into(),
+            prompt: TextBuffer::new("以阿诚的视角接一拍"),
+            instruction: "以阿诚的视角接一拍".into(),
             scene_answer: None,
             history: Arc::new(Vec::new()),
             turn_id: "question".into(),
@@ -2852,7 +3118,7 @@ mod tests {
         assert!(batch.transcript(0)[0].answer.is_some());
         let answer = "听出来了，但只问能不能再看一眼。";
         let resumed = batch.next_instruction(0, Some(&target), answer).unwrap();
-        assert!(resumed.starts_with("以李明的视角接一拍") && resumed.ends_with(answer));
+        assert!(resumed.starts_with("以阿诚的视角接一拍") && resumed.ends_with(answer));
         assert!(batch.next_instruction(0, Some(&target), "").is_err());
         let moved = WritingTarget {
             insertion: 2,
@@ -2867,7 +3133,7 @@ mod tests {
             let input: serde_json::Value = serde_json::from_str(&messages[1].text).unwrap();
             assert_eq!(input["next_beat"], "保留距离感");
             Ok(AgentReply::Answer(
-                r#"{"carry_from":"她收起平板","settled":[],"advance_to":"李明只说一句"}"#.into(),
+                r#"{"carry_from":"她收起本子","settled":[],"advance_to":"阿诚只说一句"}"#.into(),
             ))
         });
         let writer: AgentModel =
@@ -2875,7 +3141,7 @@ mod tests {
         let result = run_writing_agent(
             planner,
             "先确认：保留距离感",
-            "她收起了平板。".into(),
+            "她收起了本子。".into(),
             false,
             None,
             WritingJob {
@@ -2888,14 +3154,14 @@ mod tests {
         );
         assert!(
             matches!(result, Err(WritingRunError::NeedsDirection(question))
-            if question.quote == "她收起了平板。" && question.question.contains("李明只说一句"))
+            if question.quote == "她收起了本子。" && question.question.contains("阿诚只说一句"))
         );
         let invalid: AgentModel =
             Arc::new(|_, _| Ok(AgentReply::Answer("我不知道怎么接。".into())));
         let result = run_writing_agent(
             invalid,
             "先确认",
-            "她收起了平板。".into(),
+            "她收起了本子。".into(),
             false,
             None,
             WritingJob {
@@ -2908,7 +3174,7 @@ mod tests {
         );
         assert!(
             matches!(result, Err(WritingRunError::NeedsDirection(question))
-            if question.quote == "她收起了平板。" && question.question.contains("希望人物怎么回应"))
+            if question.quote == "她收起了本子。" && question.question.contains("希望人物怎么回应"))
         );
     }
 
@@ -2919,7 +3185,7 @@ mod tests {
         let result = run_writing_agent(
             planning,
             "续写",
-            "她把钥匙放到了门口。".into(),
+            "她把钥匙放到了桌角。".into(),
             false,
             None,
             WritingJob {
@@ -2940,43 +3206,43 @@ mod tests {
         let mut brief = story_brief();
         brief.story.character_cards = vec![
             ruwriter_core::CharacterCard {
-                name: "李明".into(),
-                surface: "看似在意实用和生计".into(),
-                motive: "理想主义被现实压制，仍然珍惜创作".into(),
+                name: "阿诚".into(),
+                surface: "看似只看结果".into(),
+                motive: "想把事情做好，但不愿被看轻".into(),
                 ..Default::default()
             },
             ruwriter_core::CharacterCard {
-                name: "赵玥".into(),
-                motive: "希望真实喜欢的画被认同".into(),
-                defense: "被说太艺术后，把认真创作说成闲画".into(),
+                name: "阿青".into(),
+                motive: "希望自己的手艺被认真看待".into(),
+                defense: "被说没用后，把认真准备说成随手做的".into(),
                 ..Default::default()
             },
         ];
         brief.story.relationships = vec![ruwriter_core::RelationshipCard {
-            from: "李明".into(),
-            to: "赵玥".into(),
-            state: "她刚收起平板".into(),
-            direction: "通过理解她的热爱建立信任".into(),
-            boundary: "此处不以卖钱衡量她的画".into(),
+            from: "阿诚".into(),
+            to: "阿青".into(),
+            state: "她刚收起本子".into(),
+            direction: "通过具体观察理解她的用心".into(),
+            boundary: "此处不以有没有用衡量她的手艺".into(),
         }];
-        let scene = "“这是不是有些太‘艺术’了？”\n“这些东西平时闲着没事干画着玩的。”\n她收起了平板，重新回沙发上。";
-        let wrong = "“你这画，卖过钱没有？”";
-        let grounded = "我望着她膝上的平板。“刚才那张，能再让我看看吗？”";
+        let scene = "“这是不是有些太‘讲究’了？”\n“平时随手做的。”\n她收起了本子，靠在沙发扶手上。";
+        let wrong = "“你做这些，能换钱吗？”";
+        let grounded = "我看着她手边的本子。“刚才那页，能再让我看看吗？”";
 
         for repair_works in [true, false] {
             let model: AgentModel = Arc::new(move |messages, _| {
                 let input: serde_json::Value = serde_json::from_str(&messages[1].text).unwrap();
-                assert_eq!(input["story"]["character_cards"][0]["name"], "李明");
-                assert_eq!(input["story"]["relationships"][0]["to"], "赵玥");
+                assert_eq!(input["story"]["character_cards"][0]["name"], "阿诚");
+                assert_eq!(input["story"]["relationships"][0]["to"], "阿青");
                 let reply = if input.get("scene_before_caret").is_some() {
                     json!({
-                        "carry_from": "赵玥把平板收起",
-                        "settled": ["她已展示过画"],
-                        "advance_to": "李明用具体观察表达兴趣",
+                        "carry_from": "阿青把本子收起",
+                        "settled": ["她已展示过成品"],
+                        "advance_to": "阿诚用具体观察表达兴趣",
                         "character_beats": [{
-                            "character": "李明",
-                            "trigger": "她因太艺术而收起平板",
-                            "trigger_quote": "她收起了平板",
+                            "character": "阿诚",
+                            "trigger": "她因被说讲究而收起本子",
+                            "trigger_quote": "她收起了本子",
                             "surface_response": "请她再展示一下",
                             "relation_effect": "让她感到他认真看过"
                         }]
@@ -2985,26 +3251,26 @@ mod tests {
                 } else if input.get("author_truth_for_review_only").is_some() {
                     assert_eq!(
                         input["continuity"]["character_beats"][0]["character"],
-                        "李明"
+                        "阿诚"
                     );
                     let issues = if input["candidate"] == wrong {
                         json!([{
                             "kind": "character",
-                            "character": "李明",
-                            "quote": "卖过钱没有",
-                            "reason": "用商业价值评判她刚刚试图藏起来的热爱"
+                            "character": "阿诚",
+                            "quote": "能换钱吗",
+                            "reason": "用有没有用评判她刚刚收起来的本子"
                         }])
                     } else {
                         json!([])
                     };
                     json!({"usable":true,"issues":issues}).to_string()
                 } else if let Some(instruction) = input["revision"].as_str() {
-                    assert!(instruction.contains("李明") && instruction.contains("卖过钱没有"));
+                    assert!(instruction.contains("阿诚") && instruction.contains("能换钱吗"));
                     if repair_works { grounded } else { wrong }.into()
                 } else {
                     assert_eq!(
                         input["continuity"]["character_beats"][0]["character"],
-                        "李明"
+                        "阿诚"
                     );
                     wrong.into()
                 };
