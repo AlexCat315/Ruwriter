@@ -299,6 +299,12 @@ pub struct ChatTurn {
     pub author: TextBuffer,
     pub answer: Option<TextBuffer>,
     pub adopted: bool,
+    /// Model that produced this answer. Kept with the turn so a reopened
+    /// conversation still says which service answered, not just the current
+    /// picker selection.
+    pub model: Option<String>,
+    /// Seconds since the Unix epoch, captured when the turn was started.
+    pub at: Option<u64>,
     pub(crate) local: Option<LocalTurn>,
 }
 
@@ -313,6 +319,11 @@ pub struct Batch {
     scene_answer: Option<SceneAnswer>,
     pub history: Arc<Vec<ChatTurn>>,
     turn_id: String,
+    pub created_at: u64,
+    /// The reply this turn replaces while a regenerate is in flight. The
+    /// archive keeps it until the new answer exists, so a failed retry does
+    /// not erase the old one.
+    fallback: Option<ChatTurn>,
     selected: usize,
     pub archive_error: Option<String>,
     scope: ResearchScope,
@@ -400,7 +411,8 @@ impl Batch {
     fn transcript(&self, selected: usize) -> Arc<Vec<ChatTurn>> {
         let mut history = self.history.clone();
         let index = self.adopted.unwrap_or(selected);
-        let answer = match self.runs.get(index).map(|run| &run.status) {
+        let run = self.runs.get(index);
+        let generated = match run.map(|run| &run.status) {
             Some(ModelStatus::Ready(result)) => Some(result.text.clone()),
             Some(ModelStatus::NeedsDirection(question)) => Some(TextBuffer::new(&format!(
                 "「{}」\n\n{}",
@@ -408,6 +420,8 @@ impl Batch {
             ))),
             _ => None,
         };
+        let fallback = self.fallback.as_ref().filter(|turn| turn.id == self.turn_id);
+        let answer = generated.or_else(|| fallback.and_then(|turn| turn.answer.clone()));
         Arc::make_mut(&mut history).push(ChatTurn {
             id: self.turn_id.clone(),
             markdown: self.task == WritingTask::Request,
@@ -415,6 +429,11 @@ impl Batch {
             author: self.prompt.clone(),
             answer,
             adopted: self.applied(),
+            model: fallback.map_or_else(
+                || run.map(|run| run.profile.model.clone()),
+                |turn| turn.model.clone(),
+            ),
+            at: fallback.map_or(Some(self.created_at), |turn| turn.at),
             local: Some(LocalTurn {
                 pending: self.scene_question(index).and_then(|question| {
                     Some(PendingScene {
@@ -878,6 +897,8 @@ impl AiState {
                                 .collect(),
                         ),
                         turn_id: turn.id.clone(),
+                        created_at: turn.at.unwrap_or_else(ruwriter_core::document::now),
+                        fallback: None,
                         selected: 0,
                         archive_error: None,
                         scope: pending.scope,
@@ -907,6 +928,33 @@ impl AiState {
             || self.archived_chat(),
             |batch| batch.transcript(batch.selected),
         )
+    }
+
+    /// A short-lived confirmation in the composer area. Repeating the same
+    /// message restarts the timer; a later message is never cleared by an
+    /// older timer.
+    pub fn flash_feedback(&self, message: impl Into<String>) {
+        let message = message.into();
+        self.feedback.set(message.clone());
+        let sender = self.feedback.sender();
+        if std::thread::Builder::new()
+            .name("ruwriter-ai-feedback".into())
+            .spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                sender.update_if(move |value| {
+                    if *value == message {
+                        value.clear();
+                        true
+                    } else {
+                        false
+                    }
+                });
+            })
+            .is_err()
+        {
+            // The message still shows until the next action; a missing
+            // timer is not worth surfacing as an error.
+        }
     }
 
     pub fn show_branches(&self) -> Result<(), String> {
@@ -1309,16 +1357,22 @@ impl AiState {
         profiles: Vec<AiPreferences>,
         research: Option<ResearchRequest>,
         brief: WritingBrief,
+        history_override: Option<Arc<Vec<ChatTurn>>>,
     ) -> Result<(), String> {
         let previous = self.current_batch();
         if previous.as_ref().is_some_and(Batch::busy) {
             return Ok(());
         }
+        let replay = history_override.is_some();
         let prompt = self.prompt.get_untracked().string_value();
         let task = self.task.get_untracked();
         let target = self.target.get_untracked();
         let instruction = match &previous {
-            Some(batch) if task == WritingTask::Continue && self.follow_draft.get_untracked() => {
+            Some(batch)
+                if history_override.is_none()
+                    && task == WritingTask::Continue
+                    && self.follow_draft.get_untracked() =>
+            {
                 batch.next_instruction(
                     self.viewed_result.get_untracked(),
                     target.as_ref(),
@@ -1366,13 +1420,19 @@ impl AiState {
             })
             .collect();
         let flag = Arc::new(AtomicBool::new(false));
-        let history = previous.as_ref().map_or_else(
-            || self.archived.get_untracked(),
-            |batch| batch.transcript(self.viewed_result.get_untracked()),
-        );
+        let history = history_override.unwrap_or_else(|| {
+            previous.as_ref().map_or_else(
+                || self.archived.get_untracked(),
+                |batch| batch.transcript(self.viewed_result.get_untracked()),
+            )
+        });
         let scene_answer = previous
             .as_ref()
-            .filter(|_| task == WritingTask::Continue && self.follow_draft.get_untracked())
+            .filter(|_| {
+                !replay
+                    && task == WritingTask::Continue
+                    && self.follow_draft.get_untracked()
+            })
             .and_then(|batch| {
                 Some(SceneAnswer {
                     anchor: SceneAnchor::capture(target.as_ref()?)?,
@@ -1395,6 +1455,13 @@ impl AiState {
         } else {
             prompt.trim()
         };
+        let turn_id = if replay {
+            previous
+                .as_ref()
+                .map_or_else(ai_chat::new_id, |batch| batch.turn_id.clone())
+        } else {
+            ai_chat::new_id()
+        };
         self.viewed_source.set(None);
         self.viewed_result.set(0);
         self.clear_revision();
@@ -1411,7 +1478,15 @@ impl AiState {
                     instruction: instruction.clone(),
                     scene_answer,
                     history: history.clone(),
-                    turn_id: ai_chat::new_id(),
+                    turn_id,
+                    created_at: ruwriter_core::document::now(),
+                    fallback: if replay {
+                        previous.as_ref().and_then(|batch| {
+                            batch.transcript(batch.selected).last().cloned()
+                        })
+                    } else {
+                        None
+                    },
                     selected: 0,
                     archive_error: None,
                     scope: self.scope.get_untracked(),
@@ -2218,6 +2293,8 @@ mod tests {
                 author: TextBuffer::new("银匣交给了谁？"),
                 answer: Some(TextBuffer::new("交给了晏澄。")),
                 adopted: false,
+                model: None,
+                at: None,
                 local: None,
             },
             ChatTurn {
@@ -2227,6 +2304,8 @@ mod tests {
                 author: TextBuffer::new("这一条没有答复"),
                 answer: None,
                 adopted: false,
+                model: None,
+                at: None,
                 local: None,
             },
         ]);
@@ -2611,6 +2690,8 @@ mod tests {
             scene_answer: None,
             history: Arc::new(Vec::new()),
             turn_id: "question".into(),
+            created_at: 0,
+            fallback: None,
             selected: 0,
             archive_error: None,
             scope: ResearchScope::Excerpt,

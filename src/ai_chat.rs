@@ -51,6 +51,10 @@ struct Turn {
     answer: Option<String>,
     adopted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     local: Option<LocalTurn>,
 }
 
@@ -85,6 +89,8 @@ fn encode_archive(turns: &[ChatTurn], timeline: Option<&Timeline>) -> io::Result
                 author: turn.author.string_value(),
                 answer: turn.answer.as_ref().map(TextBuffer::string_value),
                 adopted: turn.adopted,
+                model: turn.model.clone(),
+                at: turn.at,
                 local: if retain_local {
                     turn.local.clone()
                 } else {
@@ -140,6 +146,8 @@ fn decode_archive(path: &Path, retain_local: bool) -> io::Result<Conversation> {
             author: TextBuffer::new(&turn.author),
             answer: turn.answer.map(|answer| TextBuffer::new(&answer)),
             adopted: turn.adopted,
+            model: turn.model,
+            at: turn.at,
             local: if retain_local { turn.local } else { None },
         })
         .collect();
@@ -380,6 +388,8 @@ mod tests {
             author: TextBuffer::new(title),
             answer: Some(TextBuffer::new("一轮答复")),
             adopted: false,
+            model: None,
+            at: None,
             local: None,
         };
         let first = turn("1", "第一轮");
@@ -435,6 +445,8 @@ mod tests {
             author: TextBuffer::new("只接一个动作"),
             answer: Some(TextBuffer::new(&question.question)),
             adopted: false,
+            model: None,
+            at: None,
             local: Some(LocalTurn {
                 pending: Some(PendingScene {
                     anchor: anchor.clone(),
@@ -514,6 +526,8 @@ mod tests {
             author: TextBuffer::new("再写一段"),
             answer: Some(TextBuffer::new("她问我什么时候回来。")),
             adopted: false,
+            model: None,
+            at: None,
             local: Some(LocalTurn::default()),
         };
         let updated = ChatTurn {
@@ -546,5 +560,42 @@ mod tests {
             decode(&path).err().unwrap().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn turns_keep_model_and_time_without_breaking_older_archives() {
+        let root = tempfile::tempdir().unwrap();
+        let stamped = ChatTurn {
+            id: new_id(),
+            markdown: true,
+            task: Some(WritingTask::Request),
+            author: TextBuffer::new("帮我写一个开场"),
+            answer: Some(TextBuffer::new("雨从站台顶棚漏下来。")),
+            adopted: false,
+            model: Some("deepseek-chat".into()),
+            at: Some(1_700_000_000),
+            local: None,
+        };
+        save(
+            root.path(),
+            "uid:1",
+            std::slice::from_ref(&stamped),
+            Some(&stamped.id),
+        )
+        .unwrap();
+        let reopened = load(root.path(), "uid:1").unwrap();
+        assert_eq!(reopened[0].model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(reopened[0].at, Some(1_700_000_000));
+
+        let legacy = root.path().join("legacy.json");
+        std::fs::write(
+            &legacy,
+            r#"{"version":1,"turns":[{"id":"1","author":"旧对话","answer":"旧答复","adopted":false}]}"#,
+        )
+        .unwrap();
+        let loaded = decode(&legacy).unwrap();
+        assert_eq!(loaded[0].author.string_value(), "旧对话");
+        assert!(loaded[0].model.is_none());
+        assert!(loaded[0].at.is_none());
     }
 }

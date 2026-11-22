@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use cove_ui::compose::primitives::text::TextBuffer;
 use cove_ui::compose::primitives::text::text_field::{
@@ -33,7 +34,7 @@ use ruwriter_core::{
 };
 
 use crate::ai::{
-    AiState, ModelStatus, PendingDraftEdit, StoryStatus, WritingTarget, WritingTask,
+    AiState, ChatTurn, ModelStatus, PendingDraftEdit, StoryStatus, WritingTarget, WritingTask,
     continuation_insertion, is_continuation_command,
 };
 use crate::ai_research::{ManuscriptFile, ResearchRequest, ResearchScope};
@@ -1203,6 +1204,21 @@ impl Model {
             .set(self.ai.move_conversation(tip).err().unwrap_or_default());
     }
 
+    /// Start a fresh conversation at the same manuscript. The previous
+    /// branch stays reachable from 回退与分支.
+    pub fn new_ai_conversation(&self) {
+        if self.ai.current_batch().is_some_and(|batch| batch.busy()) {
+            return;
+        }
+        self.ai.prompt.set(TextBuffer::empty());
+        match self.ai.move_conversation(None) {
+            Ok(()) => self
+                .ai
+                .flash_feedback("已开始新对话。旧对话保留在「回退与分支」中。"),
+            Err(error) => self.ai.error.set(error),
+        }
+    }
+
     pub fn export_ai_chat(&self) {
         let contents = match crate::ai_chat::encode(&self.ai.current_chat()) {
             Ok(contents) => contents,
@@ -1427,12 +1443,47 @@ impl Model {
         self.run_ai();
     }
 
+    /// Ask for a fresh answer to the current request without feeding the
+    /// previous reply back to the model. The old draft is replaced, not
+    /// appended to the transcript.
+    pub fn regenerate_ai(&self) {
+        let Some(batch) = self
+            .ai
+            .current_batch()
+            .filter(|batch| !batch.busy() && !batch.applied())
+        else {
+            return;
+        };
+        let index = self.ai.viewed_result.get_untracked();
+        let Some(run) = batch.runs.get(index) else {
+            return;
+        };
+        if !matches!(run.status, ModelStatus::Ready(_)) {
+            return;
+        }
+        if let Some(target) = batch.target.clone() {
+            self.ai.target.set(Some(target.clone()));
+        }
+        self.ai.task.set(batch.writing_task());
+        self.ai.follow_draft.set(false);
+        self.ai
+            .prompt
+            .set(batch.retry_prompt(self.ai.target.get_untracked().as_ref()));
+        self.ai.error.set(String::new());
+        self.ai.feedback.set(String::new());
+        self.run_ai_at_target_with(Some(batch.history.clone()));
+    }
+
     fn run_ai(&self) {
         self.update_ai_target(false);
         self.run_ai_at_target();
     }
 
     fn run_ai_at_target(&self) {
+        self.run_ai_at_target_with(None);
+    }
+
+    fn run_ai_at_target_with(&self, history: Option<Arc<Vec<ChatTurn>>>) {
         let result = (|| {
             if let Some(target) = self.ai.target.get_untracked()
                 && (self.ai_document().as_ref() != Some(&target.document)
@@ -1464,7 +1515,8 @@ impl Model {
                 return self.prepare_story_request();
             }
             let prepared = self.ai_inputs(scope)?;
-            self.ai.start(prepared.0, prepared.1, brief)
+            self.ai
+                .start(prepared.0, prepared.1, brief, history.clone())
         })();
         self.ai.error.set(result.err().unwrap_or_default());
     }
