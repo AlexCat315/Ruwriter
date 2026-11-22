@@ -64,6 +64,7 @@ pub fn handle(event: &KeyEvent, model: &Model) -> bool {
         Scancode::K => model.toggle_palette(),
         Scancode::L if shift => model.toggle_outline(),
         Scancode::B if !shift => model.format(Command::Bold),
+        I if shift => model.import_picker(),
         I if !shift => model.format(Command::Italic),
         Scancode::X if shift => model.format(Command::Strikethrough),
         H if shift => model.format(Command::Heading),

@@ -3,6 +3,14 @@
 <plist version="1.0"><dict>
     <key>UIFileSharingEnabled</key><true/>
     <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+    <key>CFBundleIcons</key>
+    <dict><key>CFBundlePrimaryIcon</key>
+        <dict><key>CFBundleIconFiles</key><array><string>AppIcon120</string><string>AppIcon180</string></array></dict>
+    </dict>
+    <key>CFBundleIcons~ipad</key>
+    <dict><key>CFBundlePrimaryIcon</key>
+        <dict><key>CFBundleIconFiles</key><array><string>AppIcon152</string><string>AppIcon167</string></array></dict>
+    </dict>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

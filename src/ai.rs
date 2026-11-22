@@ -1046,6 +1046,13 @@ impl AiState {
             return Ok(());
         }
         let model = self.model_adapter(profile)?;
+        let anchor = self
+            .target
+            .get_untracked()
+            .as_ref()
+            .and_then(SceneAnchor::capture)
+            .ok_or_else(|| AgentError::Model("请先把光标放在需要续写的位置。".to_owned()))?;
+        self.story_page.set(0);
         let key = self.workspace.get_untracked();
         let token = Arc::new(AtomicBool::new(false));
         self.stories.update(|stories| {
@@ -1087,7 +1094,8 @@ impl AiState {
                     })
                 });
                 update(match result {
-                    Ok(draft) => {
+                    Ok(mut draft) => {
+                        draft.anchor = Some(anchor);
                         if !token.load(Ordering::Relaxed)
                             && let Some((root, id)) = key.as_ref()
                             && let Err(error) = ai_chat::save_story(root, id, &draft)

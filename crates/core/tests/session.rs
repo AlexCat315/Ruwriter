@@ -1,6 +1,6 @@
 use ruwriter_core::files::{read_document, write_document};
 use ruwriter_core::{
-    AiPreferences, AppearancePreference, Collection, Rescan, Session, WritingBrief,
+    AiPreferences, AppearancePreference, Collection, Rescan, Session, WritingBrief, WritingMode,
 };
 use std::path::Path;
 
@@ -10,6 +10,68 @@ fn library(session: &Session) -> &Path {
 
 fn active_path(session: &Session) -> std::path::PathBuf {
     session.active_document().expect("active").path.clone()
+}
+
+#[test]
+fn active_file_format_overrides_new_document_preference() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::at(root.path());
+    assert_eq!(session.writing_mode(), WritingMode::Novel);
+    session.set_writing_mode(WritingMode::Markdown);
+    assert_eq!(session.writing_mode(), WritingMode::Novel);
+    session.create("").unwrap();
+    assert_eq!(session.writing_mode(), WritingMode::Markdown);
+    let outside = root.path().join("正文.TXT");
+    std::fs::write(&outside, "# 字面井号").unwrap();
+    session.open_path(&outside, "").unwrap();
+    assert_eq!(session.writing_mode(), WritingMode::Novel);
+}
+
+#[test]
+fn batch_import_copies_legacy_text_and_preserves_names_and_originals() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = Session::at(root.path());
+    let folder = session.create_folder("", "小说").unwrap();
+    let source = root.path().join("章节.TXT");
+    let markdown = root.path().join("提纲.markdown");
+    let unsupported = root.path().join("附件.pdf");
+    let gbk = [0xd3, 0xea, 0xd2, 0xb9];
+    std::fs::write(&source, gbk).unwrap();
+    let utf16: Vec<_> = [0xff, 0xfe]
+        .into_iter()
+        .chain("# 提纲".encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    std::fs::write(&markdown, &utf16).unwrap();
+    let (copied, failures) = session
+        .import_files(
+            &[
+                source.clone(),
+                source.clone(),
+                unsupported,
+                markdown.clone(),
+            ],
+            &folder,
+            "",
+        )
+        .unwrap();
+    assert_eq!(copied, 3);
+    assert_eq!(failures.len(), 1);
+    let target = session.library_root().join(folder);
+    assert_eq!(
+        std::fs::read_to_string(target.join("章节.TXT")).unwrap(),
+        "雨夜"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("章节 2.TXT")).unwrap(),
+        "雨夜"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("提纲.markdown")).unwrap(),
+        "# 提纲"
+    );
+    assert_eq!(std::fs::read(source).unwrap(), gbk);
+    assert_eq!(std::fs::read(markdown).unwrap(), utf16);
+    assert_eq!(session.writing_mode(), WritingMode::Markdown);
 }
 
 #[test]

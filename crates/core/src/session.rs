@@ -16,7 +16,10 @@ use crate::document::{
     DOCUMENT_EXTENSION, DocStatus, Document, UNTITLED, derive, file_name_for, file_stem,
     normalize_tags, now,
 };
-use crate::files::{Stamp, move_path, read_document, stamp, unique_path, write_document};
+use crate::files::{
+    Stamp, move_path, read_document, read_import_text, stamp, unique_path, write_document,
+    write_new_document,
+};
 use crate::library::{
     AppearancePreference, Collection, Library, Meta, Settings, SortOrder, WritingMode, name_of,
     parent_of,
@@ -361,7 +364,9 @@ impl Session {
     }
 
     pub fn writing_mode(&self) -> WritingMode {
-        self.app.settings.writing_mode
+        self.active_document()
+            .and_then(|doc| WritingMode::from_path(&doc.path))
+            .unwrap_or(self.app.settings.writing_mode)
     }
 
     pub fn set_writing_mode(&mut self, mode: WritingMode) {
@@ -799,6 +804,77 @@ impl Session {
         self.open_document(&id);
         self.persist();
         Ok(self.saved.clone())
+    }
+
+    /// Copies imported manuscripts into the selected library folder.
+    pub fn import_files(
+        &mut self,
+        paths: &[PathBuf],
+        folder: &str,
+        current: &str,
+    ) -> Result<(usize, Vec<String>), String> {
+        if !folder.is_empty() && self.library.folder(folder).is_none() {
+            return Err("导入目标文件夹已移动或删除。".to_owned());
+        }
+        self.autosave(current)?;
+        let directory = self.folder_path(folder);
+        let mut copied = 0;
+        let mut failures = Vec::new();
+        let mut last = None;
+        for source in paths {
+            let result = self.import_file(source, &directory);
+            match result {
+                Ok(id) => {
+                    copied += 1;
+                    last = Some(id);
+                }
+                Err(error) => failures.push(format!(
+                    "{}：{error}",
+                    source
+                        .file_name()
+                        .unwrap_or(source.as_os_str())
+                        .to_string_lossy()
+                )),
+            }
+        }
+        if let Some(id) = last {
+            self.library.scan();
+            self.app.settings.collection = Collection::All;
+            self.app.settings.folder = (!folder.is_empty()).then(|| folder.to_owned());
+            self.open_document(&id);
+            self.persist();
+        }
+        Ok((copied, failures))
+    }
+
+    fn import_file(&mut self, source: &Path, directory: &Path) -> Result<String, String> {
+        if WritingMode::from_path(source).is_none() {
+            return Err("仅支持 TXT、MD 和 MARKDOWN 文稿。".to_owned());
+        }
+        let text = read_import_text(source).map_err(|error| error.to_string())?;
+        let stem = file_stem(source);
+        let stem = if stem.starts_with('.') {
+            file_name_for(stem.trim_start_matches('.'))
+        } else {
+            stem
+        };
+        let extension = extension(source);
+        let path = loop {
+            let path = unique_path(directory, &stem, &extension, None);
+            match write_new_document(&path, &text) {
+                Ok(()) => break path,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        let id = self
+            .library
+            .id_for(&path)
+            .ok_or("无法在资料库中定位导入的文稿。")?;
+        let meta = self.library.state.entries.entry(id.clone()).or_default();
+        meta.uid = crate::sync::new_sync_id();
+        meta.created_at = now();
+        Ok(id)
     }
 
     /// Switches to another library folder.

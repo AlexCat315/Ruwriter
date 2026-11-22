@@ -50,6 +50,13 @@ impl View for Palette {
             )
             .keywords(["open", "dakai"]),
             command(
+                "导入到资料库…",
+                "文稿",
+                icons::file::folder_open(),
+                Rc::new(Model::import_picker),
+            )
+            .keywords(["import", "daoru", "txt", "md"]),
+            command(
                 "AI 助手…",
                 "写作",
                 icons::status::sparkles(),
@@ -96,10 +103,10 @@ impl View for Palette {
                 "history", "version", "snapshot", "lishi", "huifu", "kuaizhao",
             ]),
             command(
-                if model.writing_mode() == ruwriter_core::WritingMode::Novel {
-                    "切换为 Markdown 模式"
+                if model.settings().writing_mode == ruwriter_core::WritingMode::Novel {
+                    "新建文稿使用 Markdown"
                 } else {
-                    "切换为小说模式（纯文本）"
+                    "新建文稿使用 TXT"
                 },
                 "写作模式",
                 icons::text::type_(),
@@ -108,9 +115,9 @@ impl View for Palette {
             .keywords(["novel", "markdown", "xiaoshuo", "moshi", "mode"]),
             command(
                 if model.paragraph_indent() {
-                    "关闭段首缩进"
+                    "关闭 TXT 自动显示段首缩进"
                 } else {
-                    "开启段首缩进"
+                    "开启 TXT 自动显示段首缩进"
                 },
                 "排版",
                 icons::text::type_(),
@@ -282,7 +289,19 @@ impl View for Palette {
                 .keywords(["sort", "paixu"]),
             );
         }
-        let formats: [(&str, BundleImageResource, Command, [&str; 2]); 9] = [
+        let formats: [(&str, BundleImageResource, Command, [&str; 2]); 11] = [
+            (
+                "写入两格段首空格",
+                icons::text::type_(),
+                Command::IndentParagraphs,
+                ["indent", "duanshou"],
+            ),
+            (
+                "删除文件中的段首空格",
+                icons::text::type_(),
+                Command::UnindentParagraphs,
+                ["unindent", "duanshou"],
+            ),
             (
                 "加粗",
                 icons::text::bold(),
@@ -339,6 +358,11 @@ impl View for Palette {
             ),
         ];
         for (title, icon, format_command, keywords) in formats {
+            if format_command.is_plain_text()
+                != (model.writing_mode() == ruwriter_core::WritingMode::Novel)
+            {
+                continue;
+            }
             items.push(
                 command(
                     title,

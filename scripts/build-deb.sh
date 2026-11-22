@@ -28,6 +28,11 @@ Categories=Office;Utility;TextEditor;
 MimeType=text/plain;text/markdown;
 StartupWMClass=ruwriter
 EOF
+if [ -f "$FOLDER/ruwriter.png" ]; then
+  mkdir -p "$root/usr/share/icons/hicolor/256x256/apps"
+  install -m 644 "$FOLDER/ruwriter.png" "$root/usr/share/icons/hicolor/256x256/apps/ruwriter.png"
+  echo 'Icon=ruwriter' >> "$root/usr/share/applications/ruwriter.desktop"
+fi
 
 cat > "$root/DEBIAN/control" <<EOF
 Package: ruwriter

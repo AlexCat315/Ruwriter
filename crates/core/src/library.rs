@@ -159,6 +159,18 @@ impl LineSpacing {
 }
 
 impl WritingMode {
+    pub fn from_path(path: &Path) -> Option<Self> {
+        let extension = path.extension()?.to_str()?;
+        if extension.eq_ignore_ascii_case("txt") {
+            Some(Self::Novel)
+        } else if extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        {
+            Some(Self::Markdown)
+        } else {
+            None
+        }
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Self::Novel => "小说",

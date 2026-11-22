@@ -291,7 +291,9 @@ impl Model {
     // MARK: - Writing mode
 
     pub fn writing_mode(&self) -> ruwriter_core::WritingMode {
-        self.settings().writing_mode
+        let _ = self.document.get();
+        self.read(Session::writing_mode)
+            .unwrap_or(self.settings().writing_mode)
     }
 
     pub fn set_writing_mode(&self, mode: ruwriter_core::WritingMode) {
@@ -304,7 +306,7 @@ impl Model {
     }
 
     pub fn toggle_writing_mode(&self) {
-        let mode = match self.writing_mode() {
+        let mode = match self.settings().writing_mode {
             ruwriter_core::WritingMode::Novel => ruwriter_core::WritingMode::Markdown,
             ruwriter_core::WritingMode::Markdown => ruwriter_core::WritingMode::Novel,
         };
@@ -505,9 +507,7 @@ impl Model {
     /// selection. The edit goes through the field's undoable edit request, so
     /// Ctrl+Z steps back over it and the selection survives the wrap.
     pub fn format(&self, command: Command) {
-        // Novel mode is plain text: inserting `**` or `#` would put markup
-        // into the manuscript. Formatting is a Markdown-mode tool.
-        if self.writing_mode() == ruwriter_core::WritingMode::Novel {
+        if command.is_plain_text() != (self.writing_mode() == ruwriter_core::WritingMode::Novel) {
             return;
         }
         let buffer = self.buffer.get_untracked();
@@ -529,6 +529,9 @@ impl Model {
             selection,
             command,
         );
+        if edit.text == text {
+            return;
+        }
         let edited = TextBuffer::new(&edit.text);
         let grapheme_index = |index| {
             let byte = edit
@@ -913,6 +916,16 @@ impl Model {
 
     pub fn open_ai_continuation(&self) {
         self.show_ai(Some(WritingTask::Continue));
+    }
+
+    pub fn continue_ai_at_end(&self) {
+        let buffer = self.buffer.get_untracked();
+        let end = buffer.character_count();
+        self.ai.task.set(WritingTask::Continue);
+        self.ai.follow_draft.set(false);
+        self.set_ai_target(buffer, None, end, false);
+        self.navigate(end, None, false);
+        self.run_ai_at_target();
     }
 
     fn show_ai(&self, task: Option<WritingTask>) {
@@ -1416,6 +1429,10 @@ impl Model {
 
     fn run_ai(&self) {
         self.update_ai_target(false);
+        self.run_ai_at_target();
+    }
+
+    fn run_ai_at_target(&self) {
         let result = (|| {
             if let Some(target) = self.ai.target.get_untracked()
                 && (self.ai_document().as_ref() != Some(&target.document)
@@ -1620,7 +1637,25 @@ impl Model {
         let Some(StoryStatus::Ready(mut draft)) = self.ai.story_status() else {
             return;
         };
-        draft.profile.direction = self.ai.story_direction.get_untracked().string_value();
+        self.update_ai_target(false);
+        let Some(target) = self.ai.target.get_untracked().and_then(|target| {
+            if let Some(anchor) = &draft.anchor {
+                anchor.restore(&target)
+            } else {
+                target.continuation_anchor().map(|_| target)
+            }
+        }) else {
+            self.ai
+                .error
+                .set("梳理时的落笔点已发生变化。请在正文定位后重新梳理。".to_owned());
+            return;
+        };
+        let direction = self.ai.story_direction.get_untracked().string_value();
+        draft.profile.direction = if direction.trim().is_empty() {
+            crate::ai_story::DEFAULT_DIRECTION.to_owned()
+        } else {
+            direction
+        };
         if !draft.profile.is_ready() {
             self.ai
                 .error
@@ -1651,7 +1686,8 @@ impl Model {
                 }
                 self.revision.update(|value| *value += 1);
                 self.ai.task.set(WritingTask::Continue);
-                self.run_ai();
+                self.set_ai_target(target.buffer, target.selection, target.insertion, false);
+                self.run_ai_at_target();
             }
             Err(error) => self.ai.error.set(error),
         }
@@ -2306,6 +2342,51 @@ impl Model {
         );
     }
 
+    pub fn import_picker(&self) {
+        let Some((root, folder)) = self.read(|session| {
+            (
+                session.library_root().to_path_buf(),
+                session.settings().folder.unwrap_or_default(),
+            )
+        }) else {
+            return;
+        };
+        let model = self.clone();
+        FilePicker::request(
+            &[markdown_filter()],
+            true,
+            Box::new(move |paths| {
+                if paths.is_empty() {
+                    return;
+                }
+                let current = model.current_text();
+                let paths: Vec<_> = paths.iter().map(PathBuf::from).collect();
+                let result = model.with_session(|session| {
+                    if session.library_root() != root {
+                        return Err("资料库已切换，请重新选择导入文件。".to_owned());
+                    }
+                    session.import_files(&paths, &folder, &current)
+                });
+                match result {
+                    Ok((count, failures)) => {
+                        if count > 0 {
+                            model.load_active();
+                            model.showing_editor.set(true);
+                            model.query.set(TextBuffer::empty());
+                            model.bump();
+                        }
+                        model.notice.set(if failures.is_empty() {
+                            format!("已导入 {count} 篇文稿")
+                        } else {
+                            format!("已导入 {count} 篇。{}", failures.join("；"))
+                        });
+                    }
+                    Err(error) => model.notice.set(error),
+                }
+            }),
+        );
+    }
+
     pub fn set_pinned(&self, id: &str, pinned: bool) {
         let id = id.to_owned();
         self.structural(move |session, _| session.set_pinned(&id, pinned));
@@ -2348,7 +2429,19 @@ impl Model {
         let (suffix, filter) = if novel {
             ("txt", text_filter())
         } else {
-            ("md", markdown_filter())
+            let suffix = if self.active_document().is_some_and(|doc| {
+                doc.path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("markdown"))
+            }) {
+                "markdown"
+            } else {
+                "md"
+            };
+            (
+                suffix,
+                FilePickerFilter::new("Markdown", [suffix.to_owned()]),
+            )
         };
         FileSaver::request(
             FileSaveRequest {

@@ -802,6 +802,13 @@ impl AiPanel {
             ai.task.get()
         };
         let continuing = mode == WritingTask::Continue;
+        if continuing
+            && !revising
+            && let Some(StoryStatus::Ready(draft)) = &story
+        {
+            let confirmation = self.story_review(&mut rows, draft);
+            return (rows, confirmation);
+        }
         let needs_story = continuing && !self.model.ai_story().is_ready();
         if let Some(status) = &story {
             self.story_progress(&mut rows, status);
@@ -1008,6 +1015,14 @@ impl AiPanel {
         } else if preferences.models.is_empty() {
             let model = self.model.clone();
             primary("添加模型", true, move || model.manage_ai())
+        } else if continuing
+            && !has_context
+            && target
+                .as_ref()
+                .is_some_and(|target| !target.buffer.is_empty())
+        {
+            let model = self.model.clone();
+            primary("从文末开始", true, move || model.continue_ai_at_end())
         } else {
             let submit = send.clone();
             if needs_story && ready {
@@ -1223,98 +1238,191 @@ impl AiPanel {
                     format!("正在分批整理剧情与人物 · 第 {batch} 批")
                 }));
             }
-            StoryStatus::Ready(draft) => {
-                rows.push(caption(draft.coverage.clone()));
-                rows.push(caption(format!(
-                    "建议题材 · {}　叙事口味 · {}",
-                    draft.profile.genre, draft.profile.tone
-                )));
-                let page = self.model.ai.story_page;
-                let current = page.get();
-                let sections = [
-                    ("剧情大纲", &draft.profile.outline),
-                    ("人物与关系", &draft.profile.characters),
-                    ("待续线索", &draft.profile.open_threads),
-                    ("角色说法", &draft.profile.character_claims),
-                ];
-                rows.push(wrap_controls(
-                    sections
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (label, _))| {
-                            AnyView::new(
-                                Button::title(*label, move || page.set(index))
-                                    .selected(index == current)
-                                    .button_style(ToggleButtonStyle::default()),
-                            )
-                        })
-                        .collect(),
-                ));
-                if current == 1 && !draft.profile.character_cards.is_empty() {
-                    let cards = draft
-                        .profile
-                        .character_cards
-                        .iter()
-                        .map(|card| {
-                            format!(
-                                "**{}**  \n表面 · {}  \n内核 · {}  \n防御 · {}  \n边界 · {}",
-                                card.name, card.surface, card.motive, card.defense, card.boundary
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-                    rows.push(AnyView::new(
-                        ScrollView::new(ScrollAxis::Vertical, MarkdownView::new(cards))
-                            .frame_height(185.0),
-                    ));
-                } else if let Some((label, content)) = sections.get(current) {
-                    rows.push(text_box(label, TextBuffer::new(content), 145.0));
-                }
-                if !draft.profile.has_character_cards() {
-                    let retry = self.model.clone();
-                    rows.push(wrap_controls(vec![
-                        caption("请先核对角色姓名、动机及关系卡。"),
-                        AnyView::new(Button::title("重新提取角色卡", move || {
-                            retry.prepare_ai_story()
-                        })),
-                    ]));
-                }
-                let direction = self.model.ai.story_direction;
-                rows.push(AnyView::new(
-                    TextField::new(
-                        "接下来想怎么发展？关系、节奏或哪些真相先别揭晓",
-                        direction.binding(),
-                    )
-                    .multiline()
-                    .frame_height(75.0),
-                ));
-                if direction.get().is_empty() {
-                    rows.push(AnyView::new(Button::title("沿现有主线，保持原稿口味", move || {
-                        direction.set(TextBuffer::new("沿现有主线和人物关系小步推进，保持原稿口味，未揭露的信息继续保留。"));
-                    })));
-                }
-                let confirm = self.model.clone();
-                let edit = self.model.clone();
-                let ready = !direction.get().string_value().trim().is_empty()
-                    && !draft.profile.genre.trim().is_empty()
-                    && !draft.profile.tone.trim().is_empty()
-                    && draft.profile.has_character_cards();
-                let mut actions = vec![primary("确认并续写", ready, move || {
-                    confirm.confirm_ai_story()
-                })];
-                if self.model.ai_work().is_some() {
-                    actions.push(AnyView::new(Button::title(
-                        "调整作品资料",
-                        move || edit.edit_prepared_story(),
-                    )));
-                }
-                rows.push(wrap_controls(actions));
-            }
             StoryStatus::Failed(error) => {
                 rows.push(error_label(format!("未能完成作品梳理。{error}")))
             }
-            StoryStatus::Confirmed(_) => {}
+            StoryStatus::Ready(_) | StoryStatus::Confirmed(_) => {}
         }
+    }
+
+    fn story_review(
+        &self,
+        rows: &mut Vec<AnyView>,
+        draft: &crate::ai_story::StoryDraft,
+    ) -> AnyView {
+        let story = &draft.profile;
+        let page = self.model.ai.story_page;
+        let open_page = page.get();
+        let names = story
+            .character_cards
+            .iter()
+            .map(|card| card.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        let mut overview = vec![AnyView::new(
+            Text::new("续写前核对").semantic_font(SemanticFontRef::headline()),
+        )];
+        if !names.is_empty() {
+            overview.push(AnyView::new(
+                Text::new(format!("主要人物 · {names}")).line_limit(Some(2)),
+            ));
+        }
+        for relation in story.relationships.iter().take(2) {
+            overview.push(caption(format!(
+                "{}与{} · {}",
+                relation.from, relation.to, relation.state
+            )));
+        }
+        overview.push(caption(format!("{} · {}", story.genre, story.tone)));
+        overview.push(wrap_controls(vec![AnyView::new(
+            Button::title(
+                if open_page == 0 {
+                    "查看梳理详情"
+                } else {
+                    "收起梳理详情"
+                },
+                move || page.set(if open_page == 0 { 1 } else { 0 }),
+            )
+            .button_style(GhostButtonStyle),
+        )]));
+        rows.push(AnyView::new(
+            vstack(7.0, Align::Stretch, overview)
+                .padding_edges(12.0, 11.0)
+                .semantic_background(SemanticColorRef::surface_raised())
+                .corner_radius(12.0),
+        ));
+        if open_page > 0 {
+            rows.push(wrap_controls(
+                ["剧情", "人物与关系", "待解信息"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        AnyView::new(
+                            Button::title(label, move || page.set(index + 1))
+                                .selected(open_page == index + 1)
+                                .button_style(ToggleButtonStyle::default()),
+                        )
+                    })
+                    .collect(),
+            ));
+            match open_page {
+                1 => {
+                    rows.push(caption(draft.coverage.clone()));
+                    let outline = crate::ai_story::author_outline(&story.outline);
+                    rows.extend(
+                        outline
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(|line| AnyView::new(Text::new(line))),
+                    );
+                }
+                2 => {
+                    for card in &story.character_cards {
+                        let mut details = vec![AnyView::new(
+                            Text::new(&card.name).semantic_font(SemanticFontRef::headline()),
+                        )];
+                        for (label, content) in [
+                            ("表面", &card.surface),
+                            ("动机", &card.motive),
+                            ("自我保护", &card.defense),
+                            ("边界", &card.boundary),
+                        ] {
+                            if !content.trim().is_empty() {
+                                details
+                                    .push(AnyView::new(Text::new(format!("{label} · {content}"))));
+                            }
+                        }
+                        rows.push(vstack(4.0, Align::Stretch, details));
+                    }
+                    for relation in &story.relationships {
+                        rows.push(vstack(
+                            4.0,
+                            Align::Stretch,
+                            vec![
+                                AnyView::new(
+                                    Text::new(format!("{}与{}", relation.from, relation.to))
+                                        .semantic_font(SemanticFontRef::headline()),
+                                ),
+                                AnyView::new(Text::new(&relation.state)),
+                                AnyView::new(Text::new(&relation.direction)),
+                                caption(&relation.boundary),
+                            ],
+                        ));
+                    }
+                }
+                _ => {
+                    for (label, section) in [
+                        ("待续线索", &story.open_threads),
+                        ("角色说法与潜台词", &story.character_claims),
+                    ] {
+                        if !section.trim().is_empty() {
+                            rows.push(AnyView::new(
+                                Text::new(label).semantic_font(SemanticFontRef::headline()),
+                            ));
+                            rows.extend(
+                                section
+                                    .lines()
+                                    .map(str::trim)
+                                    .filter(|line| !line.is_empty())
+                                    .map(|line| AnyView::new(Text::new(line))),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let direction = self.model.ai.story_direction;
+        let explicit = !direction.get().string_value().trim().is_empty();
+        let mut check = story.clone();
+        check.direction = crate::ai_story::DEFAULT_DIRECTION.to_owned();
+        let ready = check.is_ready();
+        if !ready {
+            rows.push(caption("角色卡或关系资料有缺项，补齐后即可续写。"));
+        }
+        let confirm = self.model.clone();
+        let edit = self.model.clone();
+        let retry = self.model.clone();
+        let mut actions = vec![spacer()];
+        if self.model.ai_work().is_some() {
+            actions.insert(
+                0,
+                AnyView::new(
+                    Button::title("核对并修改资料", move || edit.edit_prepared_story())
+                        .button_style(GhostButtonStyle),
+                ),
+            );
+        }
+        if !ready {
+            actions.insert(
+                0,
+                AnyView::new(
+                    Button::title("重新梳理", move || retry.prepare_ai_story())
+                        .button_style(GhostButtonStyle),
+                ),
+            );
+        }
+        actions.push(primary(
+            if explicit {
+                "确认方向并续写"
+            } else {
+                "按当前主线续写"
+            },
+            ready,
+            move || confirm.confirm_ai_story(),
+        ));
+        vstack(
+            6.0,
+            Align::Stretch,
+            vec![
+                AnyView::new(
+                    TextField::new("本场想怎么发展？（可选）", direction.binding())
+                        .multiline()
+                        .frame_height(48.0),
+                ),
+                hstack(4.0, Align::Center, actions),
+            ],
+        )
     }
 
     fn results(

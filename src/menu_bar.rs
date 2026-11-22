@@ -28,7 +28,7 @@ type MenuKey = (
     Collection,
     bool,
     bool,
-    ruwriter_core::WritingMode,
+    (ruwriter_core::WritingMode, ruwriter_core::WritingMode),
     bool,
     bool,
     ruwriter_core::LineSpacing,
@@ -47,7 +47,7 @@ pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
         settings.collection,
         pinned,
         settings.markdown_syntax,
-        settings.writing_mode,
+        (settings.writing_mode, model.writing_mode()),
         settings.paragraph_indent,
         settings.typewriter_scrolling,
         settings.line_spacing,
@@ -98,13 +98,13 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
         collection,
         pinned,
         syntax,
-        writing,
+        (writing, active_format),
         indent,
         typewriter,
         spacing,
         width,
     ) = key;
-    let markdown = writing == ruwriter_core::WritingMode::Markdown;
+    let markdown = active_format == ruwriter_core::WritingMode::Markdown;
     let file = NativeMenu::new(
         "文件",
         vec![
@@ -116,6 +116,10 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
             item(
                 action(model, "打开文件…", Model::open_picker),
                 Some(primary("o")),
+            ),
+            item(
+                action(model, "导入到资料库…", Model::import_picker),
+                Some(primary_shift("i")),
             ),
             item(
                 action(model, "打开文件夹作为资料库…", Model::open_library_picker),
@@ -161,51 +165,68 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
 
     let format = NativeMenu::new(
         "格式",
-        vec![
-            item(
-                action(model, "加粗", |model| model.format(Command::Bold)),
-                Some(primary("b")),
-            ),
-            item(
-                action(model, "斜体", |model| model.format(Command::Italic)),
-                Some(primary("i")),
-            ),
-            item(
-                action(model, "删除线", |model| {
-                    model.format(Command::Strikethrough)
-                }),
-                Some(primary_shift("x")),
-            ),
-            item(
-                action(model, "行内代码", |model| model.format(Command::Code)),
-                Some(primary("e")),
-            ),
-            item(
-                action(model, "链接", |model| model.format(Command::Link)),
-                Some(primary_shift("k")),
-            ),
-            NativeMenuItem::Separator,
-            item(
-                action(model, "标题", |model| model.format(Command::Heading)),
-                Some(primary_shift("h")),
-            ),
-            item(
-                action(model, "无序列表", |model| {
-                    model.format(Command::BulletList)
-                }),
-                Some(primary_shift("8")),
-            ),
-            item(
-                action(model, "有序列表", |model| {
-                    model.format(Command::NumberedList)
-                }),
-                Some(primary_shift("7")),
-            ),
-            item(
-                action(model, "引用", |model| model.format(Command::Quote)),
-                Some(primary_shift("9")),
-            ),
-        ],
+        if markdown {
+            vec![
+                item(
+                    action(model, "加粗", |model| model.format(Command::Bold)),
+                    Some(primary("b")),
+                ),
+                item(
+                    action(model, "斜体", |model| model.format(Command::Italic)),
+                    Some(primary("i")),
+                ),
+                item(
+                    action(model, "删除线", |model| {
+                        model.format(Command::Strikethrough)
+                    }),
+                    Some(primary_shift("x")),
+                ),
+                item(
+                    action(model, "行内代码", |model| model.format(Command::Code)),
+                    Some(primary("e")),
+                ),
+                item(
+                    action(model, "链接", |model| model.format(Command::Link)),
+                    Some(primary_shift("k")),
+                ),
+                NativeMenuItem::Separator,
+                item(
+                    action(model, "标题", |model| model.format(Command::Heading)),
+                    Some(primary_shift("h")),
+                ),
+                item(
+                    action(model, "无序列表", |model| {
+                        model.format(Command::BulletList)
+                    }),
+                    Some(primary_shift("8")),
+                ),
+                item(
+                    action(model, "有序列表", |model| {
+                        model.format(Command::NumberedList)
+                    }),
+                    Some(primary_shift("7")),
+                ),
+                item(
+                    action(model, "引用", |model| model.format(Command::Quote)),
+                    Some(primary_shift("9")),
+                ),
+            ]
+        } else {
+            vec![
+                item(
+                    action(model, "写入两格段首空格", |model| {
+                        model.format(Command::IndentParagraphs)
+                    }),
+                    None,
+                ),
+                item(
+                    action(model, "删除文件中的段首空格", |model| {
+                        model.format(Command::UnindentParagraphs)
+                    }),
+                    None,
+                ),
+            ]
+        },
     );
 
     let appearance_menu = NativeMenu::new(
@@ -262,11 +283,17 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                 None,
             ),
             item(
-                action(model, "Markdown 模式", Model::toggle_writing_mode).with_selected(markdown),
+                action(model, "新建文稿使用 Markdown", Model::toggle_writing_mode)
+                    .with_selected(writing == ruwriter_core::WritingMode::Markdown),
                 None,
             ),
             item(
-                action(model, "段首缩进", Model::toggle_paragraph_indent).with_selected(indent),
+                action(
+                    model,
+                    "TXT 自动显示段首缩进",
+                    Model::toggle_paragraph_indent,
+                )
+                .with_selected(indent),
                 None,
             ),
             item(

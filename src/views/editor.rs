@@ -13,8 +13,8 @@ use cove_ui::compose::primitives::text::text_field::{
     TextFieldCodeEditing, TextFieldContentPadding, TextFieldDecoration, TextFieldNavigationRequest,
 };
 use cove_ui::compose::primitives::text::{
-    Divider, MarkdownView, Text, TextField, TextFieldAxis, TextFieldEvents, TextFieldIndentSkip,
-    TextFieldLayout,
+    Divider, MarkdownView, Text, TextField, TextFieldAxis, TextFieldBehavior, TextFieldEvents,
+    TextFieldIndentSkip, TextFieldLayout,
 };
 use cove_ui::compose::theme::styles::components::text_field_style::AnyTextFieldStyle;
 use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
@@ -25,7 +25,7 @@ use cove_ui::imaging::BundleImageResource;
 
 use super::root::Layout;
 use super::ui::{ProseFieldStyle, full_size, hstack, icon_button, spacer, vstack};
-use crate::formatting::Command;
+use crate::formatting::{Command, skip_prose_indent};
 use crate::markdown_syntax;
 use crate::model::Model;
 use crate::theme::{Mode, SyntaxColors, editor_font, measure, novel_font};
@@ -72,6 +72,7 @@ impl View for EditorPane {
             AnyView::new(PreviewPane {
                 model: self.model.clone(),
                 column,
+                horizontal,
             })
         };
         let body: AnyView = if split {
@@ -196,7 +197,7 @@ impl EditorPane {
         ));
 
         let mut children = leading;
-        if !options.focus && self.model.writing_mode() != ruwriter_core::WritingMode::Novel {
+        if !options.focus {
             children.extend(self.formatting_controls());
         }
         children.push(spacer());
@@ -215,7 +216,9 @@ impl EditorPane {
     /// a narrow one. Focus mode hides them all.
     fn formatting_controls(&self) -> Vec<AnyView> {
         let model = &self.model;
-        if self.layout.editor_width < FORMAT_BAR_WIDTH {
+        if model.writing_mode() == ruwriter_core::WritingMode::Novel
+            || self.layout.editor_width < FORMAT_BAR_WIDTH
+        {
             return vec![AnyView::new(
                 MenuButton::new(
                     format_menu(model),
@@ -256,6 +259,21 @@ impl EditorPane {
 
 /// Every formatting command with its shortcut, for the narrow-pane menu.
 fn format_menu(model: &Model) -> Vec<MenuEntry> {
+    if model.writing_mode() == ruwriter_core::WritingMode::Novel {
+        return [
+            ("写入两格段首空格", Command::IndentParagraphs),
+            ("删除文件中的段首空格", Command::UnindentParagraphs),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (title, command))| {
+            let model = model.clone();
+            MenuEntry::Item(MenuItem::new(index as u64 + 1, title, move || {
+                model.format(command)
+            }))
+        })
+        .collect();
+    }
     let actions: [(&str, &str, Command); 9] = [
         ("加粗", "⌘B", Command::Bold),
         ("斜体", "⌘I", Command::Italic),
@@ -283,10 +301,11 @@ fn format_menu(model: &Model) -> Vec<MenuEntry> {
 
 fn document_menu(model: &Model) -> Vec<MenuEntry> {
     let pinned = model.active_document().is_some_and(|d| d.pinned);
-    let actions: [(&str, Action); 7] = [
+    let actions: [(&str, Action); 8] = [
         ("新建文稿", Rc::new(Model::create)),
         ("打开文件…", Rc::new(Model::open_picker)),
-        ("导出 Markdown…", Rc::new(Model::export)),
+        ("导入到资料库…", Rc::new(Model::import_picker)),
+        ("导出文稿…", Rc::new(Model::export)),
         (
             if pinned { "取消置顶" } else { "置顶" },
             Rc::new(move |model: &Model| {
@@ -305,7 +324,7 @@ fn document_menu(model: &Model) -> Vec<MenuEntry> {
         ),
         ("命令面板", Rc::new(Model::toggle_palette)),
     ];
-    let shortcuts = ["⌘N", "⌘O", "⇧⌘E", "", "⌘=", "⌘-", "⌘K"];
+    let shortcuts = ["⌘N", "⌘O", "⇧⌘I", "⇧⌘E", "", "⌘=", "⌘-", "⌘K"];
     let mut entries: Vec<MenuEntry> = Vec::new();
     for (index, ((title, action), shortcut)) in actions.into_iter().zip(shortcuts).enumerate() {
         let target = model.clone();
@@ -314,7 +333,7 @@ fn document_menu(model: &Model) -> Vec<MenuEntry> {
             item = item.shortcut(shortcut);
         }
         entries.push(MenuEntry::Item(item));
-        if index == 5 {
+        if index == 6 {
             let toggle = model.clone();
             entries.push(MenuEntry::Item(
                 MenuItem::new(61, "打字机滚动", move || {
@@ -323,7 +342,7 @@ fn document_menu(model: &Model) -> Vec<MenuEntry> {
                 .selected(model.typewriter_scrolling()),
             ));
         }
-        if matches!(index, 2 | 3 | 5) {
+        if matches!(index, 3 | 4 | 6) {
             entries.push(MenuEntry::separator(100 + index as u64));
         }
     }
@@ -355,7 +374,7 @@ impl View for EditorField {
         let keys = self.model.clone();
         let colors = SyntaxColors::for_theme(&self.mode.theme());
         let settings = self.model.settings();
-        let novel = settings.writing_mode == ruwriter_core::WritingMode::Novel;
+        let novel = self.model.writing_mode() == ruwriter_core::WritingMode::Novel;
         let mut code = TextFieldCodeEditing {
             occurrences: self.find_occurrences(),
             ..Default::default()
@@ -374,7 +393,7 @@ impl View for EditorField {
                     0.0
                 },
                 first_line_indent_skip: if novel {
-                    TextFieldIndentSkip::new(ruwriter_core::is_chapter_line)
+                    TextFieldIndentSkip::new(skip_prose_indent)
                 } else {
                     TextFieldIndentSkip::default()
                 },
@@ -529,10 +548,46 @@ impl View for FindBar {
 struct PreviewPane {
     model: Model,
     column: f32,
+    horizontal: f32,
 }
 
 impl View for PreviewPane {
     fn body(&self, _cx: &Scope) -> AnyView {
+        if self.model.writing_mode() == ruwriter_core::WritingMode::Novel {
+            let settings = self.model.settings();
+            return AnyView::new(
+                full_size(AnyView::new(
+                    TextField::new("纯文本预览", self.model.buffer.binding())
+                        .style(AnyTextFieldStyle::new(ProseFieldStyle))
+                        .layout(TextFieldLayout {
+                            axis: TextFieldAxis::Vertical,
+                            first_line_indent: if settings.paragraph_indent {
+                                f32::from(settings.font_size) * 2.0
+                            } else {
+                                0.0
+                            },
+                            first_line_indent_skip: TextFieldIndentSkip::new(skip_prose_indent),
+                            ..Default::default()
+                        })
+                        .decoration(TextFieldDecoration {
+                            content_padding: Some(TextFieldContentPadding::new(
+                                self.horizontal,
+                                24.0,
+                            )),
+                            ..Default::default()
+                        })
+                        .behavior(TextFieldBehavior {
+                            read_only: true,
+                            ..Default::default()
+                        })
+                        .semantic_font(novel_font(
+                            settings.font_size,
+                            settings.line_spacing.factor(),
+                        )),
+                ))
+                .id(("text-preview", self.model.document.get())),
+            );
+        }
         let text = self.model.preview.get();
         let page = AnyView::new(MarkdownView::new(text)).frame(
             Some(FrameDimension::Percent(100.0)),
@@ -583,12 +638,12 @@ impl View for StatusLine {
                     ));
                 }
             }
-            let mut summary = format!("{} 字", stats.characters);
+            let plain = self.model.writing_mode() == ruwriter_core::WritingMode::Novel;
+            let format = if plain { "TXT" } else { "Markdown" };
+            let mut summary = format!("{format} · {} 字", stats.characters);
             // Chinese prose is measured in characters; the word split only
             // helps Latin text, so novel mode leaves it out.
-            if stats.words != stats.characters
-                && self.model.writing_mode() != ruwriter_core::WritingMode::Novel
-            {
+            if stats.words != stats.characters && !plain {
                 summary.push_str(&format!(" · {} 词", stats.words));
             }
             if stats.reading_minutes > 0 {

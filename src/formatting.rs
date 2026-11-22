@@ -17,6 +17,14 @@ pub enum Command {
     BulletList,
     NumberedList,
     Quote,
+    IndentParagraphs,
+    UnindentParagraphs,
+}
+
+impl Command {
+    pub fn is_plain_text(self) -> bool {
+        matches!(self, Self::IndentParagraphs | Self::UnindentParagraphs)
+    }
 }
 
 /// The replacement text and where the caret (and optional selection) lands.
@@ -53,6 +61,60 @@ pub fn apply(
         Command::BulletList => lines(&chars, low, high, caret, LineStyle::Bullet),
         Command::NumberedList => lines(&chars, low, high, caret, LineStyle::Numbered),
         Command::Quote => lines(&chars, low, high, caret, LineStyle::Quote),
+        Command::IndentParagraphs | Command::UnindentParagraphs => plain_paragraphs(
+            &chars,
+            low,
+            high,
+            caret,
+            command == Command::IndentParagraphs,
+        ),
+    }
+}
+
+pub fn skip_prose_indent(line: &str) -> bool {
+    line.starts_with([' ', '\t', '\u{3000}']) || ruwriter_core::is_chapter_line(line.trim())
+}
+
+fn plain_paragraphs(chars: &[char], low: usize, high: usize, caret: usize, indent: bool) -> Edit {
+    let start = line_start(chars, low);
+    let end = line_end(chars, if high > low { high - 1 } else { low });
+    let mut out = chars[..start].to_vec();
+    let mut new_caret = caret;
+    let mut line = start;
+    loop {
+        let stop = line_end(chars, line);
+        let leading = chars[line..stop]
+            .iter()
+            .take_while(|&&ch| matches!(ch, ' ' | '\t' | '\u{3000}'))
+            .count();
+        let body = &chars[line + leading..stop];
+        let format = !body.iter().all(|ch| ch.is_whitespace())
+            && (!indent || !ruwriter_core::is_chapter_line(string(body).trim_end()));
+        let removed = if format { leading } else { 0 };
+        let added = if format && indent { 2 } else { 0 };
+        if caret >= line && caret <= stop {
+            new_caret = out.len() + added + (caret - line).saturating_sub(removed);
+        }
+        out.extend(std::iter::repeat_n('\u{3000}', added));
+        out.extend_from_slice(&chars[line + removed..stop]);
+        if stop >= end {
+            break;
+        }
+        out.push('\n');
+        line = stop + 1;
+    }
+    let new_end = out.len();
+    out.extend_from_slice(&chars[end..]);
+    Edit {
+        text: string(&out),
+        caret: if low == high {
+            new_caret
+        } else if caret <= low {
+            start
+        } else {
+            new_end
+        },
+        selection: (low != high).then_some((start, new_end)),
     }
 }
 
@@ -423,6 +485,26 @@ fn lines(chars: &[char], low: usize, high: usize, caret: usize, style: LineStyle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_indentation_leaves_headings_and_line_endings_intact() {
+        let text = "第一章 雨夜\r\n 已有空格\r\n\r\n下一段";
+        let selection = Some((0, text.chars().count()));
+        let result = apply(text, 0, selection, Command::IndentParagraphs);
+        assert_eq!(result.text, "第一章 雨夜\r\n　　已有空格\r\n\r\n　　下一段");
+        assert_eq!(result.caret, 0);
+        assert_eq!(result.selection, Some((0, result.text.chars().count())));
+        let stripped = apply(
+            &result.text,
+            0,
+            result.selection,
+            Command::UnindentParagraphs,
+        );
+        assert_eq!(stripped.text, "第一章 雨夜\r\n已有空格\r\n\r\n下一段");
+        assert!(skip_prose_indent("　　已经有段首空格"));
+        assert!(skip_prose_indent("第三章 天亮"));
+        assert!(!skip_prose_indent("还留着要说的话。"));
+    }
 
     fn edit(text: &str, caret: usize, selection: Option<(usize, usize)>, command: Command) -> Edit {
         apply(text, caret, selection, command)

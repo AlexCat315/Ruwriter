@@ -2,13 +2,51 @@
 //! an explicit removal first because `rename` will not replace an existing file.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn read_document(path: &Path) -> io::Result<String> {
     let bytes = fs::read(path)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub(crate) fn read_import_text(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "无法识别为 UTF-8、带 BOM 的 UTF-16 或 GB18030 文本",
+        )
+    };
+    let text = if let Some((encoding, bom)) = encoding_rs::Encoding::for_bom(&bytes) {
+        encoding
+            .decode_without_bom_handling_and_without_replacement(&bytes[bom..])
+            .ok_or_else(invalid)?
+    } else if let Ok(text) = std::str::from_utf8(&bytes) {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        encoding_rs::GB18030
+            .decode_without_bom_handling_and_without_replacement(&bytes)
+            .ok_or_else(invalid)?
+    };
+    if text.contains('\0') {
+        return Err(invalid());
+    }
+    Ok(text.into_owned())
+}
+
+pub(crate) fn write_new_document(path: &Path, text: &str) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let result = file.write_all(text.as_bytes());
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
 }
 
 pub fn write_document(path: &Path, text: &str) -> io::Result<()> {
