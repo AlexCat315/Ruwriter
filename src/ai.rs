@@ -33,7 +33,7 @@ use crate::ai_voice;
 const MAX_TOOL_ROUNDS: usize = 6;
 const MAX_RESEARCH_ROUNDS: usize = 12;
 const ANSWER_AUDIT_MIN_CHARS: usize = 100;
-const MAX_EDITOR_ROUNDS: usize = 3;
+const MAX_EDITOR_ROUNDS: usize = 8;
 
 #[derive(Clone)]
 pub struct WritingTarget {
