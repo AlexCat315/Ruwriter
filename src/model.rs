@@ -937,6 +937,26 @@ impl Model {
         self.ai.feedback.set(String::new());
     }
 
+    pub fn resume_ai_scene(&self) {
+        self.update_ai_target(false);
+        let result = self
+            .ai
+            .target
+            .get_untracked()
+            .ok_or_else(|| "请先打开原来的文稿。".to_owned())
+            .and_then(|target| self.ai.restore_scene(&target));
+        match result {
+            Ok(target) => {
+                let index = target.insertion;
+                let anchor = target.selection.as_ref().map(|range| range.start);
+                self.set_ai_target(target.buffer, target.selection, index, false);
+                self.navigate(index, anchor, false);
+                self.ai.error.set(String::new());
+            }
+            Err(error) => self.ai.error.set(error),
+        }
+    }
+
     fn update_ai_target(&self, refresh_attachment: bool) {
         if self.ai.current_batch().is_some_and(|batch| batch.busy()) && !refresh_attachment {
             return;
@@ -1148,6 +1168,18 @@ impl Model {
         );
     }
 
+    pub fn show_ai_branches(&self) {
+        self.ai
+            .error
+            .set(self.ai.show_branches().err().unwrap_or_default());
+    }
+
+    pub fn move_ai_conversation(&self, tip: Option<&str>) {
+        self.ai
+            .error
+            .set(self.ai.move_conversation(tip).err().unwrap_or_default());
+    }
+
     pub fn export_ai_chat(&self) {
         let contents = match crate::ai_chat::encode(&self.ai.current_chat()) {
             Ok(contents) => contents,
@@ -1199,6 +1231,7 @@ impl Model {
             );
         }
         self.ai.brief_open.set(false);
+        self.ai.branches_open.set(false);
         self.ai.settings_open.set(true);
     }
 
@@ -1206,7 +1239,7 @@ impl Model {
         self.edit_ai_profile(self.ai_settings().selected.first().copied());
     }
 
-    pub fn save_ai_preferences(&self) {
+    pub fn save_ai_preferences(&self, select: bool) {
         let result = (|| {
             let address = self.ai.endpoint.get_untracked().string_value();
             let endpoint = cove_agent::openai_compatible::api_base(&address)
@@ -1248,11 +1281,18 @@ impl Model {
                 settings.models.push(profile.clone());
                 index
             };
+            if select {
+                settings.selected = vec![index];
+            }
             self.store_ai_settings(settings)?;
             self.ai.save_key(&profile.endpoint, key);
             self.ai.editing.set(Some(index));
             self.ai.endpoint.set(TextBuffer::new(&profile.endpoint));
             self.ai.model.set(TextBuffer::new(&profile.model));
+            if select {
+                self.ai.settings_open.set(false);
+                self.ai.feedback.set("已切换模型。".to_owned());
+            }
             Ok(())
         })();
         self.ai.error.set(result.err().unwrap_or_default());

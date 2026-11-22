@@ -65,7 +65,7 @@ pub(crate) struct CharacterBeat {
     pub relation_effect: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SceneQuestion {
     pub quote: String,
     pub question: String,

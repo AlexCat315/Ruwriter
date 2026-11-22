@@ -3,6 +3,7 @@ mod ai_chat;
 mod ai_continuation;
 mod ai_research;
 mod ai_review;
+mod ai_scene;
 mod ai_story;
 mod ai_voice;
 mod app;

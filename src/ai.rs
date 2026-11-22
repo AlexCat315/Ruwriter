@@ -25,6 +25,7 @@ use crate::ai_research::{
     self, ResearchCache, ResearchRequest, ResearchRun, ResearchScope, Source,
 };
 use crate::ai_review::{DraftContext, Review};
+use crate::ai_scene::{self, LocalTurn, PendingScene, SceneAnchor, SceneAnswer};
 use crate::ai_story::{self, StoryDraft};
 use crate::ai_voice;
 
@@ -296,6 +297,7 @@ pub struct ChatTurn {
     pub author: TextBuffer,
     pub answer: Option<TextBuffer>,
     pub adopted: bool,
+    pub(crate) local: Option<LocalTurn>,
 }
 
 #[derive(Clone)]
@@ -306,6 +308,7 @@ pub struct Batch {
     task: WritingTask,
     pub prompt: TextBuffer,
     instruction: String,
+    scene_answer: Option<SceneAnswer>,
     pub history: Arc<Vec<ChatTurn>>,
     turn_id: String,
     selected: usize,
@@ -335,13 +338,16 @@ impl Batch {
     }
 
     pub fn scene_question(&self, index: usize) -> Option<&SceneQuestion> {
+        if self.applied() {
+            return None;
+        }
         match &self.runs.get(index)?.status {
             ModelStatus::NeedsDirection(question) => Some(question),
             _ => None,
         }
     }
 
-    fn same_scene(&self, target: Option<&WritingTarget>) -> bool {
+    pub(crate) fn same_scene(&self, target: Option<&WritingTarget>) -> bool {
         self.target
             .as_ref()
             .zip(target)
@@ -377,8 +383,9 @@ impl Batch {
             return Err("请先回答这一场的方向。".to_owned());
         }
         Ok(format!(
-            "{}\n\n场景问题：{}\n作者本轮明确回答：{}",
+            "{}\n\n原文「{}」\n场景问题：{}\n作者本轮明确回答：{}",
             scene_confirmation(&self.instruction).unwrap_or(&self.instruction),
+            question.quote,
             question.question,
             answer.trim(),
         ))
@@ -401,6 +408,17 @@ impl Batch {
             author: self.prompt.clone(),
             answer,
             adopted: self.applied(),
+            local: Some(LocalTurn {
+                pending: self.scene_question(index).and_then(|question| {
+                    Some(PendingScene {
+                        anchor: SceneAnchor::capture(self.target.as_ref()?)?,
+                        instruction: self.instruction.clone(),
+                        question: question.clone(),
+                        scope: self.scope,
+                    })
+                }),
+                scene_answer: self.scene_answer.clone(),
+            }),
         });
         history
     }
@@ -412,6 +430,15 @@ pub enum Catalog {
     Idle,
     Loading(Arc<()>),
     Loaded(Arc<[String]>),
+    Failed(AgentError),
+}
+
+#[derive(Clone, Default)]
+pub enum Connection {
+    #[default]
+    Idle,
+    Testing(Arc<()>),
+    Connected,
     Failed(AgentError),
 }
 
@@ -517,6 +544,8 @@ pub struct AiState {
     pub open: Signal<bool>,
     pub settings_open: Signal<bool>,
     pub brief_open: Signal<bool>,
+    pub branches_open: Signal<bool>,
+    pub branches: Signal<Vec<ai_chat::Branch>>,
     pub use_brief: Signal<bool>,
     pub canon: Signal<TextBuffer>,
     pub voice: Signal<TextBuffer>,
@@ -543,6 +572,7 @@ pub struct AiState {
     pub api_key: Signal<TextBuffer>,
     pub editing: Signal<Option<usize>>,
     pub catalog: Signal<Catalog>,
+    pub connection: Signal<Connection>,
     keys: Signal<BTreeMap<String, TextBuffer>>,
     pub tools: Signal<bool>,
     pub prompt: Signal<TextBuffer>,
@@ -580,6 +610,8 @@ impl AiState {
             open: cx.state(|| false),
             settings_open: cx.state(|| settings.models.is_empty()),
             brief_open: cx.state(|| false),
+            branches_open: cx.state(|| false),
+            branches: cx.state(Vec::new),
             use_brief: cx.state(|| false),
             canon: cx.state(TextBuffer::empty),
             voice: cx.state(TextBuffer::empty),
@@ -606,6 +638,7 @@ impl AiState {
             api_key: cx.state(TextBuffer::empty),
             editing: cx.state(|| settings.selected.first().copied()),
             catalog: cx.state(Catalog::default),
+            connection: cx.state(Connection::default),
             keys: cx.state(BTreeMap::new),
             tools: cx.state(|| profile.tools),
             prompt: cx.state(TextBuffer::empty),
@@ -639,6 +672,7 @@ impl AiState {
             && self.api_key.get_untracked().has_same_contents(&key)
             && matches!(self.catalog.get_untracked(), Catalog::Loaded(_));
         self.editing.set(editing);
+        self.connection.set(Connection::Idle);
         self.endpoint.set(TextBuffer::new(&profile.endpoint));
         self.model.set(TextBuffer::new(&profile.model));
         self.tools.set(profile.tools);
@@ -658,12 +692,53 @@ impl AiState {
             }
             self.endpoint.set(endpoint);
             self.catalog.set(Catalog::Idle);
+            self.connection.set(Connection::Idle);
         }
     }
 
     pub fn change_key(&self, key: TextBuffer) {
         self.api_key.set(key);
         self.catalog.set(Catalog::Idle);
+        self.connection.set(Connection::Idle);
+    }
+
+    pub fn change_model(&self, model: TextBuffer) {
+        self.model.set(model);
+        self.connection.set(Connection::Idle);
+    }
+
+    pub fn test_connection(&self) {
+        if matches!(self.connection.get_untracked(), Connection::Testing(_)) {
+            return;
+        }
+        let endpoint = self.endpoint.get_untracked().string_value();
+        let model = self.model.get_untracked().string_value();
+        let key = self.api_key.get_untracked().string_value();
+        let adapter = match ChatCompletionsModel::new(&endpoint, &model, Some(&key)) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                self.connection.set(Connection::Failed(error));
+                return;
+            }
+        };
+        let token = Arc::new(());
+        self.connection.set(Connection::Testing(token.clone()));
+        let sender = self.connection.sender();
+        if std::thread::Builder::new().name("ruwriter-model-test".into()).spawn(move || {
+            let result = adapter.complete(&[AgentMessage::user("Reply with OK.")], &[]);
+            sender.update_if(move |connection| {
+                if !matches!(connection, Connection::Testing(active) if Arc::ptr_eq(active, &token)) {
+                    return false;
+                }
+                *connection = match result {
+                    Ok(_) => Connection::Connected,
+                    Err(error) => Connection::Failed(error),
+                };
+                true
+            });
+        }).is_err() {
+            self.connection.set(Connection::Failed(AgentError::Model("无法启动连接测试。".to_owned())));
+        }
     }
 
     fn saved_key(&self, endpoint: &str) -> TextBuffer {
@@ -742,11 +817,128 @@ impl AiState {
         self.archived.get()
     }
 
+    pub fn restore_scene(&self, current: &WritingTarget) -> Result<WritingTarget, String> {
+        let key = self.workspace.get_untracked();
+        let changed = || "原来的落笔处已变化。请在正文选定位置后发起新的续写。".to_owned();
+        let target = if let Some(batch) = self.current_batch() {
+            let index = self.viewed_result.get_untracked();
+            if batch.busy() || batch.scene_question(index).is_none() {
+                return Err("当前没有待回答的场景。".to_owned());
+            }
+            let target = batch
+                .target
+                .as_ref()
+                .and_then(SceneAnchor::capture)
+                .and_then(|anchor| anchor.restore(current))
+                .ok_or_else(changed)?;
+            self.batches.update(|batches| {
+                if let Some(batch) = batches.get_mut(&key) {
+                    batch.target = Some(target.clone());
+                }
+            });
+            target
+        } else {
+            let archive = self.archived.get_untracked();
+            let (turn, pending) = ai_scene::pending(&archive).ok_or("当前没有待回答的场景。")?;
+            let target = pending.anchor.restore(current).ok_or_else(changed)?;
+            self.batches.update(|batches| {
+                batches.insert(
+                    key,
+                    Batch {
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        target: Some(target.clone()),
+                        runs: vec![ModelRun {
+                            profile: AiPreferences::default(),
+                            status: ModelStatus::NeedsDirection(pending.question.clone()),
+                            previous: None,
+                            revision_error: None,
+                            revising: None,
+                            draft_preview: None,
+                            streamed_text: TextBuffer::empty(),
+                        }],
+                        task: WritingTask::Continue,
+                        prompt: turn.author.clone(),
+                        instruction: pending.instruction.clone(),
+                        scene_answer: turn
+                            .local
+                            .as_ref()
+                            .and_then(|local| local.scene_answer.clone()),
+                        history: Arc::new(
+                            archive
+                                .iter()
+                                .filter(|entry| entry.id != turn.id)
+                                .cloned()
+                                .collect(),
+                        ),
+                        turn_id: turn.id.clone(),
+                        selected: 0,
+                        archive_error: None,
+                        scope: pending.scope,
+                        adopted: None,
+                        pre_adoption: None,
+                    },
+                );
+            });
+            self.viewed_result.set(0);
+            self.scope.set(pending.scope);
+            target
+        };
+        self.follow_draft.set(true);
+        self.task.set(WritingTask::Continue);
+        Ok(target)
+    }
+
     pub fn current_chat(&self) -> Arc<Vec<ChatTurn>> {
         self.current_batch().map_or_else(
             || self.archived.get_untracked(),
             |batch| batch.transcript(batch.selected),
         )
+    }
+
+    pub fn displayed_chat(&self) -> Arc<Vec<ChatTurn>> {
+        self.batch().map_or_else(
+            || self.archived_chat(),
+            |batch| batch.transcript(batch.selected),
+        )
+    }
+
+    pub fn show_branches(&self) -> Result<(), String> {
+        let (root, id) = self.workspace.get_untracked().ok_or("请先打开文稿。")?;
+        if self.current_batch().is_some_and(|batch| batch.busy()) {
+            return Err("请等这轮结束或停止生成后再回退。".to_owned());
+        }
+        self.flush_chat();
+        if let Some(error) = self.current_batch().and_then(|batch| batch.archive_error) {
+            return Err(error);
+        }
+        self.branches
+            .set(ai_chat::branches(&root, &id).map_err(|error| error.to_string())?);
+        self.branches_open.set(true);
+        Ok(())
+    }
+
+    pub fn move_conversation(&self, tip: Option<&str>) -> Result<(), String> {
+        let key = self.workspace.get_untracked();
+        let (root, id) = key.as_ref().ok_or("请先打开文稿。")?;
+        if self.current_batch().is_some_and(|batch| batch.busy()) {
+            return Err("请等这轮结束或停止生成后再回退。".to_owned());
+        }
+        self.flush_chat();
+        if let Some(error) = self.current_batch().and_then(|batch| batch.archive_error) {
+            return Err(error);
+        }
+        let turns = ai_chat::move_tip(root, id, tip).map_err(|error| error.to_string())?;
+        self.batches.update(|batches| {
+            batches.remove(&key);
+        });
+        self.archived.set(Arc::new(turns));
+        self.follow_draft.set(false);
+        self.viewed_result.set(0);
+        self.viewed_source.set(None);
+        self.clear_revision();
+        self.branches_open.set(false);
+        self.feedback.set("对话位置已切换。".to_owned());
+        Ok(())
     }
 
     pub fn select_draft(&self, index: usize) {
@@ -778,9 +970,12 @@ impl AiState {
             return Err("请等这轮写作结束再导入。".to_owned());
         }
         let imported = ai_chat::decode(path).map_err(|error| error.to_string())?;
-        let mut turns = self.current_chat().as_ref().clone();
-        ai_chat::merge_new(&mut turns, imported);
-        ai_chat::save(root, id, &turns, None).map_err(|error| error.to_string())?;
+        self.flush_chat();
+        if let Some(error) = self.current_batch().and_then(|batch| batch.archive_error) {
+            return Err(error);
+        }
+        ai_chat::save(root, id, &imported, None).map_err(|error| error.to_string())?;
+        let turns = ai_chat::load(root, id).map_err(|error| error.to_string())?;
         self.batches.update(|batches| {
             batches.remove(&key);
         });
@@ -892,6 +1087,7 @@ impl AiState {
             return;
         }
         self.flush_chat();
+        self.branches_open.set(false);
         self.archive_read_error.set(String::new());
         let in_progress = self.prompt.get_untracked();
         let composer = self
@@ -1138,6 +1334,22 @@ impl AiState {
             || self.archived.get_untracked(),
             |batch| batch.transcript(self.viewed_result.get_untracked()),
         );
+        let scene_answer = previous
+            .as_ref()
+            .filter(|_| task == WritingTask::Continue && self.follow_draft.get_untracked())
+            .and_then(|batch| {
+                Some(SceneAnswer {
+                    anchor: SceneAnchor::capture(target.as_ref()?)?,
+                    question: batch
+                        .scene_question(self.viewed_result.get_untracked())?
+                        .clone(),
+                })
+            });
+        let model_instruction = if task == WritingTask::Continue && scene_answer.is_none() {
+            ai_scene::append_answers(&instruction, target.as_ref(), &history)
+        } else {
+            instruction.clone()
+        };
         let displayed_prompt = if prompt.trim().is_empty() {
             match task {
                 WritingTask::Continue => "接着写一段",
@@ -1161,6 +1373,7 @@ impl AiState {
                     task,
                     prompt: TextBuffer::new(displayed_prompt),
                     instruction: instruction.clone(),
+                    scene_answer,
                     history: history.clone(),
                     turn_id: ai_chat::new_id(),
                     selected: 0,
@@ -1212,8 +1425,12 @@ impl AiState {
                         let worker_flag = flag.clone();
                         let worker_sender = sender.clone();
                         let worker_key = key.clone();
-                        let (prompt, context, research, mut job) =
-                            (&instruction, context.clone(), research.clone(), job.clone());
+                        let (prompt, context, research, mut job) = (
+                            &model_instruction,
+                            context.clone(),
+                            research.clone(),
+                            job.clone(),
+                        );
                         job.preview_model = Some(streamed_model(
                             adapter,
                             &worker_sender,
@@ -1352,6 +1569,7 @@ impl AiState {
             if let Some(instruction) = &revision {
                 batch.history = batch.transcript(index);
                 batch.prompt = TextBuffer::new(instruction);
+                batch.scene_answer = None;
                 batch.turn_id = ai_chat::new_id();
             }
             batch.cancelled = flag.clone();
@@ -1549,8 +1767,9 @@ fn update_batch(
         if !Arc::ptr_eq(&batch.cancelled, &token) || token.load(Ordering::Relaxed) {
             return false;
         }
+        let was_waiting = batch.scene_question(batch.selected).is_some();
         change(batch);
-        if !batch.busy() {
+        if !batch.busy() || (!was_waiting && batch.scene_question(batch.selected).is_some()) {
             persist_batch(&key, batch);
         }
         true
@@ -1612,13 +1831,13 @@ fn run_writing_agent(
     let initial_evidence = if let Some(run) = &mut research {
         instructions.push('\n');
         if continuing {
-            run.restrict_to_preceding_text();
+            run.restrict_for_continuation();
         }
         instructions.push_str(&run.context());
         if continuing {
             instructions.push_str(
                 "
-查阅同一文稿时，以光标之前为界。其他文稿中的资料只有在当前情节时间点已经成立时才纳入已知事实。",
+查阅以当前光标之前为界。跨文稿只提供编号更早的章节。即便出现在较早章节，预告、传闻和角色猜测仍要和已发生的事实区分。",
             );
         } else if use_tools {
             instructions.push_str("
@@ -1962,6 +2181,7 @@ mod tests {
                 author: TextBuffer::new("银匣交给了谁？"),
                 answer: Some(TextBuffer::new("交给了晏澄。")),
                 adopted: false,
+                local: None,
             },
             ChatTurn {
                 id: ai_chat::new_id(),
@@ -1969,6 +2189,7 @@ mod tests {
                 author: TextBuffer::new("这一条没有答复"),
                 answer: None,
                 adopted: false,
+                local: None,
             },
         ]);
         let result = run_writing_agent(
@@ -2349,6 +2570,7 @@ mod tests {
             target: Some(target.clone()),
             prompt: TextBuffer::new("以李明的视角接一拍"),
             instruction: "以李明的视角接一拍".into(),
+            scene_answer: None,
             history: Arc::new(Vec::new()),
             turn_id: "question".into(),
             selected: 0,

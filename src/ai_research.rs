@@ -17,7 +17,7 @@ const CHUNK_BYTES: usize = 2100;
 const CHUNK_OVERLAP: usize = 240;
 const STORY_BATCH_BYTES: usize = 42 * 1024;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ResearchScope {
     #[default]
     Excerpt,
@@ -111,6 +111,7 @@ impl IndexedText {
 struct Chapter {
     document: usize,
     title: String,
+    number: Option<u32>,
     start: usize,
     end: usize,
 }
@@ -241,10 +242,68 @@ impl ResearchRequest {
             active_document,
             caret,
             before_caret: false,
+            continuation_only: false,
+            current_number: None,
             used_bytes: 0,
             evidence: Vec::new(),
         })
     }
+}
+
+/// Only explicit chapter labels establish ordering across files. Volume and
+/// section labels are kept out because their numbering often restarts.
+fn chapter_number(title: &str) -> Option<u32> {
+    let (number, _) = title.trim().strip_prefix('第')?.split_once('章')?;
+    if let Ok(number) = number.parse::<u32>() {
+        return (number > 0).then_some(number);
+    }
+    let digit = |character| match character {
+        '零' | '〇' => Some(0),
+        '一' => Some(1),
+        '二' | '两' => Some(2),
+        '三' => Some(3),
+        '四' => Some(4),
+        '五' => Some(5),
+        '六' => Some(6),
+        '七' => Some(7),
+        '八' => Some(8),
+        '九' => Some(9),
+        _ => None,
+    };
+    if number.chars().all(|character| digit(character).is_some()) {
+        let value = number.chars().try_fold(0_u32, |sum, character| {
+            sum.checked_mul(10)?.checked_add(digit(character)?)
+        })?;
+        return (value != 0).then_some(value);
+    }
+    let mut sum = 0;
+    let mut pending = None;
+    let mut last_unit = 10_000;
+    for (index, character) in number.chars().enumerate() {
+        if let Some(value) = digit(character) {
+            if value == 0 && pending.is_none() {
+                continue;
+            }
+            if value == 0 || pending.replace(value).is_some() {
+                return None;
+            }
+            continue;
+        }
+        let unit = match character {
+            '十' => 10,
+            '百' => 100,
+            '千' => 1000,
+            _ => return None,
+        };
+        if unit >= last_unit {
+            return None;
+        }
+        let value = pending.take().or((index == 0 && unit == 10).then_some(1))?;
+        sum += value * unit;
+        last_unit = unit;
+    }
+    let sum = sum + pending.unwrap_or(0);
+    (sum > 0).then_some(sum)
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), AgentError> {
@@ -296,6 +355,7 @@ impl ManuscriptIndex {
             let chapter = self.chapters.len();
             self.chapters.push(Chapter {
                 document,
+                number: chapter_number(&title),
                 title: title.clone(),
                 start: *start,
                 end,
@@ -346,6 +406,8 @@ pub struct ResearchRun {
     active_document: Option<usize>,
     caret: usize,
     before_caret: bool,
+    continuation_only: bool,
+    current_number: Option<u32>,
     used_bytes: usize,
     evidence: Vec<(Passage, Source)>,
 }
@@ -355,9 +417,39 @@ impl ResearchRun {
         self.before_caret = true;
     }
 
+    pub fn restrict_for_continuation(&mut self) {
+        self.before_caret = true;
+        self.continuation_only = true;
+        let mut owners = HashMap::new();
+        if self
+            .index
+            .chapters
+            .iter()
+            .filter_map(|chapter| chapter.number.map(|number| (number, chapter.document)))
+            .any(|(number, document)| {
+                owners
+                    .insert(number, document)
+                    .is_some_and(|owner| owner != document)
+            })
+        {
+            return;
+        }
+        self.current_number = self.current.and_then(|id| {
+            let chapter = &self.index.chapters[id];
+            chapter_number(self.readable_title(chapter))
+        });
+    }
+
     fn readable_end(&self, chapter: &Chapter) -> usize {
         if self.before_caret && self.active_document == Some(chapter.document) {
             chapter.end.min(self.caret)
+        } else if self.continuation_only
+            && !chapter
+                .number
+                .zip(self.current_number)
+                .is_some_and(|(number, current)| number < current)
+        {
+            chapter.start
         } else {
             chapter.end
         }
@@ -743,6 +835,36 @@ mod tests {
             title: id.trim_end_matches(".txt").to_owned(),
             path: root.join(id),
         }
+    }
+
+    #[test]
+    fn project_continuation_uses_chapter_numbers_and_hides_future_or_unordered_files() {
+        let library = tempfile::tempdir().unwrap();
+        let root = library.path();
+        let active = file(root, "10-当前.txt");
+        let older = file(root, "99-较早.txt");
+        let later = file(root, "01-较晚.txt");
+        let note = file(root, "零散设定.txt");
+        std::fs::write(&older.path, "第九十九章\n钥匙交给了十七。").unwrap();
+        std::fs::write(&later.path, "第一百零一章\n钥匙被卖到了黑市。").unwrap();
+        std::fs::write(&note.path, "钥匙将在月台失踪。").unwrap();
+        let prefix = "第一百章\n天亮了。";
+        let mut run = ResearchRequest {
+            root: root.to_path_buf(),
+            files: vec![older, later, note, active.clone()],
+            active_id: active.id,
+            active: TextBuffer::new(&format!("{prefix}钥匙已换了锁。")),
+            caret: TextBuffer::new(prefix).character_count(),
+        }
+        .open(&ResearchCache::default(), &AtomicBool::new(false))
+        .unwrap();
+        run.restrict_for_continuation();
+        assert_eq!(run.list(1, 12)["total"], 2);
+        assert!(run.read(1, 0, 2048).get("error").is_some());
+        let hits = run.search("钥匙", 8).to_string();
+        assert!(hits.contains("钥匙交给了十七"));
+        assert!(!hits.contains("黑市") && !hits.contains("月台") && !hits.contains("换了锁"));
+        assert_eq!(chapter_number("第一千零二十六章 夜航"), Some(1026));
     }
 
     #[test]
