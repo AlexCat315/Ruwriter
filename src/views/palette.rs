@@ -289,19 +289,16 @@ impl View for Palette {
                 .keywords(["sort", "paixu"]),
             );
         }
-        let formats: [(&str, BundleImageResource, Command, [&str; 2]); 11] = [
-            (
-                "写入两格段首空格",
+        items.push(
+            command(
+                "格式化文本…",
+                "格式",
                 icons::text::type_(),
-                Command::IndentParagraphs,
-                ["indent", "duanshou"],
-            ),
-            (
-                "删除文件中的段首空格",
-                icons::text::type_(),
-                Command::UnindentParagraphs,
-                ["unindent", "duanshou"],
-            ),
+                Rc::new(Model::open_text_formatter),
+            )
+            .keywords(["format", "geshihua", "整理", "空行", "缩进"]),
+        );
+        let formats: [(&str, BundleImageResource, Command, [&str; 2]); 9] = [
             (
                 "加粗",
                 icons::text::bold(),
@@ -358,9 +355,7 @@ impl View for Palette {
             ),
         ];
         for (title, icon, format_command, keywords) in formats {
-            if format_command.is_plain_text()
-                != (model.writing_mode() == ruwriter_core::WritingMode::Novel)
-            {
+            if model.writing_mode() != ruwriter_core::WritingMode::Markdown {
                 continue;
             }
             items.push(

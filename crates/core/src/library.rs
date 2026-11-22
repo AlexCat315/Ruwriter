@@ -227,7 +227,7 @@ impl Default for Settings {
             font_size: 17,
             sort: SortOrder::Edited,
             writing_mode: WritingMode::Novel,
-            paragraph_indent: true,
+            paragraph_indent: false,
             typewriter_scrolling: false,
             line_spacing: LineSpacing::Normal,
             column_width: ColumnWidth::Normal,
@@ -411,8 +411,19 @@ pub struct WritingMemory {
     pub subject: String,
     pub text: String,
     pub source: String,
+    pub kind: WritingMemoryKind,
     pub pinned: bool,
     pub held: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritingMemoryKind {
+    #[default]
+    Note,
+    Fact,
+    CharacterClaim,
+    Craft,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

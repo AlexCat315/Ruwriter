@@ -18,6 +18,7 @@ pub use library::{
 };
 pub use library::{
     CharacterCard, RelationshipCard, StoryProfile, WritingBrief, WritingFeedback, WritingMemory,
+    WritingMemoryKind,
 };
 pub use outline::{Heading, heading_at, headings, is_chapter_line};
 pub use session::{

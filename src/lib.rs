@@ -14,6 +14,7 @@ mod markdown_syntax;
 mod menu_bar;
 mod model;
 mod shortcuts;
+mod text_format;
 mod theme;
 mod views;
 

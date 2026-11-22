@@ -24,6 +24,7 @@ use ruwriter_core::{Session, count};
 
 use super::ai::AiPanel;
 use super::editor::EditorPane;
+use super::format_text::FormatTextDialog;
 use super::history::HistoryDialog;
 use super::info::InfoDialog;
 use super::list::ListPane;
@@ -150,6 +151,7 @@ impl View for RootView {
                 cove_ui::compose::primitives::text::text_field::TextFieldNavigationRequest::default,
             ),
             edit: cx.state(|| None),
+            format_dialog: cx.state(|| None),
             find_open: cx.state(|| false),
             find_query: cx.state(cove_ui::compose::primitives::text::TextBuffer::empty),
             find_replacement: cx.state(cove_ui::compose::primitives::text::TextBuffer::empty),
@@ -343,6 +345,9 @@ impl View for RootView {
                     model: model.clone(),
                 }),
                 AnyView::new(RenameDialog {
+                    model: model.clone(),
+                }),
+                AnyView::new(FormatTextDialog {
                     model: model.clone(),
                 }),
                 AnyView::new(InfoDialog {

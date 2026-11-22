@@ -16,6 +16,7 @@ use cove_ui::compose::primitives::text::{
     Divider, MarkdownView, Text, TextField, TextFieldAxis, TextFieldBehavior, TextFieldEvents,
     TextFieldIndentSkip, TextFieldLayout,
 };
+use cove_ui::compose::theme::styles::buttons::{ButtonStyleViewExt, GhostButtonStyle};
 use cove_ui::compose::theme::styles::components::text_field_style::AnyTextFieldStyle;
 use cove_ui::compose::theme::{SemanticColorRef, SemanticFontRef};
 use cove_ui::compose::{FrameDimension, ScrollAxis, ScrollView};
@@ -212,14 +213,21 @@ impl EditorPane {
         ))
     }
 
-    /// The formatting commands: inline buttons on a wide pane, one menu on
-    /// a narrow one. Focus mode hides them all.
+    /// Document cleanup and Markdown markup use separate controls.
     fn formatting_controls(&self) -> Vec<AnyView> {
         let model = &self.model;
-        if model.writing_mode() == ruwriter_core::WritingMode::Novel
-            || self.layout.editor_width < FORMAT_BAR_WIDTH
-        {
-            return vec![AnyView::new(
+        let formatter = model.clone();
+        let mut controls = vec![AnyView::new(
+            Button::title("格式化", move || formatter.open_text_formatter())
+                .accessibility_text("格式化文本")
+                .tooltip("格式化文本")
+                .button_style(GhostButtonStyle),
+        )];
+        if model.writing_mode() == ruwriter_core::WritingMode::Novel {
+            return controls;
+        }
+        if self.layout.editor_width < FORMAT_BAR_WIDTH {
+            controls.push(AnyView::new(
                 MenuButton::new(
                     format_menu(model),
                     ButtonIcon::new(
@@ -229,9 +237,10 @@ impl EditorPane {
                     ),
                 )
                 .ghost()
-                .accessibility_label("格式")
-                .tooltip("格式"),
-            )];
+                .accessibility_label("Markdown 样式")
+                .tooltip("Markdown 样式"),
+            ));
+            return controls;
         }
         let buttons: [(BundleImageResource, &str, Command); 8] = [
             (icons::text::bold(), "加粗 ⌘B", Command::Bold),
@@ -247,33 +256,16 @@ impl EditorPane {
             (icons::editor::code(), "行内代码 ⌘E", Command::Code),
             (icons::action::link(), "链接 ⇧⌘K", Command::Link),
         ];
-        buttons
-            .into_iter()
-            .map(|(icon, label, command)| {
-                let target = model.clone();
-                icon_button(icon, label, false, move || target.format(command))
-            })
-            .collect()
+        controls.extend(buttons.into_iter().map(|(icon, label, command)| {
+            let target = model.clone();
+            icon_button(icon, label, false, move || target.format(command))
+        }));
+        controls
     }
 }
 
 /// Every formatting command with its shortcut, for the narrow-pane menu.
 fn format_menu(model: &Model) -> Vec<MenuEntry> {
-    if model.writing_mode() == ruwriter_core::WritingMode::Novel {
-        return [
-            ("写入两格段首空格", Command::IndentParagraphs),
-            ("删除文件中的段首空格", Command::UnindentParagraphs),
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(index, (title, command))| {
-            let model = model.clone();
-            MenuEntry::Item(MenuItem::new(index as u64 + 1, title, move || {
-                model.format(command)
-            }))
-        })
-        .collect();
-    }
     let actions: [(&str, &str, Command); 9] = [
         ("加粗", "⌘B", Command::Bold),
         ("斜体", "⌘I", Command::Italic),

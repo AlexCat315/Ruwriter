@@ -4,6 +4,152 @@ const RECENT_TEXT: usize = 1200;
 const MAX_SAMPLES: usize = 3;
 const SAMPLE_BYTES: usize = 3600;
 
+/// Local author prose supplies a baseline even when no samples were pinned.
+pub fn with_local_sample(scene: &str, samples: &[String]) -> Vec<String> {
+    let mut selected = select_samples(scene, samples);
+    if selected.is_empty() {
+        let sample = recent_text(scene, 1250).trim();
+        if !sample.is_empty() {
+            selected.push(sample.to_owned());
+        }
+    }
+    selected
+}
+
+pub fn summarize_author_feedback(instruction: &str) -> String {
+    let rejected = rejected_expressions(instruction);
+    if rejected.is_empty() {
+        return instruction.trim().chars().take(440).collect();
+    }
+    format!(
+        "作者要求避开{}及同一语用功能的近义改写。{}",
+        rejected
+            .iter()
+            .map(|phrase| format!("「{phrase}」"))
+            .collect::<Vec<_>>()
+            .join("、"),
+        instruction.trim().chars().take(360).collect::<String>()
+    )
+}
+
+pub fn lasting_author_direction(instruction: &str) -> Option<String> {
+    let instruction = instruction.trim();
+    if ["修复以下", "草稿重用了", "初稿用了", "修复并复审"]
+        .iter()
+        .any(|prefix| instruction.starts_with(prefix))
+    {
+        return None;
+    }
+    let durable = [
+        "以后写",
+        "以后都",
+        "后面都",
+        "统一文风",
+        "全书都",
+        "后续所有",
+    ]
+    .iter()
+    .any(|hint| instruction.contains(hint));
+    let style = [
+        "文风", "叙述", "语言", "句式", "用词", "比喻", "段落", "语气",
+    ]
+    .iter()
+    .any(|hint| instruction.contains(hint));
+    if durable && style {
+        return Some(instruction.chars().take(1800).collect());
+    }
+    let rejected = rejected_expressions(instruction);
+    (!rejected.is_empty()).then(|| {
+        rejected
+            .iter()
+            .take(8)
+            .map(|quote| format!("不要复用「{quote}」"))
+            .collect::<Vec<_>>()
+            .join("。")
+    })
+}
+
+pub fn rejected_expressions(instruction: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut rest = instruction;
+    while let Some((at, open)) = rest
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '「' | '“' | '『' | '"'))
+    {
+        let end_quote = match open {
+            '「' => '」',
+            '“' => '”',
+            '『' => '』',
+            _ => '"',
+        };
+        let content = &rest[at + open.len_utf8()..];
+        let Some((quote, tail)) = content.split_once(end_quote) else {
+            break;
+        };
+        let before = rest[..at]
+            .rsplit(['，', '。', '！', '？', '；', ';', '\n'])
+            .next()
+            .unwrap_or("");
+        let after = tail
+            .split([
+                '，', '。', '！', '？', '；', ';', '\n', '「', '“', '『', '"',
+            ])
+            .next()
+            .unwrap_or("");
+        let before_is_negative = [
+            "不要", "别用", "别写", "别再", "避开", "删掉", "去掉", "不用", "换掉", "禁止", "反对",
+        ]
+        .iter()
+        .any(|cue| before.contains(cue));
+        let after_is_negative = [
+            "AI味",
+            "AI 味",
+            "太像AI",
+            "套话",
+            "套式",
+            "写得不对",
+            "不成立",
+            "换掉",
+            "删掉",
+            "别再",
+        ]
+        .iter()
+        .any(|cue| after.contains(cue));
+        let quote = quote.trim();
+        if (before_is_negative || after_is_negative)
+            && (4..=140).contains(&quote.chars().count())
+            && !phrases.iter().any(|prior| prior == quote)
+        {
+            phrases.push(quote.to_owned());
+        }
+        rest = tail;
+    }
+    phrases
+}
+
+pub fn rejected_expression_in(
+    draft: &str,
+    instructions: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Option<String> {
+    for instruction in instructions {
+        for phrase in rejected_expressions(instruction.as_ref()) {
+            if draft.contains(&phrase) {
+                return Some(phrase);
+            }
+            for fragment in phrase.split(['，', '、', '；', '：', '。']) {
+                let count = fragment.chars().count();
+                if count >= 5 {
+                    let prefix: String = fragment.chars().take(count - 1).collect();
+                    if draft.contains(&prefix) {
+                        return Some(phrase);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn select_samples(scene: &str, samples: &[String]) -> Vec<String> {
     let tail = scene
         .char_indices()
@@ -56,13 +202,17 @@ pub fn select_feedback(
     use cove_agent::retrieval::SearchIndex;
     let query = format!("{request} {}", recent_text(scene, 600));
     let lowercase_query = query.to_lowercase();
+    let lowercase_scene = scene.to_lowercase();
     let records: Vec<_> = records
         .iter()
         .rev()
         .filter(|record| {
             !record.held
-                && (!record.lesson.trim().is_empty() || record.before != record.after)
-                && scope_matches(&record.subject, &lowercase_query)
+                && (!record.lesson.trim().is_empty()
+                    || !record.instruction.trim().is_empty()
+                    || record.before != record.after)
+                && (scope_matches(&record.subject, &lowercase_query)
+                    || scope_matches(&record.subject, &lowercase_scene))
         })
         .map(revision_excerpt)
         .collect();
@@ -75,23 +225,25 @@ pub fn select_feedback(
     }
     let ranked = index.search(&query, records.len());
     let mut selected = Vec::new();
-    for index in ranked
-        .iter()
-        .copied()
+    for index in (0..records.len())
+        .filter(|&index| records[index].before.is_empty() && records[index].after.is_empty())
+        .take(2)
+        .chain(
+            ranked
+                .iter()
+                .copied()
+                .chain(0..records.len())
+                .filter(|&index| !records[index].subject.trim().is_empty())
+                .chain(ranked.iter().copied()),
+        )
         .chain(0..records.len())
-        .filter(|&index| !records[index].subject.trim().is_empty())
-        .chain(ranked.iter().copied())
     {
         if !selected.contains(&index) {
             selected.push(index);
         }
-        if selected.len() == 3 {
+        if selected.len() == 5 {
             break;
         }
-    }
-    // Older work-wide examples may have no keywords.
-    if selected.is_empty() {
-        selected.extend((0..records.len()).take(2));
     }
     selected
         .into_iter()
@@ -151,6 +303,15 @@ pub fn select_memories(
     (0..active.len())
         .filter(|&index| active[index].pinned)
         .chain(ranked)
+        .chain(
+            (0..active.len())
+                .rev()
+                .filter(|&index| {
+                    active[index].subject.trim().is_empty()
+                        && active[index].title == "改稿对照的写法归纳"
+                })
+                .take(1),
+        )
         .filter(|index| selected.insert(*index))
         .filter_map(|index| {
             let entry = active[index];
@@ -164,6 +325,17 @@ pub fn select_memories(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn learns_rejected_phrasing_without_replaying_the_old_scene_instruction() {
+        let instruction = "把画收到桌边。不要用「我点点头，没急着接腔。」";
+        let saved = lasting_author_direction(instruction).unwrap();
+        assert!(saved.contains("没急着接腔"));
+        assert!(!saved.contains("把画收到"));
+        assert!(rejected_expression_in("我嗯了一声，没急着接。", [&saved]).is_some());
+        assert!(rejected_expression_in("她将画塞回袋子。", [&saved]).is_none());
+        assert!(lasting_author_direction("这次先让她把画收走。").is_none());
+    }
     use ruwriter_core::{WritingFeedback, WritingMemory};
 
     #[test]

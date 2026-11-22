@@ -3,6 +3,7 @@
 
 mod ai;
 mod editor;
+mod format_text;
 mod history;
 mod info;
 mod list;

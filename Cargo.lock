@@ -1549,6 +1549,7 @@ dependencies = [
  "cove-http",
  "cove-ui",
  "libc",
+ "pulldown-cmark",
  "ruwriter-core",
  "serde",
  "serde_json",

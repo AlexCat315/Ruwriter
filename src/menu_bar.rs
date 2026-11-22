@@ -163,71 +163,59 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
         ],
     );
 
-    let format = NativeMenu::new(
-        "格式",
-        if markdown {
-            vec![
-                item(
-                    action(model, "加粗", |model| model.format(Command::Bold)),
-                    Some(primary("b")),
-                ),
-                item(
-                    action(model, "斜体", |model| model.format(Command::Italic)),
-                    Some(primary("i")),
-                ),
-                item(
-                    action(model, "删除线", |model| {
-                        model.format(Command::Strikethrough)
-                    }),
-                    Some(primary_shift("x")),
-                ),
-                item(
-                    action(model, "行内代码", |model| model.format(Command::Code)),
-                    Some(primary("e")),
-                ),
-                item(
-                    action(model, "链接", |model| model.format(Command::Link)),
-                    Some(primary_shift("k")),
-                ),
-                NativeMenuItem::Separator,
-                item(
-                    action(model, "标题", |model| model.format(Command::Heading)),
-                    Some(primary_shift("h")),
-                ),
-                item(
-                    action(model, "无序列表", |model| {
-                        model.format(Command::BulletList)
-                    }),
-                    Some(primary_shift("8")),
-                ),
-                item(
-                    action(model, "有序列表", |model| {
-                        model.format(Command::NumberedList)
-                    }),
-                    Some(primary_shift("7")),
-                ),
-                item(
-                    action(model, "引用", |model| model.format(Command::Quote)),
-                    Some(primary_shift("9")),
-                ),
-            ]
-        } else {
-            vec![
-                item(
-                    action(model, "写入两格段首空格", |model| {
-                        model.format(Command::IndentParagraphs)
-                    }),
-                    None,
-                ),
-                item(
-                    action(model, "删除文件中的段首空格", |model| {
-                        model.format(Command::UnindentParagraphs)
-                    }),
-                    None,
-                ),
-            ]
-        },
-    );
+    let mut format_items = vec![item(
+        action(model, "格式化文本…", Model::open_text_formatter),
+        None,
+    )];
+    if markdown {
+        format_items.push(NativeMenuItem::Separator);
+        format_items.extend([
+            item(
+                action(model, "加粗", |model| model.format(Command::Bold)),
+                Some(primary("b")),
+            ),
+            item(
+                action(model, "斜体", |model| model.format(Command::Italic)),
+                Some(primary("i")),
+            ),
+            item(
+                action(model, "删除线", |model| {
+                    model.format(Command::Strikethrough)
+                }),
+                Some(primary_shift("x")),
+            ),
+            item(
+                action(model, "行内代码", |model| model.format(Command::Code)),
+                Some(primary("e")),
+            ),
+            item(
+                action(model, "链接", |model| model.format(Command::Link)),
+                Some(primary_shift("k")),
+            ),
+            NativeMenuItem::Separator,
+            item(
+                action(model, "标题", |model| model.format(Command::Heading)),
+                Some(primary_shift("h")),
+            ),
+            item(
+                action(model, "无序列表", |model| {
+                    model.format(Command::BulletList)
+                }),
+                Some(primary_shift("8")),
+            ),
+            item(
+                action(model, "有序列表", |model| {
+                    model.format(Command::NumberedList)
+                }),
+                Some(primary_shift("7")),
+            ),
+            item(
+                action(model, "引用", |model| model.format(Command::Quote)),
+                Some(primary_shift("9")),
+            ),
+        ]);
+    }
+    let format = NativeMenu::new("格式", format_items);
 
     let appearance_menu = NativeMenu::new(
         "外观",

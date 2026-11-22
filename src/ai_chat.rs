@@ -94,7 +94,12 @@ fn encode_archive(turns: &[ChatTurn], timeline: Option<&Timeline>) -> io::Result
                 local: if retain_local {
                     turn.local.clone()
                 } else {
-                    None
+                    turn.local.as_ref().and_then(|local| {
+                        Some(LocalTurn {
+                            reflection: Some(local.reflection.as_ref()?.clone()),
+                            ..Default::default()
+                        })
+                    })
                 },
             })
             .collect(),
@@ -148,7 +153,18 @@ fn decode_archive(path: &Path, retain_local: bool) -> io::Result<Conversation> {
             adopted: turn.adopted,
             model: turn.model,
             at: turn.at,
-            local: if retain_local { turn.local } else { None },
+            local: if retain_local {
+                turn.local
+            } else {
+                turn.local.and_then(|local| {
+                    let mut reflection = local.reflection?;
+                    reflection.imported = true;
+                    Some(LocalTurn {
+                        reflection: Some(reflection),
+                        ..Default::default()
+                    })
+                })
+            },
         })
         .collect();
     let timeline = if retain_local { archive.timeline } else { None }
@@ -374,7 +390,49 @@ mod tests {
     use crate::ai::WritingTarget;
     use crate::ai_continuation::SceneQuestion;
     use crate::ai_research::ResearchScope;
+    use crate::ai_review::DraftReflection;
     use crate::ai_scene::{PendingScene, SceneAnchor, SceneAnswer, append_answers, pending};
+
+    #[test]
+    fn imported_reflection_keeps_the_comparison_for_author_review() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("reflection.json");
+        let answer = "她把画放在桌上，等他开口。";
+        let turn = ChatTurn {
+            id: "1".into(),
+            task: Some(WritingTask::Continue),
+            author: TextBuffer::new("续写"),
+            answer: Some(TextBuffer::new(answer)),
+            local: Some(LocalTurn {
+                reflection: Some(DraftReflection {
+                    before_quote: "她收回了画".into(),
+                    after_quote: "她把画放在桌上".into(),
+                    lesson: "让人物用行动给对方留下回应的机会。".into(),
+                    after_hash: ruwriter_core::sync::content_hash(answer),
+                    imported: false,
+                }),
+                ..Default::default()
+            }),
+            markdown: false,
+            adopted: false,
+            model: None,
+            at: None,
+        };
+        std::fs::write(&file, encode(&[turn]).unwrap()).unwrap();
+        let imported = decode(&file).unwrap();
+        save(root.path(), "uid:1", &imported, None).unwrap();
+        let restored = load(root.path(), "uid:1").unwrap();
+        let reflection = restored[0]
+            .local
+            .as_ref()
+            .unwrap()
+            .reflection
+            .as_ref()
+            .unwrap();
+        assert!(reflection.imported);
+        assert!(reflection.applies_to(answer));
+        assert_eq!(reflection.after_quote, "她把画放在桌上");
+    }
 
     #[test]
     fn rolling_back_forks_reversibly_and_late_saves_preserve_the_selected_branch() {
