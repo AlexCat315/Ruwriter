@@ -71,6 +71,8 @@ pub struct LocalTurn {
     pub scene_answer: Option<SceneAnswer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<crate::ai_review::DraftReflection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_draft_anchor: Option<SceneAnchor>,
 }
 
 pub fn pending(turns: &[ChatTurn]) -> Option<(&ChatTurn, &PendingScene)> {

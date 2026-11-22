@@ -291,7 +291,7 @@ pub fn format(
                     }
                 }
             }
-            if options.trim_line_ends {
+            if options.trim_line_ends || (!markdown && blank && options.indent == Indent::Remove) {
                 let trimmed = if markdown {
                     line.body.trim_end_matches([' ', '\t'])
                 } else {

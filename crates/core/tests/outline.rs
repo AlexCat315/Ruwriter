@@ -69,6 +69,28 @@ fn reads_chinese_chapter_lines_without_markup() {
 }
 
 #[test]
+fn reads_spaced_numbers_and_fullwidth_digits_in_actual_chapter_titles() {
+    let text = "第十二章 白熊小兔\r\n第 13章 梦幻泡影\r\n　　第 14章\r\n第　１５　章 后来\r\n第 二 天他回来了。";
+    let heads = headings(text);
+    assert_eq!(
+        heads
+            .iter()
+            .map(|heading| heading.title.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "第十二章 白熊小兔",
+            "第 13章 梦幻泡影",
+            "第 14章",
+            "第　１５　章 后来"
+        ],
+    );
+    assert_eq!(
+        heads[2].offset,
+        text[..text.find("　　第 14章").unwrap()].chars().count()
+    );
+}
+
+#[test]
 fn prose_that_starts_like_a_chapter_is_not_a_heading() {
     let text = "第三章讲的是他离开以后发生的事情，那一年冬天特别冷。\n第二天他没有来。\n第一章\n";
     let heads = headings(text);

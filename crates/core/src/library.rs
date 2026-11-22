@@ -202,8 +202,6 @@ pub struct Settings {
     pub sort: SortOrder,
     /// Novel writing mode or the Markdown editor.
     pub writing_mode: WritingMode,
-    /// Indent the first row of each paragraph, as novels and Chinese prose do.
-    pub paragraph_indent: bool,
     /// Keep the caret row near the middle of the editor as the page scrolls.
     pub typewriter_scrolling: bool,
     /// Line spacing for the manuscript body.
@@ -227,12 +225,32 @@ impl Default for Settings {
             font_size: 17,
             sort: SortOrder::Edited,
             writing_mode: WritingMode::Novel,
-            paragraph_indent: false,
             typewriter_scrolling: false,
             line_spacing: LineSpacing::Normal,
             column_width: ColumnWidth::Normal,
             markdown_syntax: true,
             outline: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProseIndent {
+    #[default]
+    AsWritten,
+    Display,
+    FollowParagraph,
+}
+
+impl ProseIndent {
+    pub const ALL: [Self; 3] = [Self::AsWritten, Self::Display, Self::FollowParagraph];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::AsWritten => "按原文",
+            Self::Display => "仅显示两格",
+            Self::FollowParagraph => "回车沿用本段缩进",
         }
     }
 }
@@ -257,6 +275,7 @@ pub struct Meta {
     /// Caret character offset last seen in this document, so reopening puts
     /// the author back where they stopped instead of at the top.
     pub last_caret: usize,
+    pub prose_indent: ProseIndent,
     /// Stable identity for cloud sync. Generated from the path the first time
     /// the file is seen, then carried by the metadata across renames.
     pub uid: String,

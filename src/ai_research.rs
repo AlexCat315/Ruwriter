@@ -254,10 +254,12 @@ impl ResearchRequest {
 /// section labels are kept out because their numbering often restarts.
 fn chapter_number(title: &str) -> Option<u32> {
     let (number, _) = title.trim().strip_prefix('第')?.split_once('章')?;
+    let number = number.trim();
     if let Ok(number) = number.parse::<u32>() {
         return (number > 0).then_some(number);
     }
     let digit = |character| match character {
+        '０'..='９' => Some(u32::from(character) - u32::from('０')),
         '零' | '〇' => Some(0),
         '一' => Some(1),
         '二' | '两' => Some(2),
@@ -865,6 +867,8 @@ mod tests {
         assert!(hits.contains("钥匙交给了十七"));
         assert!(!hits.contains("黑市") && !hits.contains("月台") && !hits.contains("换了锁"));
         assert_eq!(chapter_number("第一千零二十六章 夜航"), Some(1026));
+        assert_eq!(chapter_number("第 14章"), Some(14));
+        assert_eq!(chapter_number("第　１５　章 后来"), Some(15));
     }
 
     #[test]

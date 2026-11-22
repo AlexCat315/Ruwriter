@@ -398,6 +398,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("reflection.json");
         let answer = "她把画放在桌上，等他开口。";
+        let buffer = TextBuffer::new("她先把平板关了。");
+        let target = WritingTarget {
+            document: (root.path().to_owned(), "chapter.txt".into(), 1),
+            insertion: buffer.character_count(),
+            buffer,
+            selection: None,
+        };
         let turn = ChatTurn {
             id: "1".into(),
             task: Some(WritingTask::Continue),
@@ -411,6 +418,7 @@ mod tests {
                     after_hash: ruwriter_core::sync::content_hash(answer),
                     imported: false,
                 }),
+                author_draft_anchor: SceneAnchor::capture(&target),
                 ..Default::default()
             }),
             markdown: false,
@@ -418,10 +426,32 @@ mod tests {
             model: None,
             at: None,
         };
+        save(root.path(), "uid:local", std::slice::from_ref(&turn), None).unwrap();
+        let local = load(root.path(), "uid:local").unwrap();
+        let saved_anchor = local[0]
+            .local
+            .as_ref()
+            .unwrap()
+            .author_draft_anchor
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            saved_anchor.restore(&target).unwrap().insertion,
+            target.insertion,
+        );
         std::fs::write(&file, encode(&[turn]).unwrap()).unwrap();
         let imported = decode(&file).unwrap();
         save(root.path(), "uid:1", &imported, None).unwrap();
         let restored = load(root.path(), "uid:1").unwrap();
+        assert!(restored[0].author_draft().is_some());
+        assert!(
+            restored[0]
+                .local
+                .as_ref()
+                .unwrap()
+                .author_draft_anchor
+                .is_none()
+        );
         let reflection = restored[0]
             .local
             .as_ref()

@@ -8,8 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One heading, with its offset in characters from the start of the text
-/// (what the editor's caret requests use, not bytes).
+/// One heading, with its offset in Unicode scalars from the start of the text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Heading {
     pub offset: usize,
@@ -107,14 +106,9 @@ fn chapter_line(line: &str) -> Option<(u8, &str)> {
     if SPECIAL.iter().any(|prefix| line.starts_with(prefix)) {
         return Some((1, line));
     }
-    if !line.starts_with('第') {
-        return None;
-    }
-    let mut numerals = 0_usize;
-    let mut unit = None;
-    for character in line.chars().skip(1) {
-        match character {
-            '0'..='9'
+    let numbered = line.strip_prefix('第')?.trim_start();
+    let end = numbered.find(|character| {
+        !matches!(character, '0'..='9' | '０'..='９'
             | '零'
             | '〇'
             | '一'
@@ -130,22 +124,15 @@ fn chapter_line(line: &str) -> Option<(u8, &str)> {
             | '百'
             | '千'
             | '万'
-            | '两' => numerals += 1,
-            '卷' | '部' | '篇' | '章' | '节' | '回' | '话' => {
-                unit = Some(character);
-                break;
-            }
-            _ => return None,
-        }
-    }
-    let unit = unit?;
-    if numerals == 0 {
+            | '两')
+    })?;
+    if end == 0 {
         return None;
     }
-    let level = if matches!(unit, '卷' | '部' | '篇') {
-        1
-    } else {
-        2
+    let level = match numbered[end..].trim_start().chars().next()? {
+        '卷' | '部' | '篇' => 1,
+        '章' | '节' | '回' | '话' => 2,
+        _ => return None,
     };
     Some((level, line))
 }

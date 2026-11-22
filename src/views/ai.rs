@@ -1033,7 +1033,7 @@ impl AiPanel {
                 } else if turn.adopted {
                     meta.push("已采纳".to_owned());
                 }
-                let ai = self.model.ai.clone();
+                let copy_ai = self.model.ai.clone();
                 let actions = vec![
                     AnyView::new(
                         Text::new(meta.join(" · "))
@@ -1048,11 +1048,53 @@ impl AiPanel {
                         false,
                         move || {
                             ClipboardHolder::write(&copy.string_value());
-                            ai.flash_feedback("已复制这条回复。");
+                            copy_ai.flash_feedback("已复制这条回复。");
                         },
                     ),
                 ];
                 message.push(hstack(4.0, Align::Center, actions));
+                if batch.is_none()
+                    && !turn.adopted
+                    && let Some((_, task)) = turn.author_draft()
+                    && let Some(target) = ai.target.get()
+                {
+                    let replacing = task == WritingTask::Polish;
+                    let mut actions = Vec::new();
+                    let docked = self.docked;
+                    let ready = !preparing_story && ai.follow_after_write.get().is_none();
+                    let anchored = turn
+                        .local
+                        .as_ref()
+                        .is_some_and(|local| local.author_draft_anchor.is_some());
+                    if anchored {
+                        let model = self.model.clone();
+                        let id = turn.id.clone();
+                        actions.push(primary(
+                            if replacing {
+                                "用作者版替换原选区"
+                            } else {
+                                "将作者版接回原处"
+                            },
+                            ready,
+                            move || model.apply_archived_author_draft(&id, true, docked),
+                        ));
+                    }
+                    let model = self.model.clone();
+                    let id = turn.id.clone();
+                    let label = if replacing {
+                        "用作者版替换当前选区"
+                    } else {
+                        "将作者版插入当前光标"
+                    };
+                    let enabled = ready && (!replacing || target.selection.is_some());
+                    let action = move || model.apply_archived_author_draft(&id, false, docked);
+                    actions.push(if anchored {
+                        AnyView::new(Button::title(label, action).enabled(enabled))
+                    } else {
+                        primary(label, enabled, action)
+                    });
+                    message.push(wrap_controls(actions));
+                }
                 if let Some(reflection) = turn
                     .local
                     .as_ref()
@@ -1492,6 +1534,27 @@ impl AiPanel {
         card.push(input);
         card.push(tools);
         let mut composer = Vec::new();
+        if let Some(batch) = &batch
+            && !batch.applied()
+            && batch.target.is_some()
+            && !ai.edit_candidate.get()
+            && let Some(draft) = batch.runs.get(index).and_then(|run| run.adoptable_result())
+            && draft.author_edited()
+        {
+            let replace = draft.task == WritingTask::Polish;
+            let label = if replace {
+                "用作者版替换原选区"
+            } else {
+                "将作者版接入正文"
+            };
+            let model = self.model.clone();
+            let docked = self.docked;
+            composer.push(wrap_controls(vec![primary(
+                label,
+                ai.follow_after_write.get().is_none(),
+                move || model.apply_ai(index, replace, docked),
+            )]));
+        }
         composer.push(AnyView::new(
             vstack(1.0, Align::Stretch, card)
                 .padding_edges(6.0, 5.0)
@@ -1720,12 +1783,7 @@ impl AiPanel {
         )
     }
 
-    fn results(
-        &self,
-        rows: &mut Vec<AnyView>,
-        batch: &Batch,
-        show_beats: Signal<bool>,
-    ) {
+    fn results(&self, rows: &mut Vec<AnyView>, batch: &Batch, show_beats: Signal<bool>) {
         let selected = batch
             .target
             .as_ref()
@@ -2124,7 +2182,7 @@ impl AiPanel {
                         })));
                     }
                 }
-                if has_target && !batch.applied() {
+                if has_target && !batch.applied() && !editing && !result.author_edited() {
                     let ready = result.can_adopt();
                     let insert = self.model.clone();
                     let replace = self.model.clone();
@@ -2199,8 +2257,6 @@ impl AiPanel {
             }
         }
     }
-
-
 }
 
 fn author_message(text: &TextBuffer, edit: Option<AnyView>) -> AnyView {

@@ -29,13 +29,13 @@ use cove_ui::platform::KeyEvent;
 use ruwriter_core::document::file_name_for;
 use ruwriter_core::sync::{SyncDocument, SyncReport};
 use ruwriter_core::{
-    AppearancePreference, Collection, DocStatus, Document, Heading, Rescan, Session, Snapshot,
-    SortOrder, WritingStats, count, heading_at, headings, parse_tags,
+    AppearancePreference, Collection, DocStatus, Document, Heading, ProseIndent, Rescan, Session,
+    Snapshot, SortOrder, WritingStats, count, heading_at, parse_tags,
 };
 
 use crate::ai::{
-    AiState, ChatTurn, ModelStatus, PendingDraftEdit, StoryStatus, WritingTarget, WritingTask,
-    automatic_task, continuation_insertion, is_continuation_command,
+    AiState, ChatTurn, DraftWriteSource, ModelStatus, PendingDraftEdit, StoryStatus, WritingTarget,
+    WritingTask, automatic_task, continuation_insertion, is_continuation_command,
 };
 use crate::ai_research::{ManuscriptFile, ResearchRequest, ResearchScope};
 use crate::formatting::{self, Command};
@@ -62,6 +62,7 @@ pub struct FormatTarget {
     pub selection: Option<std::ops::Range<usize>>,
     caret: TextFieldCaretState,
     pub mode: ruwriter_core::WritingMode,
+    pub options: crate::text_format::FormatOptions,
     document: u64,
 }
 
@@ -324,13 +325,15 @@ impl Model {
         self.set_writing_mode(mode);
     }
 
-    pub fn paragraph_indent(&self) -> bool {
-        self.settings().paragraph_indent
+    pub fn prose_indent(&self) -> ProseIndent {
+        let _ = self.settings_revision.get();
+        let _ = self.document.get();
+        self.read(Session::prose_indent).unwrap_or_default()
     }
 
-    pub fn toggle_paragraph_indent(&self) {
+    pub fn set_prose_indent(&self, indent: ProseIndent) {
         let _ = self.with_session(|session| {
-            session.toggle_paragraph_indent();
+            session.set_prose_indent(indent);
             Ok(())
         });
         self.settings_revision.update(|value| *value += 1);
@@ -386,8 +389,15 @@ impl Model {
         if let Some(edit) = self.ai.follow_after_write.get_untracked() {
             self.ai.follow_after_write.set(None);
             if buffer.has_same_contents(&edit.expected) {
-                self.remember_adopted_author_edit(edit.index);
-                self.ai.was_applied(edit.index, edit.before);
+                match &edit.source {
+                    DraftWriteSource::Active(index) => {
+                        self.ai.was_applied(*index, edit.before.clone());
+                        self.remember_adopted_author_edit(*index);
+                    }
+                    DraftWriteSource::Archived(id) => {
+                        self.ai.was_archived_applied(id, edit.clone())
+                    }
+                }
                 if edit.keep_open {
                     if let Some(batch) = self.ai.current_batch() {
                         self.ai.task.set(batch.writing_task());
@@ -416,7 +426,11 @@ impl Model {
     fn update_text_summary(&self, text: &str) {
         self.stats.set_if_changed(count(text));
         self.preview.set_if_changed(text.to_owned());
-        self.outline.set_if_changed(Rc::new(headings(text)));
+        self.outline
+            .set_if_changed(Rc::new(formatting::editor_headings(
+                text,
+                &self.buffer.get_untracked(),
+            )));
     }
 
     fn finish_text_summary(&self, text: &str) {
@@ -563,6 +577,21 @@ impl Model {
     }
 
     pub fn open_text_formatter(&self) {
+        self.open_text_formatter_with(crate::text_format::FormatOptions::CLEAN);
+    }
+
+    pub fn remove_prose_indent(&self) {
+        if self.writing_mode() == ruwriter_core::WritingMode::Novel {
+            self.open_text_formatter_with(crate::text_format::FormatOptions {
+                indent: crate::text_format::Indent::Remove,
+                blank_lines: crate::text_format::BlankLines::Keep,
+                trim_line_ends: false,
+                trim_outer_blank_lines: false,
+            });
+        }
+    }
+
+    fn open_text_formatter_with(&self, options: crate::text_format::FormatOptions) {
         if self.active_document().is_none() {
             return;
         }
@@ -580,6 +609,7 @@ impl Model {
             selection,
             caret,
             mode: self.writing_mode(),
+            options,
             document: self.document.get_untracked(),
         }));
     }
@@ -672,17 +702,44 @@ impl Model {
             }
             return true;
         }
-        if !matches!(key, Scancode::RETURN | Scancode::KEYPAD_ENTER)
-            || !modifiers.is_empty()
-            || self.writing_mode() != ruwriter_core::WritingMode::Markdown
+        if !modifiers.is_empty()
+            || !matches!(
+                key,
+                Scancode::BACKSPACE | Scancode::RETURN | Scancode::KEYPAD_ENTER
+            )
         {
             return false;
         }
         let buffer = self.buffer.get_untracked();
         let state = self.caret.get_untracked();
-        let Some(edit) =
-            formatting::continue_line(&buffer, state.caret_index, state.selected_range)
-        else {
+        if key == Scancode::BACKSPACE && self.writing_mode() == ruwriter_core::WritingMode::Novel {
+            if let Some(edit) =
+                formatting::delete_prose_indent(&buffer, state.caret_index, state.selected_range)
+            {
+                self.request_edit(edit.range, edit.replacement, edit.caret, None);
+                return true;
+            }
+            return false;
+        }
+        if !matches!(key, Scancode::RETURN | Scancode::KEYPAD_ENTER) {
+            return false;
+        }
+        let edit = match self.writing_mode() {
+            ruwriter_core::WritingMode::Markdown => {
+                formatting::continue_line(&buffer, state.caret_index, state.selected_range)
+            }
+            ruwriter_core::WritingMode::Novel
+                if self.prose_indent() == ProseIndent::FollowParagraph =>
+            {
+                formatting::continue_prose_paragraph(
+                    &buffer,
+                    state.caret_index,
+                    state.selected_range,
+                )
+            }
+            _ => None,
+        };
+        let Some(edit) = edit else {
             return false;
         };
         self.request_edit(edit.range, edit.replacement, edit.caret, None);
@@ -858,7 +915,8 @@ impl Model {
     /// Headings of the open document with their character offsets, for the
     /// palette's jump list.
     pub fn outline(&self) -> Vec<Heading> {
-        headings(&self.buffer.get_untracked().string_value())
+        let buffer = self.buffer.get_untracked();
+        formatting::editor_headings(&buffer.string_value(), &buffer)
     }
 
     /// The heading tree plus the index of the section holding the caret.
@@ -2107,15 +2165,15 @@ impl Model {
         let Some(target) = batch.target.as_ref() else {
             return;
         };
-        let Some(ModelStatus::Ready(result)) = batch.runs.get(index).map(|run| &run.status) else {
+        let Some(run) = batch.runs.get(index) else {
             return;
         };
-        if !result.can_adopt() {
+        let Some(result) = run.adoptable_result() else {
             self.ai
                 .error
                 .set("这条回复还不能写入正文。请重新生成或编辑后审稿。".to_owned());
             return;
-        }
+        };
         if (result.task == WritingTask::Continue && replace)
             || (result.task == WritingTask::Polish && !replace)
         {
@@ -2134,11 +2192,88 @@ impl Model {
                 .set("原落笔点已变化或无法唯一定位。可以复制草稿，再手动放入正文。".to_owned());
             return;
         };
-        let mut text = result.text.string_value();
+        self.queue_draft_write(
+            current,
+            range,
+            (&result.text, result.task),
+            DraftWriteSource::Active(index),
+            keep_open,
+        );
+    }
+
+    pub fn apply_archived_author_draft(&self, id: &str, original: bool, keep_open: bool) {
+        self.ai.activate(self.ai_workspace());
+        if self.ai.follow_after_write.get_untracked().is_some() || self.ai.current_batch().is_some()
+        {
+            return;
+        }
+        self.update_ai_target(false);
+        let chat = self.ai.current_chat();
+        let Some(turn) = chat.iter().find(|turn| turn.id == id && !turn.adopted) else {
+            return;
+        };
+        let Some((answer, task)) = turn.author_draft() else {
+            return;
+        };
+        let Some(current) = self.ai.target.get_untracked() else {
+            self.ai.error.set("请先打开原文。".to_owned());
+            return;
+        };
+        let target = if original {
+            let Some(target) = turn
+                .local
+                .as_ref()
+                .and_then(|local| local.author_draft_anchor.as_ref())
+                .and_then(|anchor| anchor.restore(&current))
+            else {
+                self.ai
+                    .error
+                    .set("原位置已变化。请在正文中重新定位后使用当前位置写入。".to_owned());
+                return;
+            };
+            target
+        } else {
+            current
+        };
+        let range = if task == WritingTask::Polish {
+            let Some(range) = target.selection else {
+                self.ai.error.set("请在正文中选中要替换的文字。".to_owned());
+                return;
+            };
+            range
+        } else if original {
+            target.insertion..target.insertion
+        } else {
+            let caret = self
+                .caret
+                .get_untracked()
+                .caret_index
+                .min(target.buffer.character_count());
+            caret..caret
+        };
+        self.queue_draft_write(
+            target.buffer,
+            range,
+            (answer, task),
+            DraftWriteSource::Archived(id.to_owned()),
+            keep_open,
+        );
+    }
+
+    fn queue_draft_write(
+        &self,
+        current: TextBuffer,
+        range: std::ops::Range<usize>,
+        draft: (&TextBuffer, WritingTask),
+        source: DraftWriteSource,
+        keep_open: bool,
+    ) {
+        let (text, task) = draft;
+        let mut text = text.string_value();
         if text.trim().is_empty() {
             return;
         }
-        if result.task == WritingTask::Continue {
+        if task == WritingTask::Continue {
             text = continuation_insertion(&current, range.start, text);
         }
         let start = current.utf8_offset_for_character_index(range.start);
@@ -2155,7 +2290,7 @@ impl Model {
             before: current,
             expected: updated,
             caret,
-            index,
+            source,
             keep_open,
         }));
         if self.options().preview {

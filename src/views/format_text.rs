@@ -44,7 +44,7 @@ impl View for FormatSettings {
     fn body(&self, cx: &Scope) -> AnyView {
         let markdown = self.target.mode == WritingMode::Markdown;
         let selection = cx.state(|| self.target.selection.is_some());
-        let settings = cx.state(|| FormatOptions::CLEAN);
+        let settings = cx.state(|| self.target.options);
         let error = cx.state(String::new);
         let options = settings.get();
         let selected_range = selection
@@ -110,7 +110,7 @@ impl View for FormatSettings {
                 ],
                 move |indent| settings.update(|options| options.indent = indent),
             ));
-            if self.model.paragraph_indent() {
+            if self.model.prose_indent() == ruwriter_core::ProseIndent::Display {
                 rows.push(caption(
                     "编辑器已开启显示缩进。下方预览按文件里的实际空格显示。",
                 ));

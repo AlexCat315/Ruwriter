@@ -21,8 +21,8 @@ use crate::files::{
     write_new_document,
 };
 use crate::library::{
-    AppearancePreference, Collection, Library, Meta, Settings, SortOrder, WritingMode, name_of,
-    parent_of,
+    AppearancePreference, Collection, Library, Meta, ProseIndent, Settings, SortOrder, WritingMode,
+    name_of, parent_of,
 };
 use crate::paths;
 use crate::snapshots;
@@ -374,9 +374,22 @@ impl Session {
         self.persist_app();
     }
 
-    pub fn toggle_paragraph_indent(&mut self) {
-        self.app.settings.paragraph_indent = !self.app.settings.paragraph_indent;
-        self.persist_app();
+    pub fn prose_indent(&self) -> ProseIndent {
+        self.active
+            .as_deref()
+            .and_then(|id| self.library.meta(id))
+            .map_or(ProseIndent::AsWritten, |meta| meta.prose_indent)
+    }
+
+    pub fn set_prose_indent(&mut self, indent: ProseIndent) {
+        if self.writing_mode() == WritingMode::Novel
+            && let Some(id) = self.active.as_deref()
+            && let Some(meta) = self.library.meta_mut(id)
+            && meta.prose_indent != indent
+        {
+            meta.prose_indent = indent;
+            self.persist();
+        }
     }
 
     pub fn set_column_width(&mut self, width: crate::ColumnWidth) {

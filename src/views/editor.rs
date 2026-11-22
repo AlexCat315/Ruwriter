@@ -224,6 +224,15 @@ impl EditorPane {
                 .button_style(GhostButtonStyle),
         )];
         if model.writing_mode() == ruwriter_core::WritingMode::Novel {
+            if model.active_document().is_some() {
+                controls.push(AnyView::new(
+                    MenuButton::new(prose_indent_menu(model), Text::new("段首"))
+                        .composed()
+                        .ghost()
+                        .accessibility_label("段首缩进")
+                        .tooltip("段首缩进"),
+                ));
+            }
             return controls;
         }
         if self.layout.editor_width < FORMAT_BAR_WIDTH {
@@ -288,6 +297,32 @@ fn format_menu(model: &Model) -> Vec<MenuEntry> {
             entries.push(MenuEntry::separator(50));
         }
     }
+    entries
+}
+
+fn prose_indent_menu(model: &Model) -> Vec<MenuEntry> {
+    use ruwriter_core::ProseIndent;
+    let selected = model.prose_indent();
+    let mut entries: Vec<_> = ProseIndent::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            let model = model.clone();
+            MenuEntry::Item(
+                MenuItem::new(index as u64 + 1, choice.title(), move || {
+                    model.set_prose_indent(choice)
+                })
+                .selected(choice == selected),
+            )
+        })
+        .collect();
+    let model = model.clone();
+    entries.push(MenuEntry::separator(10));
+    entries.push(MenuEntry::Item(MenuItem::new(
+        11,
+        "删除段首空格…",
+        move || model.remove_prose_indent(),
+    )));
     entries
 }
 
@@ -379,7 +414,9 @@ impl View for EditorField {
                 axis: TextFieldAxis::Vertical,
                 max_visible_lines: 6,
                 wraps_lines: true,
-                first_line_indent: if novel && settings.paragraph_indent {
+                first_line_indent: if novel
+                    && self.model.prose_indent() == ruwriter_core::ProseIndent::Display
+                {
                     f32::from(self.font_size) * 2.0
                 } else {
                     0.0
@@ -553,7 +590,9 @@ impl View for PreviewPane {
                         .style(AnyTextFieldStyle::new(ProseFieldStyle))
                         .layout(TextFieldLayout {
                             axis: TextFieldAxis::Vertical,
-                            first_line_indent: if settings.paragraph_indent {
+                            first_line_indent: if self.model.prose_indent()
+                                == ruwriter_core::ProseIndent::Display
+                            {
                                 f32::from(settings.font_size) * 2.0
                             } else {
                                 0.0

@@ -5,6 +5,25 @@
 //! Wrapping commands toggle: marked text loses its marks, unmarked text
 //! gains them. Line commands apply to every line the selection touches.
 
+use cove_ui::compose::primitives::text::TextBuffer;
+
+/// The parser counts scalars, while the editor moves in grapheme clusters.
+pub fn editor_headings(text: &str, buffer: &TextBuffer) -> Vec<ruwriter_core::Heading> {
+    let mut offsets = text.char_indices().enumerate().peekable();
+    let mut headings = ruwriter_core::headings(text);
+    for heading in &mut headings {
+        while offsets
+            .peek()
+            .is_some_and(|(index, _)| *index < heading.offset)
+        {
+            offsets.next();
+        }
+        let byte = offsets.peek().map_or(text.len(), |(_, (byte, _))| *byte);
+        heading.offset = buffer.character_index_for_utf8_offset(byte);
+    }
+    headings
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Bold,
@@ -171,6 +190,72 @@ pub struct LineEdit {
     pub range: std::ops::Range<usize>,
     pub replacement: String,
     pub caret: usize,
+}
+
+pub fn delete_prose_indent(
+    buffer: &TextBuffer,
+    caret: usize,
+    selection: Option<(usize, usize)>,
+) -> Option<LineEdit> {
+    if caret == 0 || selection.is_some_and(|(low, high)| low != high) {
+        return None;
+    }
+    let start = buffer
+        .line_range(buffer.line_index_for_character_index(caret))
+        .start;
+    if caret == start
+        || !buffer
+            .substring(caret - 1..caret)
+            .chars()
+            .all(crate::text_format::horizontal_space)
+    {
+        return None;
+    }
+    let prefix = buffer.substring(start..caret);
+    (!prefix.is_empty() && prefix.chars().all(crate::text_format::horizontal_space)).then_some(
+        LineEdit {
+            range: start..caret,
+            replacement: String::new(),
+            caret: start,
+        },
+    )
+}
+
+/// Continue the actual indentation of a prose paragraph when the author opts
+/// in. A second Enter on its empty continuation clears the provisional spaces.
+pub fn continue_prose_paragraph(
+    buffer: &TextBuffer,
+    caret: usize,
+    selection: Option<(usize, usize)>,
+) -> Option<LineEdit> {
+    if selection.is_some_and(|(low, high)| low != high) {
+        return None;
+    }
+    let row = buffer.line_index_for_character_index(caret);
+    let line = buffer.line_range(row);
+    if caret != line.end {
+        return None;
+    }
+    let text = buffer.substring(line.clone());
+    let body = text.trim_start_matches(crate::text_format::horizontal_space);
+    let prefix = &text[..text.len() - body.len()];
+    if prefix.is_empty() || ruwriter_core::is_chapter_line(body.trim()) {
+        return None;
+    }
+    let separator = if line.end < buffer.character_count() {
+        buffer.substring(line.end..line.end + 1)
+    } else if line.start > 0 {
+        buffer.substring(line.start - 1..line.start)
+    } else {
+        "\n".to_owned()
+    };
+    let range = if body.is_empty() { line } else { caret..caret };
+    let indent = if body.is_empty() { "" } else { prefix };
+    Some(LineEdit {
+        caret: range.start + 1 + indent.chars().count(),
+        range,
+        replacement: format!("{separator}{indent}"),
+    })
 }
 
 /// Return inside a Markdown list or quote continues its prefix. An empty item
@@ -434,7 +519,47 @@ mod tests {
     fn visual_indent_skips_explicit_indents_and_chapter_titles() {
         assert!(skip_prose_indent("　　已经有段首空格"));
         assert!(skip_prose_indent("第三章 天亮"));
+        assert!(skip_prose_indent("第 14章"));
         assert!(!skip_prose_indent("还留着要说的话。"));
+    }
+
+    #[test]
+    fn spaced_headings_jump_after_crlf_and_joined_emoji() {
+        let text = "👩‍💻和e\u{301}\r\n第 14章\r\n正文";
+        let buffer = TextBuffer::new(text);
+        let headings = editor_headings(text, &buffer);
+        assert_eq!(headings[0].offset, 4);
+        assert_eq!(
+            buffer.substring(headings[0].offset..headings[0].offset + 5),
+            "第 14章"
+        );
+    }
+
+    #[test]
+    fn real_prose_indent_can_be_removed_or_continued_in_one_edit() {
+        let buffer = TextBuffer::new("前一行\r\n　　正文");
+        let deletion = delete_prose_indent(&buffer, 6, None).unwrap();
+        assert_eq!(
+            buffer
+                .replace(deletion.range, &deletion.replacement)
+                .string_value(),
+            "前一行\r\n正文"
+        );
+        assert!(delete_prose_indent(&buffer, 6, Some((4, 6))).is_none());
+        let eol = buffer.character_count();
+        assert!(delete_prose_indent(&buffer, eol, None).is_none());
+        let line = continue_prose_paragraph(&buffer, eol, None).unwrap();
+        let with_indent = buffer.replace(line.range, &line.replacement);
+        assert_eq!(with_indent.string_value(), "前一行\r\n　　正文\r\n　　");
+        let empty_line = continue_prose_paragraph(&with_indent, line.caret, None).unwrap();
+        assert_eq!(
+            with_indent
+                .replace(empty_line.range, &empty_line.replacement)
+                .string_value(),
+            "前一行\r\n　　正文\r\n\r\n"
+        );
+        let title = TextBuffer::new("　　第 14章");
+        assert!(continue_prose_paragraph(&title, title.character_count(), None).is_none());
     }
 
     fn edit(text: &str, caret: usize, selection: Option<(usize, usize)>, command: Command) -> Edit {

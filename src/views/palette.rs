@@ -114,17 +114,6 @@ impl View for Palette {
             )
             .keywords(["novel", "markdown", "xiaoshuo", "moshi", "mode"]),
             command(
-                if model.paragraph_indent() {
-                    "关闭 TXT 自动显示段首缩进"
-                } else {
-                    "开启 TXT 自动显示段首缩进"
-                },
-                "排版",
-                icons::text::type_(),
-                Rc::new(Model::toggle_paragraph_indent),
-            )
-            .keywords(["indent", "suojin", "duanshou", "paragraph"]),
-            command(
                 "窄栏",
                 "排版",
                 icons::layout::columns_2(),
@@ -278,6 +267,30 @@ impl View for Palette {
             )
             .keywords(["smaller", "font"]),
         ];
+        if model.writing_mode() == ruwriter_core::WritingMode::Novel
+            && model.active_document().is_some()
+        {
+            items.push(
+                command(
+                    "删除段首空格…",
+                    "段首缩进",
+                    icons::text::type_(),
+                    Rc::new(Model::remove_prose_indent),
+                )
+                .keywords(["unindent", "duanshou", "清除缩进"]),
+            );
+            for choice in ruwriter_core::ProseIndent::ALL {
+                items.push(
+                    command(
+                        choice.title(),
+                        "段首缩进",
+                        icons::text::type_(),
+                        Rc::new(move |model| model.set_prose_indent(choice)),
+                    )
+                    .keywords(["indent", "suojin", "段首"]),
+                );
+            }
+        }
         for sort in SortOrder::ALL {
             items.push(
                 command(

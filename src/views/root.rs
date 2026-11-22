@@ -165,7 +165,10 @@ impl View for RootView {
             pending_save: cx.state(|| None),
             save_revision: cx.state(|| 0),
             caret_revision: cx.state(|| 0),
-            outline: cx.state(|| Rc::new(ruwriter_core::headings(&initial))),
+            outline: cx.state(|| {
+                let buffer = TextBuffer::new(&initial);
+                Rc::new(crate::formatting::editor_headings(&initial, &buffer))
+            }),
             history_open: cx.state(|| false),
             history_entries: cx.state(Vec::new),
             sync_open: cx.state(|| false),

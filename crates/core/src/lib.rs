@@ -13,8 +13,8 @@ pub mod sync;
 
 pub use document::{DocStatus, Document, normalize_tags, parse_tags, title_from_text};
 pub use library::{
-    AppearancePreference, Collection, ColumnWidth, Folder, Library, LineSpacing, Settings,
-    SortOrder, WritingMode,
+    AppearancePreference, Collection, ColumnWidth, Folder, Library, LineSpacing, ProseIndent,
+    Settings, SortOrder, WritingMode,
 };
 pub use library::{
     CharacterCard, RelationshipCard, StoryProfile, WritingBrief, WritingFeedback, WritingMemory,

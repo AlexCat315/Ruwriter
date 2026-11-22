@@ -14,7 +14,7 @@ use cove_ui::hosts::desktop::window::native_menu::{
     NativeMenuKeyModifiers,
 };
 use cove_ui::platform::NativeStandardMenuTitles;
-use ruwriter_core::{AppearancePreference, Collection};
+use ruwriter_core::{AppearancePreference, Collection, ProseIndent};
 
 use crate::formatting::Command;
 use crate::model::Model;
@@ -29,7 +29,7 @@ type MenuKey = (
     bool,
     bool,
     (ruwriter_core::WritingMode, ruwriter_core::WritingMode),
-    bool,
+    ProseIndent,
     bool,
     ruwriter_core::LineSpacing,
     ruwriter_core::ColumnWidth,
@@ -48,7 +48,7 @@ pub fn sync(model: &Model, installed: &Rc<RefCell<Option<MenuKey>>>) {
         pinned,
         settings.markdown_syntax,
         (settings.writing_mode, model.writing_mode()),
-        settings.paragraph_indent,
+        model.prose_indent(),
         settings.typewriter_scrolling,
         settings.line_spacing,
         settings.column_width,
@@ -275,15 +275,28 @@ fn build(model: &Model, key: MenuKey) -> NativeMenuBar {
                     .with_selected(writing == ruwriter_core::WritingMode::Markdown),
                 None,
             ),
-            item(
-                action(
-                    model,
-                    "TXT 自动显示段首缩进",
-                    Model::toggle_paragraph_indent,
-                )
-                .with_selected(indent),
-                None,
-            ),
+            NativeMenuItem::Submenu(NativeMenu::new(
+                "TXT 段首缩进",
+                ProseIndent::ALL
+                    .into_iter()
+                    .map(|choice| {
+                        item(
+                            action(model, choice.title(), move |model| {
+                                model.set_prose_indent(choice)
+                            })
+                            .with_selected(indent == choice)
+                            .with_enabled_provider(move || !markdown),
+                            None,
+                        )
+                    })
+                    .chain(std::iter::once(NativeMenuItem::Separator))
+                    .chain(std::iter::once(item(
+                        action(model, "删除段首空格…", Model::remove_prose_indent)
+                            .with_enabled_provider(move || !markdown),
+                        None,
+                    )))
+                    .collect(),
+            )),
             item(
                 action(model, "打字机滚动", Model::toggle_typewriter_scrolling)
                     .with_selected(typewriter),

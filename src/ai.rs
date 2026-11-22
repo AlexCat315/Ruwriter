@@ -302,6 +302,17 @@ impl ModelRun {
         self.draft_preview.as_deref().or(self.revising.as_deref())
     }
 
+    pub fn adoptable_result(&self) -> Option<&WritingResult> {
+        match &self.status {
+            ModelStatus::Ready(draft) => Some(draft.as_ref()),
+            ModelStatus::Running(WritingStage::Reflect | WritingStage::Review) => self
+                .draft_in_progress()
+                .filter(|draft| draft.author_edited()),
+            _ => None,
+        }
+        .filter(|draft| draft.can_adopt())
+    }
+
     pub fn feedback_example(&self) -> Option<WritingFeedback> {
         let ModelStatus::Ready(result) = &self.status else {
             return None;
@@ -362,6 +373,25 @@ pub struct ChatTurn {
     /// Seconds since the Unix epoch, captured when the turn was started.
     pub at: Option<u64>,
     pub(crate) local: Option<LocalTurn>,
+}
+
+impl ChatTurn {
+    pub fn author_draft(&self) -> Option<(&TextBuffer, WritingTask)> {
+        let task = self.task.filter(|task| *task != WritingTask::Request)?;
+        let answer = self.answer.as_ref()?;
+        let local = self.local.as_ref()?;
+        if local.author_draft_anchor.is_none() && local.reflection.is_none() {
+            return None;
+        }
+        let text = answer.string_value();
+        (!text.trim().is_empty()
+            && (local.author_draft_anchor.is_some()
+                || local
+                    .reflection
+                    .as_ref()
+                    .is_some_and(|reflection| reflection.applies_to(&text))))
+        .then_some((answer, task))
+    }
 }
 
 #[derive(Clone)]
@@ -511,6 +541,10 @@ impl Batch {
                 }),
                 scene_answer: self.scene_answer.clone(),
                 reflection: result.and_then(WritingResult::current_reflection).cloned(),
+                author_draft_anchor: result
+                    .filter(|draft| draft.author_edited())
+                    .and_then(|_| self.target.as_ref())
+                    .and_then(SceneAnchor::capture),
             }),
         });
         history
@@ -568,8 +602,8 @@ impl WritingResult {
         let text = self.text.string_value();
         !text.trim().is_empty()
             && (self.task == WritingTask::Request
-                || ((!self.author_edited() || self.text.has_same_contents(&self.reviewed_text))
-                    && !matches!(self.review, Review::Rejected)
+                || self.author_edited()
+                || (!matches!(self.review, Review::Rejected)
                     && !self.review.blocks_approval()
                     && self.repetition_warning.is_none()
                     && !self.needs_private_review()
@@ -715,11 +749,17 @@ impl Default for WritingJob {
 }
 
 #[derive(Clone)]
+pub enum DraftWriteSource {
+    Active(usize),
+    Archived(String),
+}
+
+#[derive(Clone)]
 pub struct PendingDraftEdit {
     pub before: TextBuffer,
     pub expected: TextBuffer,
     pub caret: usize,
-    pub index: usize,
+    pub source: DraftWriteSource,
     pub keep_open: bool,
 }
 
@@ -781,6 +821,7 @@ pub struct AiState {
     pub edit_candidate: Signal<bool>,
     pub feedback: Signal<String>,
     pub follow_after_write: Signal<Option<PendingDraftEdit>>,
+    archived_writes: Signal<Vec<PendingDraftEdit>>,
     pub error: Signal<String>,
     pub archive_read_error: Signal<String>,
     answers:
@@ -852,6 +893,7 @@ impl AiState {
             edit_candidate: cx.state(|| false),
             feedback: cx.state(String::new),
             follow_after_write: cx.state(|| None),
+            archived_writes: cx.state(Vec::new),
             error: cx.state(String::new),
             archive_read_error: cx.state(String::new),
             answers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1343,6 +1385,7 @@ impl AiState {
         }
         self.flush_chat();
         self.branches_open.set(false);
+        self.archived_writes.set(Vec::new());
         self.archive_read_error.set(String::new());
         let in_progress = self.prompt.get_untracked();
         let composer = self
@@ -1415,19 +1458,48 @@ impl AiState {
     }
 
     pub fn was_applied(&self, index: usize, before: TextBuffer) {
-        self.stop();
         let key = self.workspace.get_untracked();
         self.batches.update(|batches| {
             if let Some(batch) = batches.get_mut(&key) {
+                if let Some(run) = batch.runs.get_mut(index)
+                    && run.status.pending()
+                    && let Some(draft) = run.adoptable_result().cloned()
+                {
+                    run.status = ModelStatus::Ready(Box::new(draft));
+                    run.draft_preview = None;
+                    run.revising = None;
+                }
                 batch.adopted = Some(index);
                 batch.pre_adoption = Some(before);
-                persist_batch(&key, batch);
             }
         });
+        self.stop();
         self.clear_revision();
     }
 
     pub fn reopen_after_undo(&self, current: &TextBuffer) {
+        let chat = self.archived.get_untracked();
+        let writes = self.archived_writes.get_untracked();
+        if let Some((id, adopted)) = writes.iter().rev().find_map(|write| {
+            let DraftWriteSource::Archived(id) = &write.source else {
+                return None;
+            };
+            let turn = chat.iter().find(|turn| &turn.id == id)?;
+            if turn.adopted && current.has_same_contents(&write.before) {
+                Some((id, false))
+            } else if !turn.adopted && current.has_same_contents(&write.expected) {
+                Some((id, true))
+            } else {
+                None
+            }
+        }) {
+            self.set_archived_adopted(id, adopted);
+            self.flash_feedback(if adopted {
+                "已恢复写入。"
+            } else {
+                "已撤销写入。"
+            });
+        }
         let key = self.workspace.get_untracked();
         let mut undone = false;
         self.batches.update_if(|batches| {
@@ -1449,6 +1521,45 @@ impl AiState {
         });
         if undone {
             self.feedback.set("已撤销写入。".to_owned());
+        }
+    }
+
+    pub fn was_archived_applied(&self, id: &str, write: PendingDraftEdit) {
+        self.archived_writes.update(|writes| {
+            writes.retain(|previous| !matches!(&previous.source, DraftWriteSource::Archived(turn) if turn == id));
+            writes.push(write);
+        });
+        self.set_archived_adopted(id, true);
+    }
+
+    fn set_archived_adopted(&self, id: &str, adopted: bool) {
+        let key = self.workspace.get_untracked();
+        let Some((root, work)) = &key else { return };
+        let mut archive = self.archived.get_untracked();
+        let Some(turn) = Arc::make_mut(&mut archive)
+            .iter_mut()
+            .find(|turn| turn.id == id)
+        else {
+            return;
+        };
+        turn.adopted = adopted;
+        self.archived.set(archive.clone());
+        self.batches.update_if(|batches| {
+            let Some(batch) = batches.get_mut(&key) else {
+                return false;
+            };
+            let Some(turn) = Arc::make_mut(&mut batch.history)
+                .iter_mut()
+                .find(|turn| turn.id == id)
+            else {
+                return false;
+            };
+            turn.adopted = adopted;
+            true
+        });
+        if let Err(error) = ai_chat::save(root, work, &archive, Some(id)) {
+            self.error
+                .set(format!("正文已更新，对话状态保存失败。{error}"));
         }
     }
 
@@ -3162,7 +3273,25 @@ mod tests {
             Ok(AgentReply::Answer(answer.into()))
         });
         let no_rewrite: AgentModel = Arc::new(|_, _| panic!("author's edit must not be rewritten"));
-        assert!(!result.can_adopt());
+        assert!(result.can_adopt());
+        let mut pending = ModelRun {
+            profile: profile.clone(),
+            status: ModelStatus::Running(WritingStage::Reflect),
+            previous: None,
+            revision_error: None,
+            revising: Some(Box::new(result.clone())),
+            draft_preview: None,
+            streamed_text: TextBuffer::empty(),
+        };
+        assert!(pending.adoptable_result().is_some());
+        pending.status = ModelStatus::Running(WritingStage::Revise);
+        assert!(pending.adoptable_result().is_none());
+        let mut unedited = result.clone();
+        unedited.text = unedited.original_text.clone();
+        unedited.review = Review::Rejected;
+        assert!(!unedited.can_adopt());
+        unedited.text = TextBuffer::new("  ");
+        assert!(!unedited.can_adopt());
         let reflected = refine_candidate(
             &reflection_model,
             &no_rewrite,
