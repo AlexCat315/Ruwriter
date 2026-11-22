@@ -18,6 +18,7 @@ use cove_ui::compose::primitives::text::text_field::{
 use cove_ui::compose::primitives::text::{
     Divider, MarkdownView, Text, TextBuffer, TextField, TextRun, TextTraits,
 };
+use cove_ui::compose::primitives::text::rich::text_selection::TextSelectionViewExt;
 use cove_ui::compose::theme::styles::buttons::{
     ButtonStyleViewExt, GhostButtonStyle, PrimaryButtonStyle, ToggleButtonStyle,
 };
@@ -2672,16 +2673,21 @@ impl View for AiPanel {
                 let pill = AnyView::new(
                     AnyView::new(
                         AnyView::new(
-                            Button::title("回到最新", move || {
-                                jump.update(|value| *value += 1);
-                            })
+                            Button::icon(
+                                ButtonIconSource::resource(icons::navigation::arrow_down()),
+                                15.0,
+                                move || {
+                                    jump.update(|value| *value += 1);
+                                },
+                            )
+                            .tooltip("回到最新")
                             .accessibility_text("回到最新"),
                         )
                         .button_style(GhostButtonStyle),
                     )
-                    .padding_edges(10.0, 3.0)
+                    .frame_size(30.0, 30.0)
                     .semantic_background(SemanticColorRef::surface_floating())
-                    .corner_radius(14.0)
+                    .corner_radius(15.0)
                     .semantic_border(SemanticColorRef::border(), 1.0),
                 );
                 composer.push(hstack(0.0, Align::Center, vec![spacer(), pill]));
@@ -2705,6 +2711,6 @@ impl View for AiPanel {
             panel.push(self.brief_tabs());
         }
         panel.extend([AnyView::new(body), AnyView::new(footer)]);
-        AnyView::new(vstack(0.0, Align::Stretch, panel).fill())
+        AnyView::new(vstack(0.0, Align::Stretch, panel).fill()).text_selection(true)
     }
 }
