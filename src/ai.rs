@@ -10,13 +10,14 @@ use std::sync::{
 
 use cove_agent::openai_compatible::{ChatCompletionsModel, api_base};
 use cove_agent::{
-    AgentError, AgentMessage, AgentModel, AgentRole, AgentSession, AgentSkillLibrary, AgentTool,
-    AgentToolResult, AgentToolbox, JsonSchema,
+    AgentError, AgentMessage, AgentModel, AgentReply, AgentRole, AgentSession, AgentSkillLibrary,
+    AgentTool, AgentToolResult, AgentToolbox, JsonSchema,
 };
 use cove_ui::compose::primitives::text::TextBuffer;
 use cove_ui::composition::Scope;
 use cove_ui::core::{Binding, Signal, SignalSender};
 use ruwriter_core::{AiPreferences, AiSettings, StoryProfile, WritingBrief, WritingFeedback};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::ai_chat;
@@ -34,6 +35,8 @@ const REPETITION_REVIEW_CHARACTERS: usize = 6000;
 const MAX_CONTEXT_BYTES: usize = 48 * 1024;
 const MAX_TOOL_ROUNDS: usize = 6;
 const MAX_RESEARCH_ROUNDS: usize = 12;
+const ANSWER_AUDIT_MIN_CHARS: usize = 100;
+const ANSWER_AUDIT_CONTEXT_CHARS: usize = 6000;
 
 #[derive(Clone)]
 pub struct WritingTarget {
@@ -1863,6 +1866,91 @@ fn recent_messages(history: &[ChatTurn]) -> Vec<AgentMessage> {
     messages
 }
 
+#[derive(Deserialize)]
+struct AuditedAnswer {
+    verdict: String,
+    #[serde(default)]
+    revised: String,
+}
+
+fn tail_chars(text: &str, count: usize) -> &str {
+    if text.chars().count() <= count {
+        return text;
+    }
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(count)
+        .map_or(0, |(offset, _)| offset);
+    &text[start..]
+}
+
+/// One optional editor pass over manuscript-grounded answers. It only replaces the
+/// answer when the model finds a hard defect: a wrong fact, an answer that misses
+/// the request, or a guess presented as established canon.
+fn audit_request_answer(
+    model: &AgentModel,
+    request: &str,
+    context: &str,
+    sources: &[&str],
+    answer: &str,
+) -> Result<Option<String>, AgentError> {
+    let excerpt = tail_chars(context, ANSWER_AUDIT_CONTEXT_CHARS);
+    let evidence = sources
+        .iter()
+        .take(3)
+        .map(|source| tail_chars(source, 1200))
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    let instructions = r#"你是中文写作助手的终稿校对员。只修正硬伤，不改写文风。
+依据作者原文和检索来源，检查待校对回答：
+1. 是否正面完成用户要求，没有答非所问或漏掉明确要点；
+2. 人名、关系、时间、地点、物品和已发生事件是否与原文一致；
+3. 是否把猜测、传闻、玩笑或人物表面说法写成确定事实；
+4. 是否出现“好的/以下是/根据你提供的片段”等多余开场、对任务的复述或模型自述。
+只有存在以上硬伤时才改写。措辞偏好、细节多少、表达风格不同都不算问题；没有硬伤必须保留原回答。
+改写时完整保留原回答的结构和正确内容，禁止缩写，禁止添加原文没有的新事实。
+只输出 JSON，不要代码块：{"verdict":"keep"} 或 {"verdict":"revise","revised":"完整修订后的回答"}。"#;
+    let user = format!(
+        "用户要求：\n{request}\n\n作者原文：\n{excerpt}\n\n检索来源：\n{evidence}\n\n待校对回答：\n{answer}"
+    );
+    let reply = model(
+        &[
+            AgentMessage::text(AgentRole::System, instructions),
+            AgentMessage::user(user),
+        ],
+        &[],
+    )?;
+    let AgentReply::Answer(raw) = reply else {
+        return Ok(None);
+    };
+    let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) else {
+        return Ok(None);
+    };
+    let Some(parsed) = raw
+        .get(start..=end)
+        .and_then(|json| serde_json::from_str::<AuditedAnswer>(json).ok())
+    else {
+        return Ok(None);
+    };
+    if !parsed.verdict.trim().eq_ignore_ascii_case("revise") {
+        return Ok(None);
+    }
+    let revised = parsed.revised.trim();
+    let revised_chars = revised.chars().count();
+    let answer_chars = answer.chars().count();
+    if revised.is_empty()
+        || revised == answer.trim()
+        || revised_chars < 20
+        || revised_chars * 3 < answer_chars
+        || revised_chars > answer_chars * 3
+    {
+        return Ok(None);
+    }
+    Ok(Some(revised.to_owned()))
+}
+
+
 fn update_batch(
     sender: &SignalSender<Workspaces>,
     key: &WorkspaceKey,
@@ -2139,10 +2227,10 @@ fn run_writing_agent(
     } else {
         String::new()
     };
-    let (answer, repetition_warning) = if continuing {
+    let (mut answer, repetition_warning) = if continuing {
         progress(WritingProgress::Stage(WritingStage::Draft));
         let references: Vec<_> = std::iter::once(recent.as_str())
-            .chain(source_texts)
+            .chain(source_texts.iter().copied())
             .collect();
         ai_continuation::draft(
             writer,
@@ -2162,6 +2250,17 @@ fn run_writing_agent(
         }
         (first, None)
     };
+    if task == WritingTask::Request
+        && !context.trim().is_empty()
+        && answer.chars().count() >= ANSWER_AUDIT_MIN_CHARS
+    {
+        // A failed audit must never lose the answer the author already received.
+        if let Ok(Some(revised)) =
+            audit_request_answer(&model, prompt, &context, &source_texts, &answer)
+        {
+            answer = revised;
+        }
+    }
     let unknown_references = coverage.is_some()
         && answer.split("[R").skip(1).any(|part| {
             part.split_once(']')
@@ -2267,6 +2366,48 @@ mod tests {
         assert!(requires_key("https://API.DEEPSEEK.COM./chat/completions"));
         assert!(!requires_key("http://127.0.0.1:11434/v1"));
         assert!(!requires_key("https://api.deepseek.com.example/v1"));
+    }
+
+    #[test]
+    fn manuscript_answers_with_hard_errors_are_repaired_by_the_editor_pass() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model: AgentModel = {
+            let calls = calls.clone();
+            Arc::new(move |messages, tools| {
+                assert!(tools.is_empty());
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok(AgentReply::Answer(
+                        "好的，以下是回答。赵玥在第一章就说出了自己早就知道闻笙是作家，所以她才会主动搬到隔壁，并一直替闻笙保守这个秘密。".repeat(2),
+                    ))
+                } else {
+                    assert!(messages[0].text.contains("终稿校对员"));
+                    assert!(messages[1].text.contains("赵玥在第一章就说出了"));
+                    Ok(AgentReply::Answer(
+                        r#"{"verdict":"revise","revised":"赵玥没有在第一章说出这件事。原文只写到她在门口停下，随后问了一句租金，并没有提到闻笙的作家身份，也没有写她知情。"}"#
+                            .to_owned(),
+                    ))
+                }
+            })
+        };
+        let result = run_writing_agent(
+            model,
+            "赵玥知道闻笙是作家吗？",
+            "第一章 雨夜\n赵玥在门口停下，问他租金多少。".to_owned(),
+            false,
+            None,
+            WritingJob {
+                task: WritingTask::Request,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            result.text.string_value(),
+            "赵玥没有在第一章说出这件事。原文只写到她在门口停下，随后问了一句租金，并没有提到闻笙的作家身份，也没有写她知情。"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

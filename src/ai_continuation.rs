@@ -6,7 +6,7 @@ use ruwriter_core::WritingBrief;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const SCENE_CHARACTERS: usize = 4200;
+pub const SCENE_CHARACTERS: usize = 6000;
 const MAX_REPAIR_BYTES: usize = 12 * 1024;
 
 pub const PLAN_INSTRUCTIONS: &str = r#"读小说原稿，交给下一位写作者一份接续提要。story 是作者确认的剧情大纲、人物和未完线索。区分已经写出的剧情与大纲里计划在以后发生的事。character_claims 是人物说法与知情范围，可能是遮掩、误解、玩笑或隐喻，不能确认为世界事实，保持当前视角只知道自己见闻的边界。以最后一个动作、决定或没说完的话为准。next_beat 有具体要求时按作者的动作和停点整理；只有「续写」或留空时，只接当前场景里一件尚未完成的小事。无需为整幕设计结局。
