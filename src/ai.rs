@@ -589,7 +589,7 @@ impl Batch {
                 reflection: result.and_then(WritingResult::current_reflection).cloned(),
                 author_draft_anchor: result
                     .filter(|draft| draft.author_edited())
-                    .and_then(|_| self.target.as_ref())
+                    .and(self.target.as_ref())
                     .and_then(SceneAnchor::capture),
             }),
         });
@@ -703,6 +703,10 @@ impl WritingResult {
 
     pub fn voice_sample_count(&self) -> usize {
         self.draft_context.voice_samples.len()
+    }
+
+    pub fn voice_examples(&self) -> &[String] {
+        &self.draft_context.voice_samples
     }
 
     fn revise_checked_issues(
@@ -861,6 +865,7 @@ pub struct AiState {
     pub brief_page: Signal<usize>,
     pub outline_page: Signal<usize>,
     pub outline_full: Signal<bool>,
+    pub outline_list_offset: Signal<usize>,
     pub brief_item: Signal<Option<usize>>,
     pub brief_search: Signal<TextBuffer>,
     pub avoid: Signal<TextBuffer>,
@@ -935,6 +940,7 @@ impl AiState {
             brief_page: cx.state(|| 0),
             outline_page: cx.state(|| 0),
             outline_full: cx.state(|| false),
+            outline_list_offset: cx.state(|| 0),
             brief_item: cx.state(|| None),
             brief_search: cx.state(TextBuffer::empty),
             avoid: cx.state(TextBuffer::empty),
@@ -1764,7 +1770,7 @@ impl AiState {
             && self.follow_draft.get_untracked()
             && !is_continuation_command(&prompt);
         let preparing_work = !missing.is_empty() || setup_followup || plan_only;
-        let must_ask_about_work = plan_only
+        let must_ask_about_work = plan_only && !missing.is_empty()
             || preparing_work
                 && !setup_followup
                 && matches!(
@@ -2952,6 +2958,10 @@ fn run_writing_agent(
     let tools_available = task == WritingTask::Request && use_tools && !context.is_empty();
     let request = if plan_scene {
         let mut request = json!({"next_beat": prompt.trim(), "scene_before_caret": context});
+        if !voice_samples.is_empty() {
+            request["author_examples"] = json!(voice_samples);
+            request["author_sample_shapes"] = json!(ai_voice::voice_shapes(&voice_samples));
+        }
         if !brief.story.is_empty() {
             request["story"] = json!(brief.story.public_view());
         }
@@ -2980,8 +2990,9 @@ fn run_writing_agent(
         if !brief.feedback.is_empty() {
             request["accepted_revisions"] = json!(brief.feedback);
         }
-        if task == WritingTask::Polish && !voice_samples.is_empty() {
+        if (task == WritingTask::Polish || can_edit_work) && !voice_samples.is_empty() {
             request["author_examples"] = json!(voice_samples);
+            request["author_sample_shapes"] = json!(ai_voice::voice_shapes(&voice_samples));
         }
         if tools_available {
             request["excerpt_tool"] = json!("read_excerpt");

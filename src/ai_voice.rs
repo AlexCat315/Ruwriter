@@ -7,11 +7,88 @@ const SAMPLE_BYTES: usize = 3600;
 /// Local author prose supplies a baseline even when no samples were pinned.
 pub fn with_local_sample(scene: &str, samples: &[String]) -> Vec<String> {
     let mut selected = select_samples(scene, samples);
-    let sample = recent_text(scene, 1250).trim();
-    if !sample.is_empty() && !selected.iter().any(|reference| reference.contains(sample)) {
-        selected.push(sample.to_owned());
+    let recent = recent_text(scene, 1250);
+    let local_sample = if recent.len() < scene.len() {
+        recent.split_once('\n').map_or(recent, |(cut, body)| {
+            if cut.chars().count() < 240 {
+                body
+            } else {
+                recent
+            }
+        })
+    } else {
+        recent
+    }
+    .trim();
+    if !local_sample.is_empty()
+        && !selected
+            .iter()
+            .any(|reference| reference.contains(local_sample))
+    {
+        selected.insert(0, local_sample.to_owned());
     }
     selected
+}
+
+/// Measurements are used to rank samples and explain the reference to the
+/// writer. They are descriptive and never act as pass/fail thresholds.
+#[derive(Clone, Copy, serde::Serialize)]
+pub struct ProseShape {
+    dialogue_percent: usize,
+    median_sentence_chars: usize,
+    longer_sentence_chars: usize,
+    median_paragraph_chars: usize,
+}
+
+impl ProseShape {
+    fn measure(text: &str) -> Self {
+        let lengths = |segments: std::str::Split<'_, fn(char) -> bool>| {
+            let mut lengths: Vec<_> = segments
+                .map(|segment| segment.chars().filter(|ch| ch.is_alphanumeric()).count())
+                .filter(|&length| length > 0)
+                .collect();
+            lengths.sort_unstable();
+            lengths
+        };
+        let sentences =
+            lengths(text.split((|ch: char| "\n。！？!?".contains(ch)) as fn(char) -> bool));
+        let paragraphs = lengths(text.split((|ch| ch == '\n') as fn(char) -> bool));
+        let percentile = |data: &[usize], numerator: usize, denominator: usize| {
+            data.get(data.len().saturating_sub(1) * numerator / denominator)
+                .copied()
+                .unwrap_or_default()
+        };
+        Self {
+            dialogue_percent: dialogue_share(text),
+            median_sentence_chars: percentile(&sentences, 1, 2),
+            longer_sentence_chars: percentile(&sentences, 3, 4),
+            median_paragraph_chars: percentile(&paragraphs, 1, 2),
+        }
+    }
+
+    fn distance(self, other: Self) -> usize {
+        self.dialogue_percent.abs_diff(other.dialogue_percent) * 2
+            + self
+                .median_sentence_chars
+                .abs_diff(other.median_sentence_chars)
+                .min(60)
+            + self
+                .longer_sentence_chars
+                .abs_diff(other.longer_sentence_chars)
+                .min(60)
+            + self
+                .median_paragraph_chars
+                .abs_diff(other.median_paragraph_chars)
+                .min(100)
+                / 2
+    }
+}
+
+pub fn voice_shapes(samples: &[String]) -> Vec<ProseShape> {
+    samples
+        .iter()
+        .map(|sample| ProseShape::measure(sample))
+        .collect()
 }
 
 pub fn summarize_author_feedback(instruction: &str) -> String {
@@ -154,12 +231,12 @@ pub fn select_samples(scene: &str, samples: &[String]) -> Vec<String> {
         .rev()
         .nth(RECENT_TEXT)
         .map_or(0, |(index, _)| index);
-    let style = dialogue_share(&scene[tail..]);
+    let style = ProseShape::measure(&scene[tail..]);
     let mut ranked: Vec<_> = samples
         .iter()
         .map(|sample| sample.trim())
         .filter(|sample| !sample.is_empty())
-        .map(|sample| (sample, dialogue_share(sample).abs_diff(style)))
+        .map(|sample| (sample, ProseShape::measure(sample).distance(style)))
         .collect();
     ranked.sort_by_key(|(_, distance)| *distance);
     ranked
@@ -402,5 +479,18 @@ mod tests {
             select_samples("山口的斜坡伸进云里。石阶没入冰雪。", &samples)[0],
             description
         );
+    }
+
+    #[test]
+    fn keeps_the_current_passage_first_and_prefers_its_sentence_rhythm() {
+        let local = "我起身。\n门没锁。\n她在门外。";
+        let short = "袋子空了。\n我看了看桌下。\n地上也没有。";
+        let long = "我顺着惟一没有被废弃的石阶往下走，台阶的缝里到处都是前一晚下雨留下来的积水。";
+        let authored = [long.to_owned(), short.to_owned()];
+        let references = with_local_sample(local, &authored);
+        assert_eq!(references, [local, short, long]);
+        let shapes = voice_shapes(&references);
+        assert!(shapes[1].median_sentence_chars < shapes[2].median_sentence_chars);
+        assert_eq!(shapes[0].dialogue_percent, shapes[2].dialogue_percent);
     }
 }

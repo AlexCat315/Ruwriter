@@ -17,7 +17,7 @@ const REVIEW: &str = r#"你是这部小说的编辑。先判断 candidate 是否
 优先核对作者的大纲、细纲和本场意图；核对是否把未来卷的事件提前兑现，或让人物采取与设定相反的决定。用 intent 报告，basis 逐字引用这项作者约束。核对本段新增的过去经历。若候选稿把此前没有证据、作者也未授权的具体职业、旧事、收入、物件来历等作为人物反应的依据，即使写在对白里，也用 unsupported_history 报告。quote 引用候选稿中明确新增的经历，reason 指出缺少哪段铺垫及如何用当前可见行动替代，basis 可以为 null。作者允许新增的场景事实、原文已有证据的往事、角色明确在试探或撒谎时的说法，不按此项报错。证据检索覆盖不足时只指出候选稿擅自坐实的具体细节。
 核对 continuity.state_change 和 advance_to。只有当稿中出现改变知识、决定、行动或关系的具体结果，才算完成下一拍。换词重谈、继续描述同一物件、重说已经明白的感受都不算。没发生变化或走错方向时用 progress，quote 引用问题句，basis 逐字引用 advance_to。author_revisions 和 accepted_revisions 里作者明确否掉的写法，即使换成近义词、类似比喻或同一叙述结构，也报 intent，basis 引用作者的原话，reason 给出能替代该句叙述功能的具体做法。
 confirmed_memories 的 kind 为 character_claim 时只确认角色说过这些话，需保留说话人和听者的认知；fact 为作者核定的事实，craft 为写法经验，note 需要回到原文确认。先核对 character_cards、relationships 和 character_beats 的因果。检查候选稿的动作是否由卡片中的内在价值和防御方式驱动，对话是否会把关系推向作者不允许的方向。比较表面话、真正动机、可见反应三者。两人各有自己的认知：严格核对关系卡 from_knows 和 to_knows，只有 reveal_condition 成立后才允许对应变化。越界必须指出候选哪句具体触发了哪个作者禁止的行为或给谁增加了未获得的知识，不能只说「保持距离」或「感情升温过快」。人物的调侃或防御不是价值观。明显反转核心动机、违背触发后的反应或跨过关系边界时，用 character 类型并写 character 字段，值必须为角色卡原名，quote 为产生偏离的实际字句。
-先接住 continuity.carry_from：如果其中的最后一个可见动作或物件在候选稿里没有落地，候选稿却另起无关场景，报 continuity，quote 填候选稿里替代它的句子。写法是否偏离原稿，按 manuscript_excerpt、author_examples 和作品资料判断，不套用固定桥段或通用写作教程。核对 genre、tone 和 direction 的创作意图。author_truth_for_review_only 是只供审稿核对的作者私设，包括真实动机、谁已知、何时可以揭示。用它判断越过视角、不当揭露或把人物说法坐实，审稿意见只引用候选稿及公开原文，不复述私设。检查人名、角色已知事实、物品与时间是否和原稿相符，已经发生的事有没有被重写。不要用其他题材或你的文字偏好评判这部作品。比较 manuscript_excerpt 和 author_examples 中叙述者说话的方法、长短句、对白切换、情绪和场景收束。作者原有的术语、调侃、抒情、议论或感官细节应保留。只有与作者稿实际不同、会造成跳脱的地方才报告。举原稿中支持判断的短句，诸如「文风偏 AI」的抽象判断无效。author_revisions 按时间排列，最新的要求优先。
+先接住 continuity.carry_from：如果其中的最后一个可见动作或物件在候选稿里没有落地，候选稿却另起无关场景，报 continuity，quote 填候选稿里替代它的句子。写法是否偏离原稿，按 manuscript_excerpt、author_examples 和作品资料判断，不套用固定桥段或通用写作教程。核对 genre、tone 和 direction 的创作意图。author_truth_for_review_only 是只供审稿核对的作者私设，包括真实动机、谁已知、何时可以揭示。用它判断越过视角、不当揭露或把人物说法坐实，审稿意见只引用候选稿及公开原文，不复述私设。检查人名、角色已知事实、物品与时间是否和原稿相符，已经发生的事有没有被重写。不要用其他题材或你的文字偏好评判这部作品。把候选句和原稿中承担同一作用的句段并排比较，检查视角、句式、对白人物、段落切换、情绪怎么呈现、话说到哪里收束。重点识别换说法后仍在重复同一套动作、自动增加的比喻、对已看懂动作的重复解释和调平语言节奏。author_sample_shapes 是样段轮廓，不能因数字不同判文风错误。basis 引用对应的真实样段或作者认可的改法，reason 写清两个句段做法有什么不同，以及要改哪一处。作者原有的术语、调侃、抒情、议论或感官细节应保留。只有与作者稿实际不同、会造成跳脱的地方才报告。举原稿中支持判断的短句，诸如「文风偏 AI」的抽象判断无效。author_revisions 按时间排列，最新的要求优先。
 只输出 JSON 对象，格式为 {"usable":true,"issues":[{"kind":"continuity","quote":"候选稿原句","reason":"问题和具体改法","source":null,"basis":"原稿、作者要求或 advance_to 中的逐字短句"}]}。kind 为 continuity、voice、intent、disclosure、character、progress 或 unsupported_history。只有候选稿确实提前揭露私设、把未获证实的角色说法坐实，或超出当前视角时才用 disclosure。作者本轮明确要求揭晓且视角允许时，按本轮要求审稿。只报告可指到 candidate 原句的具体问题。除 unsupported_history 外，basis 找不到逐字原句就不报这一条。reason 必须说清把哪一句改成什么，不写泛泛的文学评论。只有实际引用了检索来源才填 source 编号。先列剧情、角色和知情边界问题，再列文风，最多五项。没发现问题时 issues 为空。"#;
 
 const REVISE: &str = r#"按原文和作者要求修订候选稿。revision 是本轮要求，优先于旧的接续计划和旧的改法。story.outline 约束全书走向和揭示时机，story.detailed_outline 是作者安排的场景顺序、具体事件和结果，以与落笔处相符的条目为准。两者中的未来事件尚未发生。character_cards 和 relationships 约束人物为何这么做、如何防御、关系可以走到哪一步。发言可能是掩饰、试探或隐喻。confirmed_memories 的 fact 才可当作者确认的事实，character_claim 是角色说法。不要给人补履历、收入或关系史来解释反应。用 author_examples 和 manuscript_excerpt 判断句长、语气、动作与对白怎样衔接。对照 accepted_revisions 的改前改后，改掉作者否掉的叙述功能，不只换词。保留仍适用的作者要求、事实、视角和节奏。有半句待接时，保留接在原稿最后一字之后的方式。"#;
@@ -296,6 +296,7 @@ impl DraftContext {
             "canon": self.brief.canon,
             "voice": self.brief.voice,
             "author_examples": self.voice_samples,
+            "author_sample_shapes": crate::ai_voice::voice_shapes(&self.voice_samples),
             "accepted_revisions": self.brief.feedback,
             "confirmed_memories": self.brief.memories,
             "avoid": self.brief.avoid,
@@ -336,6 +337,8 @@ impl DraftContext {
                             &self.brief.story.detailed_outline,
                             &self.brief.story.direction,
                             &self.brief.canon,
+                            &self.brief.voice,
+                            &self.brief.avoid,
                         ]
                         .iter()
                         .any(|field| field.contains(quote))
@@ -378,6 +381,22 @@ impl DraftContext {
                 })?;
                 if let Review::Checked(issues) = &mut review {
                     for issue in issues {
+                        if matches!(issue.kind, IssueKind::Voice)
+                            && !issue.basis.as_ref().is_some_and(|quote| {
+                                self.voice_samples
+                                    .iter()
+                                    .any(|sample| sample.contains(quote))
+                                    || self.brief.voice.contains(quote)
+                                    || self.brief.avoid.contains(quote)
+                                    || self.brief.feedback.iter().any(|entry| {
+                                        [&entry.after, &entry.lesson, &entry.instruction]
+                                            .iter()
+                                            .any(|field| field.contains(quote))
+                                    })
+                            })
+                        {
+                            issue.basis = None;
+                        }
                         if matches!(issue.kind, IssueKind::Progress)
                             && !self.plan.as_ref().is_some_and(|plan| {
                                 issue

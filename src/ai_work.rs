@@ -181,6 +181,9 @@ pub fn is_edit_request(prompt: &str) -> bool {
         "人物关系",
         "记忆",
         "diffdata",
+        "文风规则",
+        "本书文风",
+        "避用写法",
     ]
     .iter()
     .any(|field| prompt.to_lowercase().contains(field))
@@ -192,6 +195,7 @@ pub fn is_edit_request(prompt: &str) -> bool {
             "修改",
             "改一下",
             "改成",
+            "换成",
             "改大纲",
             "改细纲",
             "改人设",
@@ -301,7 +305,7 @@ pub fn tools() -> [AgentTool; 2] {
     [
         AgentTool::new(
             "read_work_material",
-            &format!(
+            format!(
                 "读取作品资料。{fields} start 默认 0。列表一页最多 12 条，返回的 index 为一基序号。长文本按字符分页。"
             ),
             read,
@@ -309,7 +313,7 @@ pub fn tools() -> [AgentTool; 2] {
         ),
         AgentTool::new(
             "propose_work_changes",
-            &format!(
+            format!(
                 "提交作者确认。{fields} 文本字段用 before 的唯一原句定位，初次填写空字段用空字符串；after 是替换文本。列表用 index 定位，after 是需修改的字段对象；不传 index 表示追加，after 为 null 且指定 index 表示删除。多个删除按序号从大到小。"
             ),
             propose,
@@ -557,6 +561,21 @@ fn validate(brief: &WritingBrief) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_volumes_keep_their_original_text_and_independent_ranges() {
+        let outline = "卷名（暂定） 主要故事 情感核心\n第一卷：同一屋檐下 失业、合租、争执、相识 两个陌生人的靠近\n\n第二卷：我们之间的距离 身份揭露 自卑与逃避";
+        let sections = outline_sections(outline, false);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].title, "第一卷：同一屋檐下");
+        assert_eq!(sections[1].title, "第二卷：我们之间的距离");
+        let mut revised = outline.to_owned();
+        revised.replace_range(sections[1].range.clone(), "第二卷：我们之间的距离\n新场景");
+        assert!(revised.starts_with(&outline[..sections[1].range.start]));
+        let chapters = outline_sections("第 14章：\n她沿缆索下水。\n第十五章\n灯塔回声", true);
+        assert_eq!(chapters[0].title, "第 14章：");
+        assert_eq!(chapters[1].title, "第十五章");
+    }
 
     #[test]
     fn chapter_readiness_requires_the_current_chapter_in_a_numbered_outline() {

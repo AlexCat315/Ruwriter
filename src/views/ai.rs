@@ -847,6 +847,12 @@ impl AiPanel {
                 }
             }
             5 => {
+                let study = self.model.clone();
+                rows.push(wrap_controls(vec![primary(
+                    "从正文提炼文风",
+                    self.model.ai_work().is_some(),
+                    move || study.study_ai_voice(),
+                )]));
                 rows.push(study_field("文风要求", ai.voice.binding(), 95.0));
                 rows.push(study_field("避免的词语或句式", ai.avoid.binding(), 75.0));
                 if ai
@@ -898,6 +904,8 @@ impl AiPanel {
         let page = ai.outline_page;
         let selected = ai.brief_item;
         let full = ai.outline_full;
+        let offset = ai.outline_list_offset;
+        let search = ai.brief_search;
         let current = page.get();
         rows.push(wrap_controls(
             ["分卷大纲", "章节细纲", "作品设定"]
@@ -909,6 +917,8 @@ impl AiPanel {
                             page.set(index);
                             selected.set(None);
                             full.set(false);
+                            offset.set(0);
+                            search.set(TextBuffer::empty());
                         })
                         .selected(current == index)
                         .button_style(ToggleButtonStyle::default()),
@@ -1026,7 +1036,69 @@ impl AiPanel {
                 rows.push(study_field(label, buffer.binding(), 260.0));
             }
         } else {
-            for (index, section) in sections.iter().enumerate() {
+            const PAGE_SIZE: usize = 12;
+            if sections.len() > PAGE_SIZE {
+                rows.push(AnyView::new(
+                    TextField::new(
+                        if chapters {
+                            "搜索章节"
+                        } else {
+                            "搜索分卷"
+                        },
+                        Binding::new(
+                            move || search.get(),
+                            move |value| {
+                                search.set(value);
+                                offset.set(0);
+                            },
+                        ),
+                    )
+                    .text_field_style(ProseFieldStyle)
+                    .frame_height(38.0),
+                ));
+            }
+            let query = search.get().string_value().trim().to_lowercase();
+            let number = query
+                .parse::<u32>()
+                .ok()
+                .or_else(|| crate::ai_research::chapter_number(&query));
+            let matches: Vec<_> = sections
+                .iter()
+                .enumerate()
+                .filter(|(_, section)| {
+                    section.title.to_lowercase().contains(&query)
+                        || chapters
+                            && number.is_some()
+                            && crate::ai_research::chapter_number(section.title) == number
+                })
+                .collect();
+            if matches.is_empty() {
+                rows.push(caption("找不到匹配的条目"));
+            }
+            let start = offset
+                .get()
+                .min(matches.len().saturating_sub(1) / PAGE_SIZE * PAGE_SIZE);
+            if matches.len() > PAGE_SIZE {
+                rows.push(wrap_controls(vec![
+                    AnyView::new(
+                        Button::title("上一组", move || {
+                            offset.set(start.saturating_sub(PAGE_SIZE))
+                        })
+                        .enabled(start > 0),
+                    ),
+                    caption(format!(
+                        "{}–{} / {}",
+                        start + 1,
+                        (start + PAGE_SIZE).min(matches.len()),
+                        matches.len()
+                    )),
+                    AnyView::new(
+                        Button::title("下一组", move || offset.set(start + PAGE_SIZE))
+                            .enabled(start + PAGE_SIZE < matches.len()),
+                    ),
+                ]));
+            }
+            for (index, section) in matches.into_iter().skip(start).take(PAGE_SIZE) {
                 let content = text[section.range.clone()]
                     .trim()
                     .trim_start_matches('#')
@@ -2486,6 +2558,9 @@ impl AiPanel {
                                     issue.quote
                                 )));
                                 rows.push(AnyView::new(Text::new(issue.reason.clone())));
+                                if let Some(basis) = &issue.basis {
+                                    rows.push(caption(format!("对照依据 · 「{basis}」")));
+                                }
                             }
                         }
                         if !batch.applied()
@@ -2570,6 +2645,16 @@ impl AiPanel {
                                     plan.detailed_outline_basis()
                                 )));
                             }
+                            for (quote, observation) in plan.voice_observations() {
+                                rows.push(vstack(
+                                    4.0,
+                                    Align::Stretch,
+                                    vec![
+                                        caption(format!("文风依据 · 「{quote}」")),
+                                        AnyView::new(Text::new(observation)),
+                                    ],
+                                ));
+                            }
                             for beat in plan.character_beats() {
                                 rows.push(vstack(
                                     4.0,
@@ -2599,6 +2684,13 @@ impl AiPanel {
                                     ],
                                 ));
                             }
+                        }
+                        for (index, sample) in result.voice_examples().iter().enumerate() {
+                            rows.push(text_box(
+                                &format!("正文文风参照 {}", index + 1),
+                                TextBuffer::new(sample),
+                                104.0,
+                            ));
                         }
                     }
                 }

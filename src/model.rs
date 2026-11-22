@@ -1211,6 +1211,7 @@ impl Model {
         self.ai.brief_page.set(0);
         self.ai.outline_page.set(0);
         self.ai.outline_full.set(false);
+        self.ai.outline_list_offset.set(0);
         self.ai.brief_item.set(None);
         self.ai.brief_search.set(TextBuffer::empty());
         self.ai.brief_work.set(self.ai_work());
@@ -2082,6 +2083,24 @@ impl Model {
             "请完善作品资料。以当前落笔位置为准，核对本章已有的细纲、全书大纲和角色关系。只补齐这一章，并提交章节细纲让我确认；缺少会改变章末结果的决定时先问我。"
         ));
         self.run_ai_at_target_request(None, true);
+    }
+
+    pub fn study_ai_voice(&self) {
+        self.update_ai_target(false);
+        if self.ai.current_batch().is_some_and(|batch| batch.busy()) || self.ai_work().is_none() {
+            return;
+        }
+        if self.ai.brief_open.get_untracked() {
+            self.save_ai_brief();
+            if !self.ai.error.get_untracked().is_empty() {
+                return;
+            }
+        }
+        self.ai.follow_draft.set(false);
+        self.ai.include_context.set(true);
+        self.ai.task.set(WritingTask::Request);
+        self.ai.prompt.set(TextBuffer::new("请调整作品资料中的文风。对照当前正文、作者选定的样段和已确认的 DiffData，提炼本作品能用的几条具体写法。每条附一个逐字原文依据和适用场景。看不出的先省略。保留原有作者要求，有依据再补充。用 propose_work_changes 提交文风字段给我核对，禁止自行扩写正文或拿通用写作模板当本书风格。"));
+        self.run_ai_at_target();
     }
 
     fn prepare_story_request(&self) -> Result<(), String> {
