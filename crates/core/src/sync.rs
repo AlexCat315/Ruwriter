@@ -20,7 +20,7 @@ pub const SCHEMA: u32 = 1;
 pub const MANIFEST_FILE: &str = "ruwriter-manifest.json";
 
 /// One document as it exists locally at the moment sync starts.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncDocument {
     pub uid: String,
     /// Library-relative path with `/` separators. Trashed documents keep the
@@ -60,8 +60,9 @@ impl SyncDocument {
         }
     }
 
-    fn same_version(&self, other: &Self) -> bool {
-        self.path == other.path
+    pub fn same_version(&self, other: &Self) -> bool {
+        self.uid == other.uid
+            && self.path == other.path
             && self.hash == other.hash
             && self.deleted == other.deleted
             && self.metadata() == other.metadata()
@@ -152,6 +153,8 @@ pub struct SyncConfig {
     pub library_id: String,
     pub last_synced_at: u64,
     pub base: BTreeMap<String, SyncBase>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) pending_purges: BTreeMap<String, String>,
 }
 
 /// The changes one sync pass should make.
@@ -189,7 +192,7 @@ pub struct SyncOutcome {
 impl Library {
     pub(crate) fn ensure_sync_identity(&mut self) {
         if self.state.sync.library_id.is_empty() {
-            self.state.sync.library_id = new_library_id();
+            self.state.sync.library_id = new_sync_id();
         }
     }
 }
@@ -219,8 +222,7 @@ impl Session {
         }
     }
 
-    /// Reads the local library into a form the sync planner can compare.
-    pub fn sync_snapshot(&mut self) -> Result<Vec<SyncDocument>, String> {
+    pub fn sync_inventory(&mut self) -> Result<Vec<SyncDocument>, String> {
         self.ensure_sync_uids();
         self.library
             .documents
@@ -228,6 +230,57 @@ impl Session {
             .filter(|doc| !doc.external)
             .map(|doc| self.sync_document(doc))
             .collect()
+    }
+
+    /// Reads the local library and deletion intent for the sync planner.
+    pub fn sync_snapshot(&mut self) -> Result<Vec<SyncDocument>, String> {
+        let mut documents = self.sync_inventory()?;
+        let present: BTreeSet<_> = documents.iter().map(|doc| doc.uid.as_str()).collect();
+        let purged = self
+            .sync_config()
+            .pending_purges
+            .iter()
+            .filter(|(uid, _)| !present.contains(uid.as_str()))
+            .map(|(uid, path)| SyncDocument {
+                uid: uid.clone(),
+                path: path.clone(),
+                deleted: true,
+                ..SyncDocument::default()
+            })
+            .collect::<Vec<_>>();
+        documents.extend(purged);
+        Ok(documents)
+    }
+
+    /// Records explicit trash purging before the library scan drops its metadata.
+    pub(crate) fn record_sync_purge(&mut self, id: &str) {
+        let state = &mut self.library.state;
+        let Some(meta) = state.entries.get(id).filter(|meta| !meta.uid.is_empty()) else {
+            return;
+        };
+        let path = state.trash_origins.get(id).map_or(id, String::as_str);
+        state
+            .sync
+            .pending_purges
+            .insert(meta.uid.clone(), path.to_owned());
+    }
+
+    pub fn trash_sync_document(
+        &mut self,
+        expected: &SyncDocument,
+        current_text: &str,
+    ) -> Result<(), String> {
+        let changed = || "这篇本地文稿已变化，请刷新后重新确认。".to_owned();
+        let id = self.id_for_uid(&expected.uid).ok_or_else(changed)?;
+        let document = self
+            .library
+            .find(&id)
+            .filter(|doc| !doc.external && !doc.trashed)
+            .ok_or_else(changed)?;
+        if !self.sync_document(document)?.same_version(expected) {
+            return Err(changed());
+        }
+        self.trash(&id, current_text)
     }
 
     fn sync_document(&self, document: &crate::Document) -> Result<SyncDocument, String> {
@@ -393,6 +446,9 @@ impl Session {
         config.gist_id = Some(report.gist_id.clone());
         config.last_synced_at = now();
         config.base = base;
+        for tombstone in report.manifest.documents.iter().filter(|doc| doc.deleted) {
+            config.pending_purges.remove(&tombstone.uid);
+        }
         self.set_sync_config(config)?;
         self.persist_app();
         Ok(outcome)
@@ -542,7 +598,8 @@ pub fn plan_sync(
     let mut plan = SyncPlan::default();
     let mut uploads = 0;
     let mut downloads = 0;
-    let mut deletes = 0;
+    let mut local_deletes = 0;
+    let mut remote_deletes = 0;
     let mut conflicts = 0;
 
     for uid in uids {
@@ -578,12 +635,19 @@ pub fn plan_sync(
                 continue;
             }
 
-            if b.is_some_and(|base| la.matches_base(base))
-                || b.is_none() && r.is_some_and(|doc| doc.deleted)
-            {
-                deletes += 1;
+            if r.is_some_and(|tombstone| {
+                tombstone.deleted
+                    && if tombstone.hash.is_empty() {
+                        b.is_some_and(|base| la.matches_base(base))
+                    } else {
+                        la.path == tombstone.path
+                            && la.hash == tombstone.hash
+                            && la.metadata() == tombstone.metadata()
+                    }
+            }) {
+                local_deletes += 1;
                 plan.local_deletes.push(uid.to_owned());
-                push_tombstone(&mut plan, uid, b, r, l, now);
+                push_tombstone(&mut plan, r, l, now);
             } else {
                 // Local edit after a remote delete wins and resurrects the
                 // document.
@@ -596,13 +660,14 @@ pub fn plan_sync(
 
         // Local is deleted (trashed) or absent.
         if let Some(ra) = r_active {
-            if l.is_some() || b.is_some() {
+            if l.is_some() {
+                remote_deletes += 1;
                 // Local deletion wins; keep the tombstone in the manifest.
                 if b.is_none_or(|base| !ra.matches_base(base)) {
                     conflicts += 1;
                     plan.conflicts.push(ra.clone());
                 }
-                push_tombstone(&mut plan, uid, b, r, l, now);
+                push_tombstone(&mut plan, r, l, now);
             } else {
                 downloads += 1;
                 plan.downloads.push(ra.clone());
@@ -611,7 +676,7 @@ pub fn plan_sync(
             continue;
         }
 
-        push_tombstone(&mut plan, uid, b, r, l, now);
+        push_tombstone(&mut plan, r, l, now);
     }
 
     plan.manifest = Manifest {
@@ -622,34 +687,26 @@ pub fn plan_sync(
         documents: plan.manifest.documents,
     };
     plan.summary = format!(
-        "上传 {uploads} 篇，下载 {downloads} 篇，云端删除 {deletes} 篇，冲突 {conflicts} 篇"
+        "上传 {uploads} 篇，下载 {downloads} 篇，本地移入回收站 {local_deletes} 篇，云端删除 {remote_deletes} 篇，冲突 {conflicts} 篇"
     );
     plan
 }
 
 fn push_tombstone(
     plan: &mut SyncPlan,
-    uid: &str,
-    base: Option<&SyncBase>,
     remote: Option<&SyncDocument>,
     local: Option<&SyncDocument>,
     now: u64,
 ) {
-    let path = local
-        .map(|d| d.path.clone())
-        .or_else(|| remote.map(|d| d.path.clone()))
-        .or_else(|| base.map(|b| b.path.clone()))
-        .unwrap_or_else(|| format!("{uid}.txt"));
-    let updated_at = remote.filter(|d| d.deleted).map_or(now, |d| d.updated_at);
-    plan.manifest.documents.push(ManifestDoc {
-        uid: uid.to_owned(),
-        path,
-        file: gist_name(uid),
-        hash: String::new(),
-        updated_at,
-        deleted: true,
-        ..ManifestDoc::default()
-    });
+    let Some(version) = remote.or(local) else {
+        return;
+    };
+    let mut entry = version.manifest();
+    entry.updated_at = remote
+        .filter(|doc| doc.deleted)
+        .map_or(now, |doc| doc.updated_at);
+    entry.deleted = true;
+    plan.manifest.documents.push(entry);
 }
 
 pub fn remote_documents(
@@ -734,7 +791,7 @@ pub fn uid_for(id: &str, created_at: u64) -> String {
     format!("{hash:016x}")
 }
 
-pub fn new_library_id() -> String {
+pub(crate) fn new_sync_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

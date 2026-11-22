@@ -166,7 +166,8 @@ pub fn continuation_insertion(current: &TextBuffer, at: usize, draft: String) ->
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WritingTask {
     #[default]
     Request,
@@ -294,6 +295,7 @@ pub enum StoryStatus {
 pub struct ChatTurn {
     pub id: String,
     pub markdown: bool,
+    pub task: Option<WritingTask>,
     pub author: TextBuffer,
     pub answer: Option<TextBuffer>,
     pub adopted: bool,
@@ -319,6 +321,10 @@ pub struct Batch {
 }
 
 impl Batch {
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
     pub fn writing_task(&self) -> WritingTask {
         self.task
     }
@@ -405,6 +411,7 @@ impl Batch {
         Arc::make_mut(&mut history).push(ChatTurn {
             id: self.turn_id.clone(),
             markdown: self.task == WritingTask::Request,
+            task: Some(self.task),
             author: self.prompt.clone(),
             answer,
             adopted: self.applied(),
@@ -608,7 +615,7 @@ impl AiState {
             .unwrap_or_default();
         Self {
             open: cx.state(|| false),
-            settings_open: cx.state(|| settings.models.is_empty()),
+            settings_open: cx.state(|| false),
             brief_open: cx.state(|| false),
             branches_open: cx.state(|| false),
             branches: cx.state(Vec::new),
@@ -938,6 +945,27 @@ impl AiState {
         self.clear_revision();
         self.branches_open.set(false);
         self.feedback.set("对话位置已切换。".to_owned());
+        Ok(())
+    }
+
+    pub fn edit_conversation_turn(&self, id: &str) -> Result<(), String> {
+        if !self.prompt.get_untracked().string_value().trim().is_empty() {
+            return Err("请先处理输入框里的内容，再编辑历史消息。".to_owned());
+        }
+        let turns = self.current_chat();
+        let index = turns
+            .iter()
+            .position(|turn| turn.id == id)
+            .ok_or("找不到这条消息。")?;
+        let turn = &turns[index];
+        let parent = index.checked_sub(1).map(|index| turns[index].id.as_str());
+        self.move_conversation(parent)?;
+        if let Some(task) = turn.task.or(turn.markdown.then_some(WritingTask::Request)) {
+            self.task.set(task);
+        }
+        self.prompt.set(turn.author.clone());
+        self.feedback
+            .set("已载入原要求。发送后会开启新分支。".to_owned());
         Ok(())
     }
 
@@ -2178,6 +2206,7 @@ mod tests {
             ChatTurn {
                 id: ai_chat::new_id(),
                 markdown: true,
+                task: None,
                 author: TextBuffer::new("银匣交给了谁？"),
                 answer: Some(TextBuffer::new("交给了晏澄。")),
                 adopted: false,
@@ -2186,6 +2215,7 @@ mod tests {
             ChatTurn {
                 id: ai_chat::new_id(),
                 markdown: true,
+                task: None,
                 author: TextBuffer::new("这一条没有答复"),
                 answer: None,
                 adopted: false,

@@ -763,6 +763,7 @@ impl Session {
         let meta = self.library.state.entries.entry(id.clone()).or_default();
         meta.auto_named = true;
         meta.created_at = now();
+        meta.uid = crate::sync::new_sync_id();
         self.library.scan();
         self.open_document(&id);
         self.persist();
@@ -1036,6 +1037,7 @@ impl Session {
             return Err("只能删除废纸篓中的文档".to_owned());
         }
         remove_file(&document.path)?;
+        self.record_sync_purge(id);
         self.library.scan();
         if self.active.as_deref() == Some(id) {
             self.replace_active(successor)?;
@@ -1047,10 +1049,20 @@ impl Session {
     pub fn empty_trash(&mut self) -> Result<(), String> {
         let trash = self.library.trash_path();
         let active_trashed = self.active_document().is_some_and(|d| d.trashed);
+        let trashed: Vec<_> = self
+            .library
+            .documents
+            .iter()
+            .filter(|doc| doc.trashed)
+            .map(|doc| doc.id.clone())
+            .collect();
         match std::fs::remove_dir_all(&trash) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
+        }
+        for id in trashed {
+            self.record_sync_purge(&id);
         }
         self.library.state.trash_origins.clear();
         self.library.scan();

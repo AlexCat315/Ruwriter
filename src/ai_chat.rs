@@ -9,7 +9,7 @@ use cove_ui::compose::primitives::text::TextBuffer;
 use cove_ui::system::files::{Access, FileLock, atomic_write};
 use serde::{Deserialize, Serialize};
 
-use crate::ai::ChatTurn;
+use crate::ai::{ChatTurn, WritingTask};
 use crate::ai_scene::LocalTurn;
 
 const VERSION: u32 = 1;
@@ -45,6 +45,8 @@ struct Turn {
     id: String,
     #[serde(default)]
     markdown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task: Option<WritingTask>,
     author: String,
     answer: Option<String>,
     adopted: bool,
@@ -79,6 +81,7 @@ fn encode_archive(turns: &[ChatTurn], timeline: Option<&Timeline>) -> io::Result
             .map(|turn| Turn {
                 id: turn.id.clone(),
                 markdown: turn.markdown,
+                task: turn.task,
                 author: turn.author.string_value(),
                 answer: turn.answer.as_ref().map(TextBuffer::string_value),
                 adopted: turn.adopted,
@@ -133,6 +136,7 @@ fn decode_archive(path: &Path, retain_local: bool) -> io::Result<Conversation> {
         .map(|turn| ChatTurn {
             id: turn.id,
             markdown: turn.markdown,
+            task: turn.task,
             author: TextBuffer::new(&turn.author),
             answer: turn.answer.map(|answer| TextBuffer::new(&answer)),
             adopted: turn.adopted,
@@ -372,6 +376,7 @@ mod tests {
         let turn = |id: &str, title: &str| ChatTurn {
             id: id.into(),
             markdown: true,
+            task: None,
             author: TextBuffer::new(title),
             answer: Some(TextBuffer::new("一轮答复")),
             adopted: false,
@@ -426,6 +431,7 @@ mod tests {
         let waiting = ChatTurn {
             id: new_id(),
             markdown: false,
+            task: None,
             author: TextBuffer::new("只接一个动作"),
             answer: Some(TextBuffer::new(&question.question)),
             adopted: false,
@@ -504,6 +510,7 @@ mod tests {
         let original = ChatTurn {
             id: new_id(),
             markdown: true,
+            task: None,
             author: TextBuffer::new("再写一段"),
             answer: Some(TextBuffer::new("她问我什么时候回来。")),
             adopted: false,

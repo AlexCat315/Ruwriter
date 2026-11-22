@@ -12,7 +12,9 @@ use cove_ui::compose::primitives::controls::{
 };
 use cove_ui::compose::primitives::media::ui_icon_catalog as icons;
 use cove_ui::compose::primitives::overlays::{MenuEntry, MenuItem, MenuSubmenu, PopoverPlacement};
-use cove_ui::compose::primitives::text::text_field::{TextFieldBehavior, TextFieldEvents};
+use cove_ui::compose::primitives::text::text_field::{
+    TextFieldBehavior, TextFieldEvents, TextFieldNavigationRequest,
+};
 use cove_ui::compose::primitives::text::{
     Divider, MarkdownView, Text, TextBuffer, TextField, TextRun, TextTraits,
 };
@@ -716,6 +718,7 @@ impl AiPanel {
         show_controls: Signal<bool>,
         show_beats: Signal<bool>,
         composer_focus: Signal<bool>,
+        composer_navigation: Signal<u64>,
         review_expanded: Signal<bool>,
     ) -> (Vec<AnyView>, AnyView) {
         let ai = &self.model.ai;
@@ -744,7 +747,12 @@ impl AiPanel {
             .flatten()
             .map(|(turn, _)| turn.id.as_str());
         for turn in history.iter() {
-            let mut message = vec![author_message(&turn.author)];
+            let mut message = vec![self.chat_author(
+                &turn.author,
+                &turn.id,
+                composer_navigation,
+                !busy && !preparing_story,
+            )];
             if let Some(answer) = &turn.answer {
                 let copy = answer.clone();
                 message.push(assistant_message(answer, turn.markdown));
@@ -780,7 +788,12 @@ impl AiPanel {
             if let Some(error) = &batch.archive_error {
                 rows.push(error_label(format!("无法保存对话。{error}")));
             }
-            rows.push(author_message(&batch.prompt));
+            rows.push(self.chat_author(
+                &batch.prompt,
+                batch.turn_id(),
+                composer_navigation,
+                !busy && !preparing_story,
+            ));
             self.results(&mut rows, batch, show_beats, review_expanded);
         }
         let mode = if starts_continuation || answering {
@@ -948,31 +961,15 @@ impl AiPanel {
                     ));
                 }
             }
-            if has_context {
-                let mut controls = Vec::new();
-                if mode == WritingTask::Request {
-                    controls.push(AnyView::new(Toggle::labeled(
-                        if selected {
-                            "附带选区"
-                        } else {
-                            "附带前文"
-                        },
-                        ai.include_context.binding(),
-                    )));
-                }
-                if include || polishing {
-                    controls.push(AnyView::new(Button::title(
-                        if preview_context.get() {
-                            "收起原文"
-                        } else {
-                            "查看参考原文"
-                        },
-                        move || preview_context.update(|shown| *shown = !*shown),
-                    )));
-                }
-                if !controls.is_empty() {
-                    rows.push(wrap_controls(controls));
-                }
+            if has_context && (include || polishing) {
+                rows.push(AnyView::new(Button::title(
+                    if preview_context.get() {
+                        "收起原文"
+                    } else {
+                        "查看参考原文"
+                    },
+                    move || preview_context.update(|shown| *shown = !*shown),
+                )));
             }
             if let Ok(text) = &context
                 && (include || polishing)
@@ -1039,6 +1036,38 @@ impl AiPanel {
                         |anchor| format!("接在「{anchor}」后"),
                     ),
             ));
+        } else if polishing {
+            let selected = target.as_ref().and_then(|target| target.selection.as_ref());
+            composer.push(muted_line(selected.map_or_else(
+                || "在正文中框选要润色的片段".to_owned(),
+                |range| format!("润色正文选区 · {} 字", range.len()),
+            )));
+        } else if mode == WritingTask::Request && has_context {
+            let attachment = ai.include_context;
+            let label = match (include, selected) {
+                (true, true) => "已附选区",
+                (true, false) => "已附前文",
+                (false, true) => "附带选区",
+                (false, false) => "附带前文",
+            };
+            composer.push(hstack(
+                0.0,
+                Align::Center,
+                vec![
+                    AnyView::new(
+                        Button::title(label, move || attachment.update(|value| *value = !*value))
+                            .selected(include)
+                            .tooltip(if include {
+                                "移除这段正文"
+                            } else {
+                                "把这段正文发给模型"
+                            })
+                            .enabled(!busy)
+                            .button_style(GhostButtonStyle),
+                    ),
+                    spacer(),
+                ],
+            ));
         }
         let input_label = match (answering, revising, mode) {
             (true, _, _) => "补充这一场的方向…",
@@ -1053,28 +1082,36 @@ impl AiPanel {
             .map(|line| line.chars().take(140).count().div_ceil(26).max(1))
             .sum::<usize>()
             .clamp(1, 5);
+        let mut input = TextField::new(input_label, ai.prompt.binding())
+            .multiline()
+            .events(TextFieldEvents {
+                on_focus: Some(Rc::new(move || composer_focus.set(true))),
+                on_blur: Some(Rc::new(move || composer_focus.set(false))),
+                on_key_down: Some(Rc::new(move |event| {
+                    if ready
+                        && !event.is_repeat
+                        && matches!(event.scancode, Scancode::RETURN | Scancode::KEYPAD_ENTER)
+                        && (event.modifiers.is_empty()
+                            || crate::shortcuts::has_primary(event.modifiers))
+                        && !event.modifiers.has_shift()
+                        && !crate::shortcuts::has_composition()
+                    {
+                        send();
+                        return true;
+                    }
+                    false
+                })),
+                ..Default::default()
+            });
+        let focus = composer_navigation.get();
+        if focus > 0 {
+            input.navigation = TextFieldNavigationRequest {
+                focus_request_id: Some(focus),
+                ..Default::default()
+            };
+        }
         let input = AnyView::new(
-            TextField::new(input_label, ai.prompt.binding())
-                .multiline()
-                .events(TextFieldEvents {
-                    on_focus: Some(Rc::new(move || composer_focus.set(true))),
-                    on_blur: Some(Rc::new(move || composer_focus.set(false))),
-                    on_key_down: Some(Rc::new(move |event| {
-                        if ready
-                            && !event.is_repeat
-                            && matches!(event.scancode, Scancode::RETURN | Scancode::KEYPAD_ENTER)
-                            && (event.modifiers.is_empty()
-                                || crate::shortcuts::has_primary(event.modifiers))
-                            && !event.modifiers.has_shift()
-                            && !crate::shortcuts::has_composition()
-                        {
-                            send();
-                            return true;
-                        }
-                        false
-                    })),
-                    ..Default::default()
-                })
+            input
                 .text_field_style(ProseFieldStyle)
                 .frame_height(49.0 + (lines - 1) as f32 * 18.0),
         );
@@ -1149,6 +1186,32 @@ impl AiPanel {
                 .semantic_border(border, 1.0),
         ));
         (rows, vstack(7.0, Align::Stretch, composer))
+    }
+
+    fn chat_author(
+        &self,
+        author: &TextBuffer,
+        id: &str,
+        composer_navigation: Signal<u64>,
+        enabled: bool,
+    ) -> AnyView {
+        let model = self.model.clone();
+        let id = id.to_owned();
+        let edit = enabled.then(|| {
+            icon_button(
+                icons::action::pencil(),
+                "编辑并重发",
+                false,
+                move || match model.ai.edit_conversation_turn(&id) {
+                    Ok(()) => {
+                        model.ai.error.set(String::new());
+                        composer_navigation.update(|value| *value += 1);
+                    }
+                    Err(error) => model.ai.error.set(error),
+                },
+            )
+        });
+        author_message(author, edit)
     }
 
     fn story_progress(&self, rows: &mut Vec<AnyView>, status: &StoryStatus) {
@@ -1696,7 +1759,7 @@ impl AiPanel {
     }
 }
 
-fn author_message(text: &TextBuffer) -> AnyView {
+fn author_message(text: &TextBuffer, edit: Option<AnyView>) -> AnyView {
     let message = text.string_value();
     let label = format!("你说，{message}");
     let bubble = Text::new(message)
@@ -1705,7 +1768,10 @@ fn author_message(text: &TextBuffer) -> AnyView {
         .semantic_background(SemanticColorRef::accent_muted())
         .corner_radius(12.0)
         .flex_with(0.0, 1.0, None);
-    hstack(32.0, Align::FlexStart, vec![spacer(), AnyView::new(bubble)])
+    let mut row = vec![spacer()];
+    row.extend(edit);
+    row.push(AnyView::new(bubble));
+    hstack(5.0, Align::Center, row)
 }
 
 fn writing_change(
@@ -2052,6 +2118,7 @@ impl View for AiPanel {
         let controls = cx.state(|| false);
         let show_beats = cx.state(|| false);
         let composer_focus = cx.state(|| false);
+        let composer_navigation = cx.state(|| 0_u64);
         let review_expanded = cx.state(|| false);
         let scroll = cx.remember(|| Rc::new(RefCell::new(None::<(_, Option<ScrollRequest>)>)));
         let turn = cx.remember(|| Rc::new(Cell::new(None)));
@@ -2076,6 +2143,7 @@ impl View for AiPanel {
                 controls,
                 show_beats,
                 composer_focus,
+                composer_navigation,
                 review_expanded,
             )
         };
@@ -2182,7 +2250,11 @@ impl View for AiPanel {
             let last_turn = (
                 self.model.document.get(),
                 jump.get(),
-                batch.as_ref().map(|batch| batch.history.len()),
+                composer_navigation.get(),
+                batch.as_ref().map_or_else(
+                    || self.model.ai.archived_chat().len(),
+                    |batch| batch.history.len() + 1,
+                ),
             );
             let stream = batch.as_ref().and_then(|batch| {
                 batch

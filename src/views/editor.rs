@@ -59,7 +59,8 @@ impl View for EditorPane {
             self.layout.editor_width
         };
         let column = measure(font_size, settings.column_width.glyphs());
-        let horizontal = ((pane_width - column) / 2.0).max(MARGIN);
+        let margin = (pane_width * 0.055).clamp(12.0, MARGIN);
+        let horizontal = ((pane_width - column) / 2.0).max(margin);
 
         let editor = AnyView::new(EditorField {
             model: self.model.clone(),
@@ -158,7 +159,11 @@ impl EditorPane {
         trailing.extend([
             icon_button(
                 icons::layout::columns_2(),
-                "预览",
+                if options.preview && self.layout.editor_width < SPLIT_WIDTH {
+                    "返回编辑"
+                } else {
+                    "预览"
+                },
                 options.preview,
                 move || preview.toggle_preview(),
             ),
@@ -309,6 +314,15 @@ fn document_menu(model: &Model) -> Vec<MenuEntry> {
             item = item.shortcut(shortcut);
         }
         entries.push(MenuEntry::Item(item));
+        if index == 5 {
+            let toggle = model.clone();
+            entries.push(MenuEntry::Item(
+                MenuItem::new(61, "打字机滚动", move || {
+                    toggle.toggle_typewriter_scrolling()
+                })
+                .selected(model.typewriter_scrolling()),
+            ));
+        }
         if matches!(index, 2 | 3 | 5) {
             entries.push(MenuEntry::separator(100 + index as u64));
         }

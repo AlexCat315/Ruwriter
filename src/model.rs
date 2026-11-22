@@ -60,6 +60,12 @@ type SyncHandler = Rc<dyn Fn(SyncEvent)>;
 
 pub enum SyncEvent {
     Login(String),
+    Inventory {
+        library: PathBuf,
+        library_id: String,
+        deleting: bool,
+        result: Result<Option<crate::gist::RemoteInventory>, String>,
+    },
     PreserveConflicts {
         library: PathBuf,
         library_id: String,
@@ -68,6 +74,7 @@ pub enum SyncEvent {
     },
     Finished {
         library: PathBuf,
+        library_id: String,
         snapshot: Vec<SyncDocument>,
         conflicts: Vec<PathBuf>,
         result: Box<Result<SyncReport, String>>,
@@ -166,6 +173,9 @@ pub struct Model {
     pub sync_status: Signal<String>,
     pub sync_busy: Signal<bool>,
     pub sync_failed: Signal<bool>,
+    pub sync_local: Signal<Rc<Vec<SyncDocument>>>,
+    pub sync_remote: Signal<Option<Rc<crate::gist::RemoteInventory>>>,
+    pub sync_remote_loaded: Signal<bool>,
     pub ai: AiState,
 }
 
@@ -1813,6 +1823,7 @@ impl Model {
             return;
         };
         if self.sync_library.get_untracked().as_ref() != Some(&library) {
+            self.invalidate_sync_remote();
             self.sync_failed.set(false);
             self.sync_status.set(if last > 0 {
                 format!("上次同步：{}", crate::dates::relative(last))
@@ -1822,6 +1833,7 @@ impl Model {
             self.sync_library.set(Some(library));
         }
         self.sync_open.set(true);
+        self.refresh_sync_local();
         self.revision.update(|value| *value += 1);
         self.check_sync_login();
     }
@@ -1855,6 +1867,121 @@ impl Model {
             self.bump();
         }
         Ok(())
+    }
+
+    fn sync_problem(&self, error: String) {
+        self.sync_status.set(error);
+        self.sync_failed.set(true);
+    }
+
+    fn invalidate_sync_remote(&self) {
+        self.sync_remote.set(None);
+        self.sync_remote_loaded.set(false);
+    }
+
+    pub fn refresh_sync_local(&self) {
+        match self.flush_sync_save().and_then(|()| {
+            self.with_session(|session| {
+                let documents = session.sync_inventory()?;
+                session
+                    .library
+                    .save_state()
+                    .map_err(|error| error.to_string())?;
+                Ok(documents)
+            })
+        }) {
+            Ok(documents) => self.sync_local.set(Rc::new(documents)),
+            Err(error) => {
+                self.sync_local.set(Rc::new(Vec::new()));
+                self.sync_problem(format!("无法读取本地文稿：{error}"));
+            }
+        }
+    }
+
+    pub fn delete_sync_local(&self, expected: &SyncDocument) {
+        if self.sync_busy.get_untracked() {
+            return;
+        }
+        let result = self.flush_sync_save().and_then(|()| {
+            let before = self.editor_identity();
+            let current = self.current_text();
+            self.with_session(|session| session.trash_sync_document(expected, &current))?;
+            Ok(self.editor_identity() != before)
+        });
+        match result {
+            Ok(active_changed) => {
+                if active_changed {
+                    self.load_active();
+                    self.restore_caret();
+                }
+                self.bump();
+                self.sync_failed.set(false);
+                self.sync_status.set("文稿已移入本地回收站。".to_owned());
+            }
+            Err(error) => self.sync_problem(error),
+        }
+        self.refresh_sync_local();
+    }
+
+    pub fn refresh_sync_remote(&self) {
+        self.run_sync_inventory(None);
+    }
+
+    pub fn delete_sync_remote(&self, gist_id: String, document: SyncDocument) {
+        self.run_sync_inventory(Some((gist_id, document)));
+    }
+
+    fn run_sync_inventory(&self, deletion: Option<(String, SyncDocument)>) {
+        if self.sync_busy.get_untracked() {
+            return;
+        }
+        let Some((library, request)) = self.read(|session| {
+            let config = session.sync_config();
+            (
+                session.library_root().to_path_buf(),
+                crate::gist::SyncRequest {
+                    gist_id: config.gist_id.clone(),
+                    library_id: config.library_id.clone(),
+                    device: ruwriter_core::sync::default_device(),
+                    local: Vec::new(),
+                    base: Default::default(),
+                },
+            )
+        }) else {
+            return;
+        };
+        let deleting = deletion.is_some();
+        self.sync_busy.set(true);
+        self.sync_failed.set(false);
+        self.sync_status.set(
+            if deleting {
+                "正在删除云端文稿…"
+            } else {
+                "正在读取云端清单…"
+            }
+            .to_owned(),
+        );
+        let poster = cove_ui::core::ThreadPoster::current();
+        std::thread::spawn(move || {
+            let result = crate::gist::gh_token().and_then(|token| match deletion {
+                Some((gist_id, document)) => crate::gist::delete_remote_document(
+                    &gist_id,
+                    &request.library_id,
+                    &document,
+                    &token,
+                )
+                .map(Some),
+                None => crate::gist::preview_remote(&request, &token),
+            });
+            poster.post(move || {
+                deliver_sync_event(SyncEvent::Inventory {
+                    library,
+                    library_id: request.library_id,
+                    deleting,
+                    result,
+                })
+            });
+        });
     }
 
     pub fn sync_now(&self) {
@@ -1921,6 +2048,7 @@ impl Model {
             poster.post(move || {
                 deliver_sync_event(SyncEvent::Finished {
                     library,
+                    library_id: request.library_id,
                     snapshot: request.local,
                     conflicts,
                     result: Box::new(result),
@@ -1929,9 +2057,11 @@ impl Model {
         });
     }
 
-    fn is_sync_library(&self, path: &Path) -> bool {
-        self.read(|session| session.library_root() == path)
-            .unwrap_or(false)
+    fn is_sync_library(&self, path: &Path, id: &str) -> bool {
+        self.read(|session| {
+            session.library_root() == path && session.sync_config().library_id == id
+        })
+        .unwrap_or(false)
     }
 
     fn on_sync_event(&self, event: SyncEvent) {
@@ -1939,6 +2069,35 @@ impl Model {
             SyncEvent::Login(status) => {
                 self.sync_checking.set(false);
                 self.sync_login.set(status);
+            }
+            SyncEvent::Inventory {
+                library,
+                library_id,
+                deleting,
+                result,
+            } => {
+                self.sync_busy.set(false);
+                if !self.is_sync_library(&library, &library_id) {
+                    return;
+                }
+                match result {
+                    Ok(inventory) => {
+                        self.sync_remote_loaded.set(true);
+                        self.sync_remote.set(inventory.map(Rc::new));
+                        self.sync_status.set(
+                            if deleting {
+                                "已删除云端版本。同步时，仍与它一致的本地版本会移入回收站。"
+                            } else {
+                                "云端清单已刷新。"
+                            }
+                            .to_owned(),
+                        );
+                    }
+                    Err(error) => {
+                        self.invalidate_sync_remote();
+                        self.sync_problem(error);
+                    }
+                }
             }
             SyncEvent::PreserveConflicts {
                 library,
@@ -1959,12 +2118,13 @@ impl Model {
             }
             SyncEvent::Finished {
                 library,
+                library_id,
                 snapshot,
                 mut conflicts,
                 result,
             } => {
                 self.sync_busy.set(false);
-                if !self.is_sync_library(&library) {
+                if !self.is_sync_library(&library, &library_id) {
                     self.sync_library.set(None);
                     if self.sync_open.get_untracked() {
                         self.open_sync();
@@ -2012,6 +2172,10 @@ impl Model {
                         self.sync_failed.set(true);
                         self.sync_status.set(error);
                     }
+                }
+                self.invalidate_sync_remote();
+                if self.sync_open.get_untracked() {
+                    self.refresh_sync_local();
                 }
             }
         }

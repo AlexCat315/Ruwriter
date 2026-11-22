@@ -137,6 +137,102 @@ fn remote_delete_moves_local_to_trash_when_local_is_unchanged() {
 }
 
 #[test]
+fn missing_remote_manifest_entry_reuploads_the_local_document() {
+    let local = vec![doc("a", "第一章.txt", "雨夜")];
+    let base = BTreeMap::from([base("a", "第一章.txt", "雨夜")]);
+    let plan = plan_sync(&local, &[], &base, "lib", "mac", 100);
+    assert!(plan.local_deletes.is_empty());
+    assert_eq!(plan.uploads, local);
+}
+
+#[test]
+fn a_local_file_absent_without_delete_intent_is_recovered_from_the_cloud() {
+    let remote = vec![doc("a", "第一章.txt", "雨夜")];
+    let base = BTreeMap::from([base("a", "第一章.txt", "雨夜")]);
+    let plan = plan_sync(&[], &remote, &base, "lib", "mac", 100);
+    assert_eq!(plan.downloads, remote);
+    assert!(!plan.manifest.documents[0].deleted);
+    assert!(
+        plan_sync(&[], &[], &base, "lib", "mac", 100)
+            .manifest
+            .documents
+            .is_empty()
+    );
+}
+
+#[test]
+fn purging_or_emptying_trash_keeps_an_explicit_deletion_across_restart() {
+    for empty in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::at(dir.path());
+        session.autosave("雨夜").unwrap();
+        let remote = session.sync_snapshot().unwrap();
+        let document = &remote[0];
+        session.trash(&document.path, "雨夜").unwrap();
+        if empty {
+            session.empty_trash().unwrap();
+        } else {
+            let trashed = session
+                .library
+                .documents
+                .iter()
+                .find(|doc| doc.trashed)
+                .unwrap()
+                .id
+                .clone();
+            session.purge(&trashed).unwrap();
+        }
+        let mut reopened = Session::at(dir.path());
+        let snapshot = reopened.sync_snapshot().unwrap();
+        let plan = plan_sync(&snapshot, &remote, &BTreeMap::new(), "lib", "mac", 100);
+        assert!(plan.downloads.is_empty());
+        assert!(
+            plan.manifest
+                .documents
+                .iter()
+                .any(|entry| entry.uid == document.uid && entry.deleted)
+        );
+    }
+}
+
+#[test]
+fn versioned_tombstone_only_removes_the_matching_version() {
+    let version = doc("a", "第一章.txt", "雨夜");
+    let remote = vec![SyncDocument {
+        deleted: true,
+        content: String::new(),
+        ..version.clone()
+    }];
+    let base = BTreeMap::from([base("a", "第一章.txt", "较早的底稿")]);
+    let matched = plan_sync(
+        std::slice::from_ref(&version),
+        &remote,
+        &base,
+        "lib",
+        "mac",
+        100,
+    );
+    assert_eq!(matched.local_deletes, ["a"]);
+    assert_eq!(matched.manifest.documents[0].hash, version.hash);
+    let local = vec![doc("a", "第一章.txt", "未经同步的改稿")];
+    let edited = plan_sync(&local, &remote, &BTreeMap::new(), "lib", "mac", 100);
+    assert!(edited.local_deletes.is_empty());
+    assert_eq!(edited.uploads, local);
+}
+
+#[test]
+fn local_delete_requires_the_previewed_disk_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::at(dir.path());
+    session.autosave("旧稿").unwrap();
+    let old = session.sync_snapshot().unwrap().remove(0);
+    let path = session.library_root().join(&old.path);
+    fs::write(&path, "另外设备改过的版本").unwrap();
+    assert!(session.trash_sync_document(&old, "旧稿").is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "另外设备改过的版本");
+}
+
+#[test]
 fn local_delete_stays_deleted_on_remote() {
     let local = vec![deleted("a", "第一章.txt")];
     let remote = vec![doc("a", "第一章.txt", "雨夜")];

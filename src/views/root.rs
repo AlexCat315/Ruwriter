@@ -173,6 +173,9 @@ impl View for RootView {
             sync_status: cx.state(String::new),
             sync_busy: cx.state(|| false),
             sync_failed: cx.state(|| false),
+            sync_local: cx.state(|| Rc::new(Vec::new())),
+            sync_remote: cx.state(|| None),
+            sync_remote_loaded: cx.state(|| false),
             ai: crate::ai::AiState::new(cx, session.borrow().ai_preferences()),
         };
 
