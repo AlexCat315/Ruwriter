@@ -6,6 +6,7 @@ mod ai_review;
 mod ai_scene;
 mod ai_story;
 mod ai_voice;
+mod ai_work;
 mod app;
 mod dates;
 mod formatting;

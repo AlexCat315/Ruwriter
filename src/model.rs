@@ -1209,6 +1209,8 @@ impl Model {
         self.ai.writing_memories.set(brief.memories);
         self.ai.reviewed_feedback.set(brief.feedback);
         self.ai.brief_page.set(0);
+        self.ai.outline_page.set(0);
+        self.ai.outline_full.set(false);
         self.ai.brief_item.set(None);
         self.ai.brief_search.set(TextBuffer::empty());
         self.ai.brief_work.set(self.ai_work());
@@ -1600,6 +1602,11 @@ impl Model {
     pub fn send_ai_message(&self) {
         let prompt = self.ai.prompt.get_untracked().string_value();
         let index = self.ai.viewed_result.get_untracked();
+        if crate::ai_work::is_edit_request(&prompt) {
+            self.ai.task.set(WritingTask::Request);
+            self.run_ai();
+            return;
+        }
         if self.ai.follow_draft.get_untracked()
             && self
                 .ai
@@ -1608,7 +1615,7 @@ impl Model {
         {
             if !is_continuation_command(&prompt) {
                 self.ai.feedback.set(String::new());
-                let result = self.ai.refine(index, Some(prompt.clone()));
+                let result = self.refine_current(index, Some(prompt.clone()));
                 self.ai.error.set(match result {
                     Ok(()) => self
                         .remember_author_direction(&prompt)
@@ -1711,6 +1718,10 @@ impl Model {
     }
 
     fn run_ai_at_target_with(&self, history: Option<Arc<Vec<ChatTurn>>>) {
+        self.run_ai_at_target_request(history, false);
+    }
+
+    fn run_ai_at_target_request(&self, history: Option<Arc<Vec<ChatTurn>>>, plan_only: bool) {
         let result = (|| {
             if let Some(target) = self.ai.target.get_untracked()
                 && (self.ai_document().as_ref() != Some(&target.document)
@@ -1724,7 +1735,7 @@ impl Model {
             } else {
                 Default::default()
             };
-            if self.ai.task.get_untracked() == WritingTask::Continue {
+            if self.ai.task.get_untracked() != WritingTask::Request || plan_only {
                 brief = self.ai_brief();
             }
             let scope = if self.ai.task.get_untracked() == WritingTask::Polish {
@@ -1733,8 +1744,12 @@ impl Model {
                 self.ai.scope.get_untracked()
             };
             let prepared = self.ai_inputs(scope)?;
+            let work = self.ai_work().map(|key| crate::ai_work::WorkMaterial {
+                key,
+                brief: self.ai_brief(),
+            });
             self.ai
-                .start(prepared.0, prepared.1, brief, history.clone())
+                .start(prepared.0, prepared.1, brief, history, work, plan_only)
         })();
         self.ai.error.set(result.err().unwrap_or_default());
     }
@@ -1769,11 +1784,7 @@ impl Model {
             return;
         };
         let memories = draft.style_memories();
-        let example = if draft.text.has_same_contents(&draft.original_text) {
-            None
-        } else {
-            run.feedback_example()
-        };
+        let example = run.feedback_example();
         let example = example.map(|mut example| {
             example.source = self.active_id().unwrap_or_default();
             // Adopting the prose approves the example. Promoting the model's
@@ -1931,12 +1942,81 @@ impl Model {
                         || !draft.text.has_same_contents(&draft.reviewed_text)))
         }) {
             self.ai.error.set(
-                self.ai
-                    .refine(index, None)
+                self.refine_current(index, None)
                     .err()
                     .map_or_else(String::new, |error| error.to_string()),
             );
         }
+    }
+
+    fn refine_current(
+        &self,
+        index: usize,
+        revision: Option<String>,
+    ) -> Result<(), cove_agent::AgentError> {
+        let brief = self.ai_work().map(|_| self.ai_brief());
+        self.ai.refine(index, revision, brief)
+    }
+
+    pub fn submit_ai_refinement(&self, index: usize, revision: Option<String>) {
+        self.ai.feedback.set(String::new());
+        self.ai.error.set(
+            self.refine_current(index, revision)
+                .err()
+                .map_or_else(String::new, |error| error.to_string()),
+        );
+    }
+
+    pub fn decide_ai_work_change(&self, id: &str, approve: bool) {
+        let result = (|| {
+            let change = self
+                .ai
+                .current_batch()
+                .and_then(|batch| {
+                    batch.runs.into_iter().find_map(|run| match run.status {
+                        ModelStatus::NeedsUserAnswer(question) if question.id == id => {
+                            question.work_change
+                        }
+                        _ => None,
+                    })
+                })
+                .ok_or("这份提案已经结束。")?;
+            if !approve {
+                return self
+                    .ai
+                    .answer_user_question(id, crate::ai_work::DECLINED.into());
+            }
+            if self.ai_work().as_ref() != Some(&change.base.key) {
+                return Err("作品已切换，请回到原作品确认。".into());
+            }
+            let (root, work) = &change.base.key;
+            self.with_session(|session| {
+                if session.library_root() != root
+                    || session
+                        .library
+                        .state
+                        .writing_briefs
+                        .get(work)
+                        .cloned()
+                        .unwrap_or_default()
+                        != change.base.brief
+                {
+                    return Err("作品资料已发生变化，请保留原样后重新提交。".into());
+                }
+                session
+                    .library
+                    .save_writing_brief(work, change.updated.clone())
+                    .map_err(|error| error.to_string())
+            })?;
+            self.ai.use_brief.set(!change.updated.is_empty());
+            self.ai.brief_open.set(false);
+            self.revision.update(|value| *value += 1);
+            self.ai
+                .flash_feedback("已保存到作品资料，下一轮写作会使用。");
+            self.ai
+                .answer_user_question(id, crate::ai_work::APPLIED.into())
+        })();
+        self.ai.error.set(result.err().unwrap_or_default());
     }
 
     pub fn remember_archived_reflection(&self, id: &str) {
@@ -1976,6 +2056,32 @@ impl Model {
         self.ai
             .error
             .set(self.prepare_story_request().err().unwrap_or_default());
+    }
+
+    pub fn plan_current_ai_chapter(&self) {
+        self.update_ai_target(false);
+        if self.ai.current_batch().is_some_and(|batch| batch.busy()) {
+            self.ai.error.set("请先回答或结束当前对话。".to_owned());
+            return;
+        }
+        if self.ai_work().is_none() {
+            self.ai.error.set("请先打开作品资料库里的正文。".to_owned());
+            return;
+        }
+        if self.ai.brief_open.get_untracked() {
+            self.save_ai_brief();
+            if !self.ai.error.get_untracked().is_empty() {
+                return;
+            }
+        }
+        self.ai.brief_open.set(false);
+        self.ai.story_review_open.set(false);
+        self.ai.follow_draft.set(false);
+        self.ai.task.set(WritingTask::Request);
+        self.ai.prompt.set(TextBuffer::new(
+            "请完善作品资料。以当前落笔位置为准，核对本章已有的细纲、全书大纲和角色关系。只补齐这一章，并提交章节细纲让我确认；缺少会改变章末结果的决定时先问我。"
+        ));
+        self.run_ai_at_target_request(None, true);
     }
 
     fn prepare_story_request(&self) -> Result<(), String> {

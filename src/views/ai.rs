@@ -570,7 +570,7 @@ impl AiPanel {
                         93.0,
                     ));
                     rows.push(study_field(
-                        "不能写反的边界",
+                        "什么会与这个人的动机冲突",
                         record_field(cards, index, |c| &c.boundary, |c, v| c.boundary = v),
                         93.0,
                     ));
@@ -583,7 +583,7 @@ impl AiPanel {
                     selected,
                     search,
                     "添加关系",
-                    "为两张角色卡记录当前关系、下一阶段的方向和现在的分寸。",
+                    "记录两人对彼此的态度、各自知道的事，以及关系发生变化的条件。",
                     |edge| {
                         let title = if edge.from.is_empty() && edge.to.is_empty() {
                             String::new()
@@ -642,10 +642,35 @@ impl AiPanel {
                         95.0,
                     ));
                     rows.push(study_field(
-                        "现阶段别跨过的分寸",
+                        "当前阶段禁止提前发生的事",
                         record_field(edges, index, |e| &e.boundary, |e, v| e.boundary = v),
-                        95.0,
+                        80.0,
                     ));
+                    for (label, field) in [
+                        (
+                            "依据的事件或原句",
+                            record_field(edges, index, |e| &e.evidence, |e, v| e.evidence = v),
+                        ),
+                        (
+                            "前者知道什么",
+                            record_field(edges, index, |e| &e.from_knows, |e, v| e.from_knows = v),
+                        ),
+                        (
+                            "后者知道什么",
+                            record_field(edges, index, |e| &e.to_knows, |e, v| e.to_knows = v),
+                        ),
+                        (
+                            "变化或揭晓的条件",
+                            record_field(
+                                edges,
+                                index,
+                                |e| &e.reveal_condition,
+                                |e, v| e.reveal_condition = v,
+                            ),
+                        ),
+                    ] {
+                        rows.push(study_field(label, field, 78.0));
+                    }
                 }
             }
             3 => {
@@ -859,64 +884,172 @@ impl AiPanel {
                     rows.push(text_box("作者样段", TextBuffer::new(sample), 105.0));
                 }
             }
-            _ => {
-                if let Some(reading) = &reading {
-                    let cache = ai.story_review_open;
-                    let page = ai.story_page;
-                    let open = ai.brief_open;
-                    let task = ai.task;
-                    rows.push(wrap_controls(vec![AnyView::new(Button::title(
-                        "查看已写剧情",
-                        move || {
-                            page.set(1);
-                            task.set(WritingTask::Continue);
-                            cache.set(true);
-                            open.set(false);
-                        },
-                    ))]));
-                    if !reading.reading.recap.is_empty() {
-                        rows.push(caption(
-                            "已写剧情从正文梳理，可随时回看。全书大纲和章节细纲在下方由作者维护。",
-                        ));
-                    }
-                }
-                rows.push(study_field(
-                    "作者大纲 · 全书主线、分卷与情感走向",
-                    ai.story_outline.binding(),
-                    165.0,
-                ));
-                rows.push(study_field(
-                    "作者细纲 · 章节与场景顺序、冲突、转折和落点",
-                    ai.story_detailed_outline.binding(),
-                    135.0,
-                ));
-                rows.push(study_field("待续线索", ai.story_threads.binding(), 92.0));
-                rows.push(study_field("题材", ai.story_genre.binding(), 46.0));
-                rows.push(study_field("叙事口味", ai.story_tone.binding(), 62.0));
-                rows.push(study_field("创作方向", ai.story_direction.binding(), 82.0));
-                rows.push(study_field(
-                    "卡片之外的角色概览",
-                    ai.story_characters.binding(),
-                    82.0,
-                ));
-                rows.push(study_field(
-                    "角色说法与知情范围",
-                    ai.story_claims.binding(),
-                    100.0,
-                ));
-                rows.push(study_field(
-                    "私设与揭晓点 · 审稿用",
-                    ai.story_truth.binding(),
-                    100.0,
-                ));
-                rows.push(study_field("硬设定", ai.canon.binding(), 95.0));
-            }
+            _ => self.outline_workspace(&mut rows, reading.is_some()),
         }
         let save = self.model.clone();
         (
             rows,
             primary("保存作品资料", true, move || save.save_ai_brief()),
         )
+    }
+
+    fn outline_workspace(&self, rows: &mut Vec<AnyView>, has_reading: bool) {
+        let ai = &self.model.ai;
+        let page = ai.outline_page;
+        let selected = ai.brief_item;
+        let full = ai.outline_full;
+        let current = page.get();
+        rows.push(wrap_controls(
+            ["分卷大纲", "章节细纲", "作品设定"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    AnyView::new(
+                        Button::title(label, move || {
+                            page.set(index);
+                            selected.set(None);
+                            full.set(false);
+                        })
+                        .selected(current == index)
+                        .button_style(ToggleButtonStyle::default()),
+                    )
+                })
+                .collect(),
+        ));
+        if current == 2 {
+            rows.push(study_field("题材", ai.story_genre.binding(), 50.0));
+            rows.push(study_field("叙事口味", ai.story_tone.binding(), 82.0));
+            rows.push(study_field("创作方向", ai.story_direction.binding(), 82.0));
+            rows.push(study_field("待续线索", ai.story_threads.binding(), 120.0));
+            rows.push(study_field(
+                "卡片之外的角色概览",
+                ai.story_characters.binding(),
+                94.0,
+            ));
+            rows.push(study_field(
+                "角色说法与知情范围",
+                ai.story_claims.binding(),
+                100.0,
+            ));
+            rows.push(study_field(
+                "私设与揭晓点 · 审稿用",
+                ai.story_truth.binding(),
+                100.0,
+            ));
+            rows.push(study_field("硬设定", ai.canon.binding(), 95.0));
+            return;
+        }
+        let chapters = current == 1;
+        let buffer = if chapters {
+            ai.story_detailed_outline
+        } else {
+            ai.story_outline
+        };
+        let text = buffer.get().string_value();
+        let sections = crate::ai_work::outline_sections(&text, chapters);
+        let label = if chapters {
+            "章节细纲"
+        } else {
+            "分卷大纲"
+        };
+        if chapters {
+            let model = self.model.clone();
+            rows.push(wrap_controls(vec![primary(
+                "为当前章拟细纲",
+                self.model.ai_work().is_some(),
+                move || {
+                    model.plan_current_ai_chapter();
+                },
+            )]));
+        } else if has_reading {
+            let cache = ai.story_review_open;
+            let page = ai.story_page;
+            let open = ai.brief_open;
+            rows.push(wrap_controls(vec![AnyView::new(Button::title(
+                "查看已写剧情",
+                move || {
+                    page.set(1);
+                    cache.set(true);
+                    open.set(false);
+                },
+            ))]));
+        }
+
+        let show_full = full.get();
+        let action = if show_full {
+            "按卷章查看"
+        } else {
+            "编辑全文"
+        };
+        if !text.is_empty() || show_full {
+            rows.push(wrap_controls(vec![AnyView::new(
+                Button::title(action, move || {
+                    full.set(!show_full);
+                    selected.set(None);
+                })
+                .button_style(GhostButtonStyle),
+            )]));
+        }
+        if show_full {
+            rows.push(study_field(label, buffer.binding(), 335.0));
+        } else if let Some(index) = selected.get()
+            && let Some(section) = sections.get(index)
+        {
+            rows.push(wrap_controls(vec![AnyView::new(
+                Button::title(
+                    if chapters {
+                        "全部章节"
+                    } else {
+                        "全部分卷"
+                    },
+                    move || selected.set(None),
+                )
+                .button_style(GhostButtonStyle),
+            )]));
+            rows.push(study_field(
+                section.title,
+                outline_section_binding(buffer, index, chapters),
+                275.0,
+            ));
+        } else if sections.is_empty() {
+            if text.trim().is_empty() {
+                rows.push(caption(if chapters {
+                    "还没有章节细纲"
+                } else {
+                    "还没有分卷大纲"
+                }));
+                rows.push(wrap_controls(vec![AnyView::new(Button::title(
+                    "手动填写",
+                    move || full.set(true),
+                ))]));
+            } else {
+                rows.push(study_field(label, buffer.binding(), 260.0));
+            }
+        } else {
+            for (index, section) in sections.iter().enumerate() {
+                let content = text[section.range.clone()]
+                    .trim()
+                    .trim_start_matches('#')
+                    .trim_start()
+                    .strip_prefix(section.title)
+                    .unwrap_or("")
+                    .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '：' | ':'));
+                let mut item = vec![wrap_controls(vec![AnyView::new(
+                    Button::title(section.title, move || selected.set(Some(index)))
+                        .button_style(GhostButtonStyle),
+                )])];
+                if !content.is_empty() {
+                    let snippet: String = content.chars().take(110).collect();
+                    item.push(caption(snippet));
+                }
+                rows.push(AnyView::new(
+                    vstack(2.0, Align::Stretch, item)
+                        .padding_edges(9.0, 8.0)
+                        .semantic_background(SemanticColorRef::surface_raised())
+                        .corner_radius(9.0),
+                ));
+            }
+        }
     }
 
     fn empty_state(&self, _mode: WritingTask, composer_navigation: Signal<u64>) -> AnyView {
@@ -992,11 +1125,16 @@ impl AiPanel {
                 ModelStatus::NeedsUserAnswer(question) => Some(question.clone()),
                 _ => None,
             });
+        let confirming_work = user_question
+            .as_ref()
+            .is_some_and(|question| question.work_change.is_some());
+        let preparing_work = batch.as_ref().is_some_and(|batch| batch.preparing_work);
         let answering = ai.follow_draft.get() && has_question;
         let following =
             ai.follow_draft.get() && batch.as_ref().is_some_and(|batch| batch.can_revise(index));
         let starts_continuation = following && is_continuation_command(&prompt);
-        let revising = following && !starts_continuation;
+        let revising =
+            following && !starts_continuation && !crate::ai_work::is_edit_request(&prompt);
         let mut rows = Vec::new();
         let history = batch
             .as_ref()
@@ -1154,7 +1292,11 @@ impl AiPanel {
         let mode = if starts_continuation || answering || revising {
             WritingTask::Continue
         } else {
-            automatic_task(&prompt, has_target, has_selection)
+            if crate::ai_work::is_edit_request(&prompt) {
+                WritingTask::Request
+            } else {
+                automatic_task(&prompt, has_target, has_selection)
+            }
         };
         let continuing = mode == WritingTask::Continue;
         if ai.story_review_open.get()
@@ -1273,7 +1415,8 @@ impl AiPanel {
             rows.push(caption(message));
         }
 
-        let ready = !busy
+        let ready = (!busy || user_question.is_some())
+            && !confirming_work
             && !preparing_story
             && if revising || answering {
                 !prompt.trim().is_empty()
@@ -1289,7 +1432,7 @@ impl AiPanel {
         let send: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(question) = answer_question.clone() {
                 let answer = model.ai.prompt.get_untracked().string_value();
-                if answer.trim().is_empty() {
+                if question.work_change.is_some() || answer.trim().is_empty() {
                     return;
                 }
                 match model.ai.answer_user_question(&question.id, answer) {
@@ -1307,7 +1450,7 @@ impl AiPanel {
         let action = if preparing_story {
             let ai = ai.clone();
             send_button("停止梳理", true, true, move || ai.clear_story())
-        } else if busy {
+        } else if busy && (user_question.is_none() || confirming_work) {
             let ai = ai.clone();
             send_button("停止", true, true, move || ai.stop())
         } else if preferences.models.is_empty() {
@@ -1345,7 +1488,12 @@ impl AiPanel {
         };
         let mut meta_row: Option<AnyView> = None;
         let typed = prompt.chars().count();
-        if continuing && !revising {
+        if preparing_work {
+            meta_row = Some(composer_meta(
+                "完善作品资料 · 保存细纲后再续写".to_owned(),
+                typed,
+            ));
+        } else if continuing && !revising {
             meta_row = Some(composer_meta(
                 target
                     .as_ref()
@@ -1408,8 +1556,12 @@ impl AiPanel {
                 ],
             ));
         }
-        let input_label = if user_question.is_some() {
+        let input_label = if confirming_work {
+            "请在上方确认资料更改"
+        } else if user_question.is_some() {
             "也可以直接写下你的选择…"
+        } else if preparing_work {
+            "补充场景安排、人物动机或章末结果…"
         } else {
             match (answering, revising) {
                 (true, _) => "补充这一场的方向…",
@@ -1639,10 +1791,16 @@ impl AiPanel {
                 Text::new(format!("主要人物 · {names}")).line_limit(Some(2)),
             ));
         }
-        for relation in story.relationships.iter().take(2) {
+        for relation in story
+            .relationships
+            .iter()
+            .rev()
+            .filter(|event| !event.quote.is_empty())
+            .take(2)
+        {
             overview.push(caption(format!(
                 "{}与{} · {}",
-                relation.from, relation.to, relation.state
+                relation.from, relation.to, relation.observed
             )));
         }
         overview.push(caption(format!("{} · {}", story.genre, story.tone)));
@@ -1698,7 +1856,6 @@ impl AiPanel {
                             ("表面", &card.surface),
                             ("动机", &card.motive),
                             ("自我保护", &card.defense),
-                            ("边界", &card.boundary),
                         ] {
                             if !content.trim().is_empty() {
                                 details
@@ -1707,20 +1864,32 @@ impl AiPanel {
                         }
                         rows.push(vstack(4.0, Align::Stretch, details));
                     }
-                    for relation in &story.relationships {
-                        rows.push(vstack(
-                            4.0,
-                            Align::Stretch,
-                            vec![
-                                AnyView::new(
-                                    Text::new(format!("{}与{}", relation.from, relation.to))
-                                        .semantic_font(SemanticFontRef::headline()),
-                                ),
-                                AnyView::new(Text::new(&relation.state)),
-                                AnyView::new(Text::new(&relation.direction)),
-                                caption(&relation.boundary),
-                            ],
-                        ));
+                    for relation in story
+                        .relationships
+                        .iter()
+                        .rev()
+                        .filter(|event| !event.quote.is_empty())
+                    {
+                        let mut evidence = vec![
+                            AnyView::new(
+                                Text::new(format!("{}与{}", relation.from, relation.to))
+                                    .semantic_font(SemanticFontRef::headline()),
+                            ),
+                            AnyView::new(Text::new(&relation.observed)),
+                            caption(format!(
+                                "{} · 「{}」",
+                                relation.chapter_title, relation.quote
+                            )),
+                        ];
+                        for (name, knowledge) in [
+                            (&relation.from, &relation.from_knows),
+                            (&relation.to, &relation.to_knows),
+                        ] {
+                            if !knowledge.trim().is_empty() {
+                                evidence.push(caption(format!("{name}知道 · {knowledge}")));
+                            }
+                        }
+                        rows.push(vstack(4.0, Align::Stretch, evidence));
                     }
                 }
                 _ => {
@@ -1814,6 +1983,13 @@ impl AiPanel {
                 .collect();
             rows.push(wrap_controls(tabs));
         }
+        for (question, answer) in run.author_answers() {
+            rows.push(caption(question.clone()));
+            rows.push(author_message(&TextBuffer::new(answer), None));
+        }
+        if batch.preparing_work {
+            rows.push(caption("完善作品资料"));
+        }
         match &run.status {
             ModelStatus::Indexing => {
                 rows.push(live_status("正在建立本地章节索引…".to_owned(), ai));
@@ -1824,6 +2000,7 @@ impl AiPanel {
                     |draft| draft.text.character_count(),
                 );
                 let label = match stage {
+                    WritingStage::PrepareWork => "正在编排本章细纲…".to_owned(),
                     WritingStage::Research => "正在梳理接续点和可用的章节证据…".to_owned(),
                     WritingStage::Draft if received > 0 => {
                         format!("正在起草 · 已接收 {received} 字")
@@ -1865,6 +2042,42 @@ impl AiPanel {
                     &TextBuffer::new(&question.question),
                     false,
                 ));
+                if batch.preparing_work
+                    && question.work_change.is_none()
+                    && let Some(anchor) = batch
+                        .target
+                        .as_ref()
+                        .and_then(|target| target.continuation_anchor())
+                {
+                    rows.push(caption(format!("原文断点 · 「{anchor}」")));
+                }
+                if let Some(change) = &question.work_change {
+                    for preview in &change.previews {
+                        let mut changes = vec![caption(preview.label.clone())];
+                        for (label, text) in [("改前", &preview.before), ("改后", &preview.after)]
+                        {
+                            if text.is_empty() {
+                                changes.push(caption(format!("{label} · 空")));
+                            } else {
+                                changes.push(text_box(label, TextBuffer::new(text), 100.0));
+                            }
+                        }
+                        rows.push(vstack(5.0, Align::Stretch, changes));
+                    }
+                    let save = self.model.clone();
+                    let decline = self.model.clone();
+                    let save_id = question.id.clone();
+                    let decline_id = question.id.clone();
+                    rows.push(wrap_controls(vec![
+                        primary("保存到作品资料", true, move || {
+                            save.decide_ai_work_change(&save_id, true)
+                        }),
+                        AnyView::new(Button::title("保留原样", move || {
+                            decline.decide_ai_work_change(&decline_id, false)
+                        })),
+                    ]));
+                    return;
+                }
                 let multiple = question.multiple;
                 let options = question
                     .options
@@ -1874,11 +2087,12 @@ impl AiPanel {
                         let ai = ai.clone();
                         let model = self.model.clone();
                         let id = question.id.clone();
-                        let answer = if option.description.trim().is_empty() {
-                            option.label.clone()
-                        } else {
-                            format!("{}｜{}", option.label, option.description)
-                        };
+                        let answer = [&option.label, &option.description, &option.effect]
+                            .into_iter()
+                            .filter(|line| !line.trim().is_empty())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         let label = option.label.clone();
                         let append = option.label.clone();
                         let action = move || {
@@ -1899,16 +2113,33 @@ impl AiPanel {
                                 ai.error.set(error);
                             }
                         };
-                        if question.recommended == Some(option_index) {
+                        let select = if question.recommended == Some(option_index) {
                             primary(&label, true, action)
                         } else {
                             AnyView::new(
                                 Button::title(label, action).button_style(GhostButtonStyle),
                             )
+                        };
+                        let mut row = vec![wrap_controls(vec![select])];
+                        if !option.description.trim().is_empty() {
+                            row.push(AnyView::new(Text::new(&option.description)));
                         }
+                        if !option.effect.trim().is_empty() {
+                            row.push(caption(format!("场尾变化 · {}", option.effect)));
+                        }
+                        AnyView::new(
+                            vstack(5.0, Align::Stretch, row)
+                                .padding_edges(12.0, 10.0)
+                                .semantic_background(SemanticColorRef::surface_raised())
+                                .corner_radius(9.0),
+                        )
                     })
                     .collect();
-                rows.push(wrap_controls(options));
+                rows.push(vstack(8.0, Align::Stretch, options));
+                let stop = ai.clone();
+                rows.push(wrap_controls(vec![AnyView::new(
+                    Button::title("停止本轮", move || stop.stop()).button_style(GhostButtonStyle),
+                )]));
                 rows.push(caption(if multiple {
                     "可多选；选完点「回答」，也可以直接输入。"
                 } else {
@@ -2102,6 +2333,14 @@ impl AiPanel {
                         },
                     )));
                 }
+                if result.task == WritingTask::Continue && !batch.applied() && !batch.busy() {
+                    let model = self.model.clone();
+                    more.push(MenuEntry::Item(MenuItem::new(
+                        6,
+                        "调整走向",
+                        move || model.replan_ai_scene(),
+                    )));
+                }
                 if !more.is_empty() {
                     controls.push(glyph_menu("草稿操作", more));
                 }
@@ -2145,7 +2384,7 @@ impl AiPanel {
                         )));
                     }
                     if !batch.applied() && !batch.busy() {
-                        let ai = ai.clone();
+                        let model = self.model.clone();
                         let instruction = format!(
                             "保留作者手改确定的事实、人物动机和情节结果，另出一版并落实这条改法：{}",
                             reflection.lesson
@@ -2153,13 +2392,13 @@ impl AiPanel {
                         actions.push(AnyView::new(Button::title(
                             "按这条改法另写一版",
                             move || {
-                                submit_refinement(&ai, current, Some(instruction.clone()));
+                                model.submit_ai_refinement(current, Some(instruction.clone()));
                             },
                         )));
                     }
                     rows.push(reflection_card(reflection, actions));
                 } else if !editing && result.author_edited() && !batch.applied() && !batch.busy() {
-                    let ai = ai.clone();
+                    let model = self.model.clone();
                     let label = result.reflection_error.as_ref().map_or_else(
                         || "这版手改可以进行差别反思。".to_owned(),
                         |error| format!("反思失败。{error}"),
@@ -2167,7 +2406,7 @@ impl AiPanel {
                     rows.push(wrap_controls(vec![
                         caption(label),
                         AnyView::new(Button::title("反思手改", move || {
-                            submit_refinement(&ai, current, None)
+                            model.submit_ai_refinement(current, None)
                         })),
                     ]));
                 }
@@ -2182,7 +2421,30 @@ impl AiPanel {
                         })));
                     }
                 }
-                if has_target && !batch.applied() && !editing && !result.author_edited() {
+                if batch.preparing_work && !batch.busy() {
+                    let model = self.model.clone();
+                    let missing = crate::ai_work::missing_story(&self.model.ai_brief(), None);
+                    if missing.is_empty() {
+                        rows.push(wrap_controls(vec![primary(
+                            "核对细纲并续写",
+                            true,
+                            move || {
+                                model.ai.follow_draft.set(false);
+                                model.ai.prompt.set(TextBuffer::new("续写"));
+                                model.send_ai_message();
+                            },
+                        )]));
+                    } else {
+                        rows.push(caption(format!("待确认 · {}", missing.join("、"))));
+                    }
+                }
+                if has_target
+                    && !batch.preparing_work
+                    && !crate::ai_work::is_edit_request(&batch.prompt.string_value())
+                    && !batch.applied()
+                    && !editing
+                    && !result.author_edited()
+                {
                     let ready = result.can_adopt();
                     let insert = self.model.clone();
                     let replace = self.model.clone();
@@ -2212,44 +2474,131 @@ impl AiPanel {
                         rows.push(wrap_controls(actions));
                     }
                 }
-                if let Some(plan) = result.scene_plan()
-                    && (!plan.character_beats().is_empty() || !plan.revision_lessons().is_empty())
-                {
+                if result.task != WritingTask::Request {
+                    let issues: Vec<_> = result.review_blockers().collect();
+                    if !issues.is_empty() {
+                        rows.push(caption(format!("审稿 · {} 项待处理", issues.len())));
+                        if show_beats.get() {
+                            for issue in issues {
+                                rows.push(caption(format!(
+                                    "{} · 「{}」",
+                                    issue.kind.label(),
+                                    issue.quote
+                                )));
+                                rows.push(AnyView::new(Text::new(issue.reason.clone())));
+                            }
+                        }
+                        if !batch.applied()
+                            && !batch.busy()
+                            && !editing
+                            && let Some(instruction) = result.repair_instruction()
+                        {
+                            let model = self.model.clone();
+                            rows.push(wrap_controls(vec![AnyView::new(Button::title(
+                                "修复并复审",
+                                move || {
+                                    model.submit_ai_refinement(current, Some(instruction.clone()));
+                                },
+                            ))]));
+                        }
+                    } else if !result.can_adopt() && !batch.applied() && !batch.busy() && !editing {
+                        let model = self.model.clone();
+                        rows.push(wrap_controls(vec![
+                            caption("草稿待核对"),
+                            AnyView::new(Button::title("重新审稿", move || {
+                                model.submit_ai_refinement(current, None)
+                            })),
+                        ]));
+                    }
                     let shown = show_beats.get();
                     rows.push(AnyView::new(Button::title(
                         if shown {
-                            "收起场景推演"
+                            "收起写作依据"
                         } else {
-                            "查看场景推演"
+                            "查看写作依据"
                         },
                         move || show_beats.set(!shown),
                     )));
                     if shown {
-                        for beat in plan.character_beats() {
-                            rows.push(vstack(
-                                4.0,
-                                Align::Stretch,
-                                vec![
-                                    AnyView::new(Text::runs(vec![TextRun::with_traits(
-                                        &beat.character,
-                                        TextTraits::BOLD,
-                                    )])),
-                                    caption(format!("触发 · {}", beat.trigger)),
-                                    caption(format!("原文 · 「{}」", beat.trigger_quote.trim())),
-                                    caption(format!("反应 · {}", beat.surface_response)),
-                                    caption(format!("关系 · {}", beat.relation_effect)),
-                                ],
-                            ));
+                        let brief = result.writing_brief();
+                        let (feedback, memory) = result.guidance_counts();
+                        let mut guidance = Vec::new();
+                        if !brief.story.outline.trim().is_empty() {
+                            guidance.push("全书大纲".to_owned());
                         }
-                        for lesson in plan.revision_lessons() {
-                            rows.push(vstack(
-                                4.0,
-                                Align::Stretch,
-                                vec![
-                                    caption(format!("沿用改法 · {}", lesson.lesson)),
-                                    caption(format!("改稿依据 · 「{}」", lesson.basis.trim())),
-                                ],
-                            ));
+                        if !brief.story.detailed_outline.trim().is_empty() {
+                            guidance.push("章节细纲".to_owned());
+                        }
+                        if !brief.story.character_cards.is_empty() {
+                            guidance
+                                .push(format!("{} 张角色卡", brief.story.character_cards.len()));
+                        }
+                        if !brief.story.relationships.is_empty() {
+                            guidance.push(format!("{} 条关系", brief.story.relationships.len()));
+                        }
+                        guidance.push(format!(
+                            "{} 条记忆 · {} 条 DiffData · {} 份文风参考",
+                            memory,
+                            feedback,
+                            result.voice_sample_count()
+                        ));
+                        rows.push(caption(format!("已提供给模型 · {}", guidance.join(" · "))));
+                        for note in result.continuity_notes.iter() {
+                            rows.push(caption(format!("待核对 · {note}")));
+                        }
+                        for entry in result.referenced_memories() {
+                            rows.push(caption(format!(
+                                "{} · {}",
+                                memory_kind(entry.kind),
+                                entry.title
+                            )));
+                        }
+                        for entry in result.referenced_feedback() {
+                            let reference = if !entry.lesson.trim().is_empty() {
+                                &entry.lesson
+                            } else {
+                                &entry.instruction
+                            };
+                            if !reference.trim().is_empty() {
+                                rows.push(caption(format!("DiffData · {reference}")));
+                            }
+                        }
+                        if let Some(plan) = result.scene_plan() {
+                            if !plan.detailed_outline_basis().is_empty() {
+                                rows.push(caption(format!(
+                                    "本场细纲依据 · 「{}」",
+                                    plan.detailed_outline_basis()
+                                )));
+                            }
+                            for beat in plan.character_beats() {
+                                rows.push(vstack(
+                                    4.0,
+                                    Align::Stretch,
+                                    vec![
+                                        AnyView::new(Text::runs(vec![TextRun::with_traits(
+                                            &beat.character,
+                                            TextTraits::BOLD,
+                                        )])),
+                                        caption(format!("触发 · {}", beat.trigger)),
+                                        caption(format!(
+                                            "原文 · 「{}」",
+                                            beat.trigger_quote.trim()
+                                        )),
+                                        caption(format!("反应 · {}", beat.surface_response)),
+                                        caption(format!("关系 · {}", beat.relation_effect)),
+                                    ],
+                                ));
+                            }
+                            for lesson in plan.revision_lessons() {
+                                rows.push(vstack(
+                                    4.0,
+                                    Align::Stretch,
+                                    vec![
+                                        caption(format!("沿用改法 · {}", lesson.lesson)),
+                                        caption(format!("改稿依据 · 「{}」", lesson.basis.trim())),
+                                    ],
+                                ));
+                            }
                         }
                     }
                 }
@@ -2303,6 +2652,37 @@ fn writing_change(
         .padding_edges(10.0, 7.0)
         .semantic_background(SemanticColorRef::surface())
         .corner_radius(7.0),
+    )
+}
+
+fn outline_section_binding(
+    buffer: Signal<TextBuffer>,
+    index: usize,
+    chapters: bool,
+) -> Binding<TextBuffer> {
+    Binding::new(
+        move || {
+            let text = buffer.get().string_value();
+            crate::ai_work::outline_sections(&text, chapters)
+                .get(index)
+                .map_or_else(TextBuffer::empty, |section| {
+                    TextBuffer::new(text[section.range.clone()].trim_end_matches('\n'))
+                })
+        },
+        move |updated| {
+            let mut text = buffer.get_untracked().string_value();
+            let range = crate::ai_work::outline_sections(&text, chapters)
+                .get(index)
+                .map(|section| {
+                    let end = section.range.start
+                        + text[section.range.clone()].trim_end_matches('\n').len();
+                    section.range.start..end
+                });
+            if let Some(range) = range {
+                text.replace_range(range, &updated.string_value());
+                buffer.set(TextBuffer::new(&text));
+            }
+        },
     )
 }
 
@@ -2527,19 +2907,11 @@ fn reflection_card(
     )
 }
 
-fn submit_refinement(ai: &crate::ai::AiState, index: usize, revision: Option<String>) {
-    ai.feedback.set(String::new());
-    ai.error.set(
-        ai.refine(index, revision)
-            .err()
-            .map_or_else(String::new, |error| error.to_string()),
-    );
-}
-
 fn status_title(status: &ModelStatus) -> &'static str {
     match status {
         ModelStatus::Indexing => "建索引",
         ModelStatus::Running(stage) => match stage {
+            WritingStage::PrepareWork => "完善作品资料",
             WritingStage::Research => "梳理前文",
             WritingStage::Draft => "起草中",
             WritingStage::Reflect => "反思中",

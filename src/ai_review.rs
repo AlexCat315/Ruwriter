@@ -1,11 +1,13 @@
 //! Manuscript-aware review and targeted revision of a candidate.
 
-use cove_agent::{AgentError, AgentModel};
+use cove_agent::{
+    AgentError, AgentMessage, AgentModel, AgentRole, AgentSession, AgentSkillLibrary, AgentToolbox,
+};
 use ruwriter_core::WritingBrief;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::ai::WritingTask;
+use crate::ai::{AskUser, WritingTask, ask_questions, ask_user_tool};
 use crate::ai_continuation::{
     ScenePlan, check_prose, continuation_body, prose_reply, quality_check,
 };
@@ -14,11 +16,13 @@ use crate::ai_research::Source;
 const REVIEW: &str = r#"你是这部小说的编辑。先判断 candidate 是否真的交付了正文。只有流程解释、提纲、拒绝或索取材料时，usable 为 false。人物对白或实际接续的半句可以是正文。
 优先核对作者的大纲、细纲和本场意图；核对是否把未来卷的事件提前兑现，或让人物采取与设定相反的决定。用 intent 报告，basis 逐字引用这项作者约束。核对本段新增的过去经历。若候选稿把此前没有证据、作者也未授权的具体职业、旧事、收入、物件来历等作为人物反应的依据，即使写在对白里，也用 unsupported_history 报告。quote 引用候选稿中明确新增的经历，reason 指出缺少哪段铺垫及如何用当前可见行动替代，basis 可以为 null。作者允许新增的场景事实、原文已有证据的往事、角色明确在试探或撒谎时的说法，不按此项报错。证据检索覆盖不足时只指出候选稿擅自坐实的具体细节。
 核对 continuity.state_change 和 advance_to。只有当稿中出现改变知识、决定、行动或关系的具体结果，才算完成下一拍。换词重谈、继续描述同一物件、重说已经明白的感受都不算。没发生变化或走错方向时用 progress，quote 引用问题句，basis 逐字引用 advance_to。author_revisions 和 accepted_revisions 里作者明确否掉的写法，即使换成近义词、类似比喻或同一叙述结构，也报 intent，basis 引用作者的原话，reason 给出能替代该句叙述功能的具体做法。
-confirmed_memories 的 kind 为 character_claim 时只确认角色说过这些话，需保留说话人和听者的认知；fact 为作者核定的事实，craft 为写法经验，note 需要回到原文确认。先核对 character_cards、relationships 和 character_beats 的因果。检查候选稿的动作是否由卡片中的内在价值和防御方式驱动，对话是否会把关系推向作者不允许的方向。比较表面话、真正动机、可见反应三者。人物的调侃或防御不是价值观。明显反转核心动机、违背触发后的反应或跨过关系边界时，用 character 类型并写 character 字段，值必须为角色卡原名，quote 为产生偏离的实际字句。
+confirmed_memories 的 kind 为 character_claim 时只确认角色说过这些话，需保留说话人和听者的认知；fact 为作者核定的事实，craft 为写法经验，note 需要回到原文确认。先核对 character_cards、relationships 和 character_beats 的因果。检查候选稿的动作是否由卡片中的内在价值和防御方式驱动，对话是否会把关系推向作者不允许的方向。比较表面话、真正动机、可见反应三者。两人各有自己的认知：严格核对关系卡 from_knows 和 to_knows，只有 reveal_condition 成立后才允许对应变化。越界必须指出候选哪句具体触发了哪个作者禁止的行为或给谁增加了未获得的知识，不能只说「保持距离」或「感情升温过快」。人物的调侃或防御不是价值观。明显反转核心动机、违背触发后的反应或跨过关系边界时，用 character 类型并写 character 字段，值必须为角色卡原名，quote 为产生偏离的实际字句。
 先接住 continuity.carry_from：如果其中的最后一个可见动作或物件在候选稿里没有落地，候选稿却另起无关场景，报 continuity，quote 填候选稿里替代它的句子。写法是否偏离原稿，按 manuscript_excerpt、author_examples 和作品资料判断，不套用固定桥段或通用写作教程。核对 genre、tone 和 direction 的创作意图。author_truth_for_review_only 是只供审稿核对的作者私设，包括真实动机、谁已知、何时可以揭示。用它判断越过视角、不当揭露或把人物说法坐实，审稿意见只引用候选稿及公开原文，不复述私设。检查人名、角色已知事实、物品与时间是否和原稿相符，已经发生的事有没有被重写。不要用其他题材或你的文字偏好评判这部作品。比较 manuscript_excerpt 和 author_examples 中叙述者说话的方法、长短句、对白切换、情绪和场景收束。作者原有的术语、调侃、抒情、议论或感官细节应保留。只有与作者稿实际不同、会造成跳脱的地方才报告。举原稿中支持判断的短句，诸如「文风偏 AI」的抽象判断无效。author_revisions 按时间排列，最新的要求优先。
 只输出 JSON 对象，格式为 {"usable":true,"issues":[{"kind":"continuity","quote":"候选稿原句","reason":"问题和具体改法","source":null,"basis":"原稿、作者要求或 advance_to 中的逐字短句"}]}。kind 为 continuity、voice、intent、disclosure、character、progress 或 unsupported_history。只有候选稿确实提前揭露私设、把未获证实的角色说法坐实，或超出当前视角时才用 disclosure。作者本轮明确要求揭晓且视角允许时，按本轮要求审稿。只报告可指到 candidate 原句的具体问题。除 unsupported_history 外，basis 找不到逐字原句就不报这一条。reason 必须说清把哪一句改成什么，不写泛泛的文学评论。只有实际引用了检索来源才填 source 编号。先列剧情、角色和知情边界问题，再列文风，最多五项。没发现问题时 issues 为空。"#;
 
-const REVISE: &str = r#"按原文和作者要求修订候选稿。candidate 为空时，直接使用 manuscript_excerpt 起草。revision 是当前要做的事；author_revisions 中仍适用的作者要求继续遵守。accepted_revisions 是作者明示的改法与反例。删改被指出句子的功能与结构，不能保留同一套式只换近义词。核对原文如何切换动作、对白和段落，照作者写法安排新场景动作。progress 有问题时，从 continuity.state_change 对照应发生的可见变化，直接写这件新事的结果，省掉重复的旧动作和解释。保留其他已成立的事实、视角和节奏。有话没说完就从原稿末字后接，不抄原稿，不重新叙述已发生的事。只输出完整的修订后候选正文。"#;
+const REVISE: &str = r#"按原文和作者要求修订候选稿。revision 是本轮要求，优先于旧的接续计划和旧的改法。story.outline 约束全书走向和揭示时机，story.detailed_outline 是作者安排的场景顺序、具体事件和结果，以与落笔处相符的条目为准。两者中的未来事件尚未发生。character_cards 和 relationships 约束人物为何这么做、如何防御、关系可以走到哪一步。发言可能是掩饰、试探或隐喻。confirmed_memories 的 fact 才可当作者确认的事实，character_claim 是角色说法。不要给人补履历、收入或关系史来解释反应。用 author_examples 和 manuscript_excerpt 判断句长、语气、动作与对白怎样衔接。对照 accepted_revisions 的改前改后，改掉作者否掉的叙述功能，不只换词。保留仍适用的作者要求、事实、视角和节奏。有半句待接时，保留接在原稿最后一字之后的方式。"#;
+
+const PATCH_REVISION: &str = r#"只改落实本轮要求所需的最少部分，保留其余字句和换行。输出 JSON {"edits":[{"before":"candidate 中唯一出现且逐字一致的原句或片段","after":"替换文字"}]}。删除时 after 为空；插入时用邻接原句作为 before，并在 after 中保留它。重名或重复用语要带足邻接字句以唯一定位。各个 before 不能重叠。必要时可替换连续几段，但不能为统一风格改动无关段落。候选是半句时也可直接定位其中的字句。不要输出整份草稿或解释。"#;
 
 const REFLECT: &str = r#"对照模型稿 before 和作者亲改的 after，抓住对这一场结果影响最大的一处变化。prior_context 只用于认清场景和说话人。辨别这次是改了人物动机、剧情结果、知情边界还是写法。说明原句在场景中做了什么、作者改成怎样推进，只从作者改后版本提炼一条下次能执行的做法，不把改掉的写法列为备选。两版用了同一主题词时，要区分话题在两版中的作用和指向。只总结改后字面能支持的变化。没有明确的台词归属就描述问句和反应本身，不能擅自指定说话人，尤其不要把紧接着点头的人当成问话者。规则用「提问者」「叙述者」等中性称谓，不把原文人物名字写进可复用规则，不猜动机、不扩写。只返回 JSON { "before_quote":"改前逐字短句，纯插入可空", "after_quote":"改后逐字短句，纯删除可空", "lesson":"具体差异及下一次的执行方式，最多两句" }。引用落在真正改动的地方。"#;
 
@@ -98,7 +102,7 @@ pub fn reflect_author_edit(
     Ok(reflection)
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueKind {
     Continuity,
@@ -139,7 +143,7 @@ impl DraftIssue {
         self.basis.is_some()
             || matches!(
                 self.kind,
-                IssueKind::Disclosure | IssueKind::Character | IssueKind::UnsupportedHistory
+                IssueKind::Disclosure | IssueKind::UnsupportedHistory
             )
     }
 }
@@ -153,16 +157,27 @@ pub enum Review {
 }
 
 impl Review {
-    pub fn has_disclosure(&self) -> bool {
-        matches!(self, Self::Checked(issues) if issues.iter().any(|issue| matches!(issue.kind, IssueKind::Disclosure)))
-    }
-
-    pub fn has_character_violation(&self) -> bool {
-        matches!(self, Self::Checked(issues) if issues.iter().any(|issue| matches!(issue.kind, IssueKind::Character)))
-    }
-
     pub fn blocks_approval(&self) -> bool {
         matches!(self, Self::Checked(issues) if issues.iter().any(DraftIssue::actionable))
+    }
+
+    pub fn blocking_issues(&self) -> impl Iterator<Item = &DraftIssue> {
+        match self {
+            Self::Checked(issues) => issues.as_slice(),
+            _ => &[],
+        }
+        .iter()
+        .filter(|issue| issue.actionable())
+    }
+
+    pub fn introduces_blocker(&self, baseline: &Self) -> bool {
+        self.blocking_issues().any(|issue| {
+            !baseline.blocking_issues().any(|prior| {
+                prior.kind == issue.kind
+                    && prior.character == issue.character
+                    && (prior.quote.contains(&issue.quote) || issue.quote.contains(&prior.quote))
+            })
+        })
     }
 
     pub fn addressed_quote(&self, revised: &str) -> bool {
@@ -185,6 +200,7 @@ impl Review {
                     ));
                 }
                 if matches!(issue.kind, IssueKind::Character) {
+                    issue.basis.as_ref()?;
                     let character = issue.character.as_deref()?;
                     return Some(format!(
                         "按「{character}」的角色卡和关系边界重写「{}」。保留角色在当前触发下可观察的反应。",
@@ -243,6 +259,7 @@ impl Review {
     }
 }
 
+#[derive(Clone)]
 pub struct DraftContext {
     pub task: WritingTask,
     pub request: String,
@@ -251,6 +268,12 @@ pub struct DraftContext {
     pub brief: WritingBrief,
     pub voice_samples: Vec<String>,
     pub local_reference: String,
+}
+
+pub struct RevisionRequest<'a> {
+    pub instruction: &'a str,
+    pub whole_draft: bool,
+    pub ask_user: Option<AskUser>,
 }
 
 impl DraftContext {
@@ -316,6 +339,24 @@ impl DraftContext {
                         ]
                         .iter()
                         .any(|field| field.contains(quote))
+                        || self.brief.story.character_cards.iter().any(|card| {
+                            [&card.surface, &card.motive, &card.defense, &card.boundary]
+                                .iter()
+                                .any(|field| field.contains(quote))
+                        })
+                        || self.brief.story.relationships.iter().any(|relation| {
+                            [
+                                &relation.state,
+                                &relation.direction,
+                                &relation.boundary,
+                                &relation.evidence,
+                                &relation.from_knows,
+                                &relation.to_knows,
+                                &relation.reveal_condition,
+                            ]
+                            .iter()
+                            .any(|field| field.contains(quote))
+                        })
                         || self
                             .brief
                             .memories
@@ -371,11 +412,63 @@ impl DraftContext {
         draft: &str,
         sources: &[Source],
         revisions: &[String],
-        revision: &str,
+        request: RevisionRequest<'_>,
     ) -> Result<String, AgentError> {
+        let RevisionRequest {
+            instruction,
+            whole_draft,
+            ask_user,
+        } = request;
         let mut input = self.payload(draft, sources, revisions);
-        input["revision"] = json!(revision);
-        let answer = prose_reply(model, REVISE, &input)?;
+        input["revision"] = json!(instruction);
+        let edit_format = if whole_draft {
+            "candidate 为空时，从 manuscript_excerpt 的落笔处起草。只输出完整的修订后候选正文。"
+        } else {
+            PATCH_REVISION
+        };
+        let instructions = format!("{REVISE}\n{edit_format}");
+        let answer = if let Some(ask) = ask_user {
+            let toolbox = AgentToolbox::new(
+                vec![ask_user_tool()],
+                std::sync::Arc::new(move |_, input| ask_questions(&ask, input, 1, false)),
+            )?;
+            AgentSession::new(toolbox, &AgentSkillLibrary::default(), &[], 3, model.clone())?
+                .run(vec![
+                    AgentMessage::text(AgentRole::System, format!("{instructions}\n如果改稿要求和作者已确认的角色动机、关系边界或剧情结果冲突且意图不明确，先 ask_user，再继续改稿。可以依据现有资料确定的写法直接改。")),
+                    AgentMessage::user(input.to_string()),
+                ])?
+                .answer
+        } else {
+            prose_reply(model, &instructions, &input)?
+        };
+        if !whole_draft {
+            #[derive(Deserialize)]
+            struct Edits {
+                edits: Vec<Replacement>,
+            }
+            #[derive(Deserialize)]
+            struct Replacement {
+                before: String,
+                after: String,
+            }
+            let invalid = || AgentError::Model("未收到可定位的改动，已保留原草稿。".to_owned());
+            let reply = answer.trim();
+            let reply = reply
+                .strip_prefix("```json")
+                .and_then(|text| text.strip_suffix("```"))
+                .unwrap_or(reply);
+            let edits: Edits = serde_json::from_str(reply).map_err(|_| invalid())?;
+            let revised = cove_agent::revision::apply_replacements(
+                draft,
+                edits
+                    .edits
+                    .iter()
+                    .map(|edit| (edit.before.as_str(), edit.after.as_str())),
+            )
+            .ok_or_else(invalid)?;
+            check_prose(revised.trim())?;
+            return Ok(revised);
+        }
         let prose = if self.task == WritingTask::Continue {
             continuation_body(&self.excerpt, &answer)
         } else {

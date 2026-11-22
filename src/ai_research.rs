@@ -53,10 +53,10 @@ pub struct Source {
 #[derive(serde::Serialize)]
 pub struct StoryExcerpt {
     file: String,
-    chapter: usize,
-    title: String,
+    pub(crate) chapter: usize,
+    pub(crate) title: String,
     offset: usize,
-    text: String,
+    pub(crate) text: String,
 }
 
 pub type ResearchCache = Arc<Mutex<Option<CachedIndex>>>;
@@ -252,7 +252,7 @@ impl ResearchRequest {
 
 /// Only explicit chapter labels establish ordering across files. Volume and
 /// section labels are kept out because their numbering often restarts.
-fn chapter_number(title: &str) -> Option<u32> {
+pub(crate) fn chapter_number(title: &str) -> Option<u32> {
     let (number, _) = title.trim().strip_prefix('第')?.split_once('章')?;
     let number = number.trim();
     if let Ok(number) = number.parse::<u32>() {

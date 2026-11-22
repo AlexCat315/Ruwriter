@@ -409,6 +409,14 @@ pub struct RelationshipCard {
     pub state: String,
     pub direction: String,
     pub boundary: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub evidence: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub from_knows: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub to_knows: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reveal_condition: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

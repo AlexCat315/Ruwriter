@@ -525,6 +525,7 @@ mod tests {
         let question = SceneQuestion {
             quote: "合上了本子".into(),
             question: "她是在犹豫，还是想结束话题？".into(),
+            needs_chapter_detail: false,
         };
         let waiting = ChatTurn {
             id: new_id(),

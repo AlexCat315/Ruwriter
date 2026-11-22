@@ -7,11 +7,9 @@ const SAMPLE_BYTES: usize = 3600;
 /// Local author prose supplies a baseline even when no samples were pinned.
 pub fn with_local_sample(scene: &str, samples: &[String]) -> Vec<String> {
     let mut selected = select_samples(scene, samples);
-    if selected.is_empty() {
-        let sample = recent_text(scene, 1250).trim();
-        if !sample.is_empty() {
-            selected.push(sample.to_owned());
-        }
+    let sample = recent_text(scene, 1250).trim();
+    if !sample.is_empty() && !selected.iter().any(|reference| reference.contains(sample)) {
+        selected.push(sample.to_owned());
     }
     selected
 }
