@@ -716,6 +716,7 @@ impl AiPanel {
         show_controls: Signal<bool>,
         show_beats: Signal<bool>,
         composer_focus: Signal<bool>,
+        review_expanded: Signal<bool>,
     ) -> (Vec<AnyView>, AnyView) {
         let ai = &self.model.ai;
         let batch = ai.batch();
@@ -780,7 +781,7 @@ impl AiPanel {
                 rows.push(error_label(format!("无法保存对话。{error}")));
             }
             rows.push(author_message(&batch.prompt));
-            self.results(&mut rows, batch, show_beats);
+            self.results(&mut rows, batch, show_beats, review_expanded);
         }
         let mode = if starts_continuation || answering {
             WritingTask::Continue
@@ -1253,7 +1254,13 @@ impl AiPanel {
         }
     }
 
-    fn results(&self, rows: &mut Vec<AnyView>, batch: &Batch, show_beats: Signal<bool>) {
+    fn results(
+        &self,
+        rows: &mut Vec<AnyView>,
+        batch: &Batch,
+        show_beats: Signal<bool>,
+        review_expanded: Signal<bool>,
+    ) {
         let selected = batch
             .target
             .as_ref()
@@ -1484,18 +1491,15 @@ impl AiPanel {
                         })));
                     }
                 }
+                self.review_candidate(
+                    rows,
+                    result,
+                    current,
+                    !batch.applied() && !batch.busy(),
+                    review_expanded,
+                );
                 if has_target && !batch.applied() {
                     let ready = result.can_adopt();
-                    if result.task != WritingTask::Request {
-                        if result.text != result.reviewed_text {
-                            rows.push(caption("当前编辑稿尚未审阅。"));
-                        } else if result.repetition_warning.is_some()
-                            || !result.continuity_notes.is_empty()
-                            || matches!(&result.review, Review::Checked(issues) if !issues.is_empty())
-                        {
-                            rows.push(caption("审稿有待核对项，见下方意见。"));
-                        }
-                    }
                     let insert = self.model.clone();
                     let replace = self.model.clone();
                     let mut actions = Vec::new();
@@ -1524,7 +1528,6 @@ impl AiPanel {
                         rows.push(wrap_controls(actions));
                     }
                 }
-                self.review_candidate(rows, result, current, !batch.applied() && !batch.busy());
                 if let Some(plan) = result.scene_plan()
                     && (!plan.character_beats().is_empty() || !plan.revision_lessons().is_empty())
                 {
@@ -1577,79 +1580,119 @@ impl AiPanel {
         result: &WritingResult,
         index: usize,
         available: bool,
+        expanded: Signal<bool>,
     ) {
         if result.task == WritingTask::Request {
             return;
         }
-        let ai = &self.model.ai;
-        for note in result.continuity_notes.iter() {
-            rows.push(caption(format!("接续待核对 · {note}")));
-        }
-        let changed = result.text != result.reviewed_text;
-        let mut instructions = Vec::new();
-        if result.review.has_character_violation() {
-            rows.push(error_label(
-                "草稿偏离了角色卡或关系边界，修正后才能采纳。".to_owned(),
+        let changed = !result.text.has_same_contents(&result.reviewed_text);
+        let issues = match &result.review {
+            Review::Checked(issues) if !changed => issues.as_slice(),
+            _ => &[],
+        };
+        let count = if changed {
+            0
+        } else {
+            issues.len()
+                + result.continuity_notes.len()
+                + usize::from(result.repetition_warning.is_some())
+        };
+        let title = if changed {
+            "草稿已编辑，待重新审稿".to_owned()
+        } else {
+            match &result.review {
+                Review::Rejected => "回复尚未交付正文".to_owned(),
+                Review::Incomplete => "本轮审稿未完成".to_owned(),
+                Review::NotRequested => "待审稿".to_owned(),
+                Review::Checked(_) if count == 0 => "审稿未发现具体问题".to_owned(),
+                Review::Checked(_) => format!("{count} 项待核对"),
+            }
+        };
+        let mut controls = vec![AnyView::new(
+            Text::new(title).truncated().flex_with(1.0, 1.0, None),
+        )];
+        let show_details = expanded.get();
+        if count > 0 {
+            controls.push(AnyView::new(
+                Button::title(
+                    if show_details {
+                        "收起意见"
+                    } else {
+                        "展开意见"
+                    },
+                    move || expanded.set(!show_details),
+                )
+                .button_style(GhostButtonStyle),
             ));
         }
-        if result.review.has_disclosure() {
-            rows.push(error_label(
-                "草稿泄露了尚不该揭晓的信息，核对修订后才能采纳。".to_owned(),
+        let mut details = vec![hstack(3.0, Align::Center, controls)];
+        if !changed && result.review.has_character_violation() {
+            details.push(error_label(
+                "草稿偏离了角色卡或关系边界，修正后可采纳。".to_owned(),
             ));
+        }
+        if !changed && result.review.has_disclosure() {
+            details.push(error_label("草稿提前揭晓了信息，修正后可采纳。".to_owned()));
         }
         if result.needs_private_review() {
-            rows.push(caption("当前版本需要核对角色卡和知情边界，才能采纳。"));
+            details.push(caption("采纳前需核对角色卡和知情边界。"));
         }
-        if changed {
-            rows.push(caption("草稿已编辑，可以重新审稿。"));
-        } else {
+        if count > 0 && show_details {
+            for note in result.continuity_notes.iter() {
+                details.push(caption(format!("接续待核对 · {note}")));
+            }
             if let Some(warning) = &result.repetition_warning {
-                rows.push(error_label(warning.clone()));
-                instructions.push(warning.clone());
+                details.push(error_label(warning.clone()));
             }
-            match &result.review {
-                Review::NotRequested => {}
-                Review::Incomplete => rows.push(caption("本轮未能完成模型审稿。")),
-                Review::Rejected => rows.push(error_label(
-                    "这条回复没有交付正文。请修订后重新审稿。".to_owned(),
-                )),
-                Review::Checked(issues) if issues.is_empty() && instructions.is_empty() => {
-                    rows.push(caption("审稿未发现具体问题。"));
+            for issue in issues {
+                let mut quote = vec![
+                    caption(issue.kind.label()),
+                    AnyView::new(Text::new(format!("「{}」", issue.quote.trim()))),
+                    caption(issue.reason.trim()),
+                ];
+                if let Some(basis) = &issue.basis {
+                    quote.push(caption(format!("依据 · 「{basis}」")));
                 }
-                Review::Checked(issues) => {
-                    for issue in issues {
-                        let source = issue
-                            .source
-                            .as_ref()
-                            .map_or_else(String::new, |id| format!(" [{id}]"));
-                        let note =
-                            format!("「{}」 {}{source}", issue.quote.trim(), issue.reason.trim());
-                        rows.push(caption(format!("{} · {note}", issue.kind.label())));
-                    }
+                if let Some(source) = &issue.source {
+                    quote.push(caption(format!("原文来源 · [{source}]")));
                 }
+                details.push(vstack(3.0, Align::Stretch, quote));
             }
         }
-        if !available {
-            return;
+        if available {
+            let review = self.model.ai.clone();
+            let mut actions = vec![AnyView::new(
+                Button::title("重新审稿", move || {
+                    submit_refinement(&review, index, None)
+                })
+                .button_style(GhostButtonStyle),
+            )];
+            if !changed {
+                let instructions = result
+                    .repetition_warning
+                    .iter()
+                    .cloned()
+                    .chain(result.review_revision_instruction())
+                    .collect::<Vec<_>>();
+                if !instructions.is_empty() {
+                    let revise = self.model.ai.clone();
+                    let instructions = instructions.join("\n");
+                    actions.push(AnyView::new(Button::title(
+                        "按审稿意见修订",
+                        move || {
+                            submit_refinement(&revise, index, Some(instructions.clone()));
+                        },
+                    )));
+                }
+            }
+            details.push(wrap_controls(actions));
         }
-        let refine = ai.clone();
-        let mut actions = vec![AnyView::new(Button::title("重新审稿", move || {
-            submit_refinement(&refine, index, None);
-        }))];
-        if !changed && let Some(direction) = result.review_revision_instruction() {
-            instructions.push(direction);
-        }
-        if !instructions.is_empty() {
-            let refine = ai.clone();
-            let instructions = instructions.join("\n");
-            actions.push(AnyView::new(Button::title(
-                "按审稿意见修订",
-                move || {
-                    submit_refinement(&refine, index, Some(instructions.clone()));
-                },
-            )));
-        }
-        rows.push(wrap_controls(actions));
+        rows.push(AnyView::new(
+            vstack(5.0, Align::Stretch, details)
+                .padding_edges(10.0, 8.0)
+                .semantic_background(SemanticColorRef::surface_raised())
+                .corner_radius(9.0),
+        ));
     }
 }
 
@@ -2009,11 +2052,13 @@ impl View for AiPanel {
         let controls = cx.state(|| false);
         let show_beats = cx.state(|| false);
         let composer_focus = cx.state(|| false);
-        let scroll = cx.remember(|| RefCell::new(None::<(_, Option<ScrollRequest>)>));
-        let turn = cx.remember(|| Cell::new(None));
-        let brief_scroll = cx.remember(|| RefCell::new(None::<(_, ScrollRequest)>));
-        let follow_tail = cx.remember(|| Cell::new(true));
-        let last_geometry = cx.remember(|| Cell::new((0_f32, 0_f32)));
+        let review_expanded = cx.state(|| false);
+        let scroll = cx.remember(|| Rc::new(RefCell::new(None::<(_, Option<ScrollRequest>)>)));
+        let turn = cx.remember(|| Rc::new(Cell::new(None)));
+        let brief_scroll = cx.remember(|| Rc::new(RefCell::new(None::<(_, ScrollRequest)>)));
+        let follow_tail = cx.remember(|| Rc::new(Cell::new(true)));
+        let detached = cx.state(|| false);
+        let last_geometry = cx.remember(|| Rc::new(Cell::new(None::<(f32, f32)>)));
         let jump = cx.state(|| 0_u64);
         let settings = self.model.ai.settings_open.get();
         let brief = self.model.ai.brief_open.get();
@@ -2026,7 +2071,13 @@ impl View for AiPanel {
         } else if branches {
             self.conversation_branches()
         } else {
-            self.writer(preview, controls, show_beats, composer_focus)
+            self.writer(
+                preview,
+                controls,
+                show_beats,
+                composer_focus,
+                review_expanded,
+            )
         };
         let error = self.model.ai.error.get();
         if !error.is_empty() && secondary {
@@ -2131,10 +2182,7 @@ impl View for AiPanel {
             let last_turn = (
                 self.model.document.get(),
                 jump.get(),
-                story_stage,
-                batch
-                    .as_ref()
-                    .map(|batch| (batch.history.len(), batch.applied())),
+                batch.as_ref().map(|batch| batch.history.len()),
             );
             let stream = batch.as_ref().and_then(|batch| {
                 batch
@@ -2142,33 +2190,50 @@ impl View for AiPanel {
                     .get(self.model.ai.viewed_result.get())
                     .map(|run| (run.streamed_text.utf8_length(), batch.busy()))
             });
-            let key = (last_turn, controls.get(), stream);
+            let key = (
+                last_turn,
+                story_stage,
+                controls.get(),
+                stream,
+                batch.as_ref().is_some_and(Batch::applied),
+            );
             let follow = follow_tail.clone();
             let position = last_geometry.clone();
             body = body.on_geometry_change(move |geometry| {
                 let end = (geometry.content_size.height - geometry.viewport_size.height).max(0.0);
-                let (previous_end, previous_y) = position.replace((end, geometry.offset.y));
-                if (end - previous_end).abs() < 1.0 && (geometry.offset.y - previous_y).abs() > 1.0
+                let y = geometry.offset.y;
+                let previous = position.replace(Some((end, y)));
+                let near_tail = end - y <= 28.0;
+                if near_tail
+                    || previous.is_some_and(|(old_end, old_y)| {
+                        let moved_up = y < old_y - 1.0 && end >= old_end - 1.0;
+                        moved_up || ((end - old_end).abs() < 1.0 && (y - old_y).abs() > 1.0)
+                    })
                 {
-                    follow.set(end - geometry.offset.y <= 30.0);
+                    follow.set(near_tail);
+                    detached.set_if_changed(!near_tail);
                 }
             });
             let mut previous = scroll.borrow_mut();
             if previous.as_ref().is_none_or(|(last, _)| last != &key) {
                 if turn.replace(Some(last_turn)) != Some(last_turn) {
                     follow_tail.set(true);
+                    detached.set_if_changed(false);
                 }
                 let request = follow_tail
                     .get()
                     .then(|| ScrollRequest::new(Point::new(0.0, 1.0e9), 0.0));
                 *previous = Some((key, request));
             }
-            if let Some((_, Some(request))) = &*previous {
+            if follow_tail.get()
+                && let Some((_, Some(request))) = &*previous
+            {
                 body = body.scroll_request(request.clone());
             }
         } else {
             *scroll.borrow_mut() = None;
             turn.set(None);
+            last_geometry.set(None);
         }
         if brief {
             let page = self.model.ai.brief_page.get();
@@ -2187,6 +2252,19 @@ impl View for AiPanel {
             hstack(6.0, Align::Center, vec![spacer(), action])
         } else {
             let mut composer = Vec::new();
+            if detached.get() {
+                composer.push(hstack(
+                    0.0,
+                    Align::Center,
+                    vec![
+                        spacer(),
+                        AnyView::new(
+                            Button::title("回到最新", move || jump.update(|value| *value += 1))
+                                .button_style(GhostButtonStyle),
+                        ),
+                    ],
+                ));
+            }
             let archive_error = self.model.ai.archive_read_error.get();
             if !archive_error.is_empty() {
                 composer.push(error_label(archive_error));
