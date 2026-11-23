@@ -1220,6 +1220,126 @@ impl Model {
         self.ai.brief_open.set(true);
     }
 
+    pub fn reference_key(&self) -> Option<(PathBuf, String)> {
+        let (root, _) = self.ai_work()?;
+        let key = self.ai_brief().reference_shelf;
+        (!key.is_empty()).then_some((root, key))
+    }
+
+    pub fn show_reference_books(&self) {
+        if !self.ai.brief_open.get_untracked() {
+            self.edit_ai_brief();
+        }
+        self.ai.brief_page.set(6);
+        if let Some(key) = self.reference_key() {
+            self.ai.references.open(&key);
+        }
+    }
+
+    pub fn import_reference_books(&self) {
+        let Some(work) = self.ai_work() else {
+            self.ai.error.set("请先打开资料库里的作品。".into());
+            return;
+        };
+        let model = self.clone();
+        FilePicker::request(
+            &[FilePickerFilter::new(
+                "参考书",
+                ["txt", "md", "markdown", "epub"].map(str::to_owned),
+            )],
+            true,
+            Box::new(move |paths| {
+                if paths.is_empty() {
+                    return;
+                }
+                let result = (|| {
+                    if model.ai_work().as_ref() != Some(&work) {
+                        return Err("作品已切换，请重新选择参考书。".to_owned());
+                    }
+                    let (root, id) = &work;
+                    let key = model.with_session(|session| {
+                        if session.library_root() != root {
+                            return Err("资料库已切换，请重新选择参考书。".to_owned());
+                        }
+                        let mut brief = session
+                            .library
+                            .state
+                            .writing_briefs
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_default();
+                        if brief.reference_shelf.is_empty() {
+                            brief.reference_shelf =
+                                ruwriter_core::sync::content_hash(&crate::ai_chat::new_id());
+                            let key = brief.reference_shelf.clone();
+                            session
+                                .library
+                                .save_writing_brief(id, brief)
+                                .map_err(|error| error.to_string())?;
+                            Ok(key)
+                        } else {
+                            Ok(brief.reference_shelf)
+                        }
+                    })?;
+                    let key = (root.clone(), key);
+                    model.ai.references.open(&key);
+                    model
+                        .ai
+                        .references
+                        .import(key, paths.into_iter().map(PathBuf::from).collect());
+                    model.revision.update(|value| *value += 1);
+                    Ok(())
+                })();
+                model.ai.error.set(result.err().unwrap_or_default());
+            }),
+        );
+    }
+
+    pub fn analyze_reference_book(&self, book: crate::ai_reference::Book) {
+        let result = (|| {
+            let key = self.reference_key().ok_or("请先导入参考书。")?;
+            let settings = self.ai_settings();
+            let profile = settings
+                .selected
+                .first()
+                .and_then(|index| settings.models.get(*index))
+                .ok_or("请先选择用于拆书的模型。")?;
+            let model = self
+                .ai
+                .model_adapter(profile)
+                .map_err(|error| error.to_string())?;
+            self.ai.references.start(key, book, model);
+            Ok(())
+        })();
+        self.ai.error.set(result.err().unwrap_or_default());
+    }
+
+    pub fn remember_reference_technique(
+        &self,
+        expected: &(PathBuf, String),
+        title: &str,
+        guidance: &str,
+        source: String,
+    ) {
+        if self.reference_key().as_ref() != Some(expected) {
+            self.ai
+                .error
+                .set("作品已切换，请在原作品里保存写法。".into());
+            return;
+        }
+        let result = self.store_writing_learning(
+            None,
+            vec![ruwriter_core::WritingMemory {
+                title: title.to_owned(),
+                text: guidance.to_owned(),
+                source,
+                kind: ruwriter_core::WritingMemoryKind::Craft,
+                ..Default::default()
+            }],
+        );
+        self.ai.error.set(result.err().unwrap_or_default());
+    }
+
     pub fn save_ai_brief(&self) {
         let result = (|| {
             let (root, work) = self

@@ -897,6 +897,7 @@ pub struct AiState {
     pub writing_memories: Signal<Vec<ruwriter_core::WritingMemory>>,
     pub reviewed_feedback: Signal<Vec<WritingFeedback>>,
     pub brief_page: Signal<usize>,
+    pub references: crate::ai_reference::References,
     pub outline_page: Signal<usize>,
     pub outline_full: Signal<bool>,
     pub outline_list_offset: Signal<usize>,
@@ -970,6 +971,7 @@ impl AiState {
             writing_memories: cx.state(Vec::new),
             reviewed_feedback: cx.state(Vec::new),
             brief_page: cx.state(|| 0),
+            references: crate::ai_reference::References::new(cx),
             outline_page: cx.state(|| 0),
             outline_full: cx.state(|| false),
             outline_list_offset: cx.state(|| 0),
@@ -2196,7 +2198,7 @@ impl AiState {
         Ok(())
     }
 
-    fn model_adapter(&self, profile: &AiPreferences) -> Result<AgentModel, AgentError> {
+    pub(crate) fn model_adapter(&self, profile: &AiPreferences) -> Result<AgentModel, AgentError> {
         Ok(self.configured_model(profile)?.into_agent_model())
     }
 

@@ -306,6 +306,8 @@ pub struct WritingBrief {
     pub canon: String,
     pub voice: String,
     pub avoid: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub reference_shelf: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub voice_samples: Vec<String>,
     #[serde(skip_serializing_if = "StoryProfile::is_empty")]
@@ -321,6 +323,7 @@ impl WritingBrief {
         self.canon.trim().is_empty()
             && self.voice.trim().is_empty()
             && self.avoid.trim().is_empty()
+            && self.reference_shelf.is_empty()
             && self.voice_samples.is_empty()
             && self.story.is_empty()
             && self.feedback.is_empty()

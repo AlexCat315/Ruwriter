@@ -6,6 +6,7 @@ pub mod files;
 pub mod library;
 pub mod outline;
 pub mod paths;
+pub mod reference;
 pub mod session;
 pub mod snapshots;
 pub mod stats;

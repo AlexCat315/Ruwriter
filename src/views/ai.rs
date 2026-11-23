@@ -53,6 +53,13 @@ fn caption(text: impl Into<String>) -> AnyView {
     )
 }
 
+fn reference_note(rows: &mut Vec<AnyView>, title: &str, text: &str) {
+    if !text.trim().is_empty() {
+        rows.push(caption(title));
+        rows.push(AnyView::new(Text::new(text)));
+    }
+}
+
 fn text_box(label: &str, buffer: TextBuffer, height: f32) -> AnyView {
     AnyView::new(
         TextField::new(label, Binding::new(move || buffer.clone(), |_| {}))
@@ -467,23 +474,37 @@ impl AiPanel {
         let page = self.model.ai.brief_page;
         let selected = self.model.ai.brief_item;
         let search = self.model.ai.brief_search;
+        let model = self.model.clone();
         AnyView::new(
             wrap_controls(
-                ["大纲", "角色卡", "关系", "记忆", "DiffData", "文风"]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, label)| {
-                        AnyView::new(
-                            Button::title(label, move || {
+                [
+                    "大纲",
+                    "角色卡",
+                    "关系",
+                    "记忆",
+                    "DiffData",
+                    "文风",
+                    "参考书",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    let model = model.clone();
+                    AnyView::new(
+                        Button::title(label, move || {
+                            if index == 6 {
+                                model.show_reference_books();
+                            } else {
                                 page.set(index);
-                                selected.set(None);
-                                search.set(TextBuffer::empty());
-                            })
-                            .selected(page.get() == index)
-                            .button_style(ToggleButtonStyle::default()),
-                        )
-                    })
-                    .collect(),
+                            }
+                            selected.set(None);
+                            search.set(TextBuffer::empty());
+                        })
+                        .selected(page.get() == index)
+                        .button_style(ToggleButtonStyle::default()),
+                    )
+                })
+                .collect(),
             )
             .padding_edges(14.0, 4.0),
         )
@@ -491,6 +512,9 @@ impl AiPanel {
 
     fn brief(&self) -> (Vec<AnyView>, AnyView) {
         let ai = &self.model.ai;
+        if ai.brief_page.get() == 6 {
+            return self.reference_books();
+        }
         let mut rows = Vec::new();
         let page = ai.brief_page;
         let selected = ai.brief_item;
@@ -897,6 +921,296 @@ impl AiPanel {
             rows,
             primary("保存作品资料", true, move || save.save_ai_brief()),
         )
+    }
+
+    fn reference_books(&self) -> (Vec<AnyView>, AnyView) {
+        let references = &self.model.ai.references;
+        let key = self.model.reference_key();
+        let shelf = key
+            .as_ref()
+            .map(|key| references.shelf(key))
+            .unwrap_or_default();
+        let importer = self.model.clone();
+        let import = primary(
+            if shelf.importing {
+                "正在导入…"
+            } else {
+                "导入参考书"
+            },
+            self.model.ai_work().is_some() && !shelf.importing,
+            move || importer.import_reference_books(),
+        );
+        let mut rows = Vec::new();
+        if !shelf.notice.is_empty() {
+            rows.push(caption(shelf.notice.clone()));
+        }
+        let Some(book) = shelf
+            .selected
+            .as_ref()
+            .and_then(|id| shelf.books.iter().find(|book| &book.id == id))
+        else {
+            if shelf.books.is_empty() {
+                rows.push(caption(
+                    "导入 TXT、Markdown 或 EPUB，查看逐章分析和全书结构。",
+                ));
+            }
+            for book in shelf.books {
+                let key = key.clone().expect("reference shelf work");
+                let library = references.clone();
+                let id = book.id.clone();
+                let search = self.model.ai.brief_search;
+                let active = shelf
+                    .reading
+                    .as_ref()
+                    .is_some_and(|reading| reading.book_id == id);
+                rows.push(vstack(
+                    5.0,
+                    Align::Stretch,
+                    vec![
+                        wrap_controls(vec![AnyView::new(Button::title(book.title, move || {
+                            search.set(TextBuffer::empty());
+                            library.select(&key, Some(id.clone()));
+                        }))]),
+                        caption(format!(
+                            "{} · {} 章 · {} 字{}",
+                            book.format,
+                            book.chapters.len(),
+                            book.characters,
+                            if active { " · 正在拆解" } else { "" }
+                        )),
+                    ],
+                ));
+            }
+            return (rows, import);
+        };
+
+        let key = key.expect("reference shelf work");
+        let other = references.clone();
+        let shelf_key = key.clone();
+        rows.push(wrap_controls(vec![AnyView::new(
+            Button::title("返回参考书列表", move || {
+                other.select(&shelf_key, None)
+            })
+            .button_style(GhostButtonStyle),
+        )]));
+        rows.push(AnyView::new(
+            Text::new(&book.title).semantic_font(SemanticFontRef::headline()),
+        ));
+        let reading = shelf
+            .reading
+            .as_ref()
+            .filter(|reading| reading.book_id == book.id);
+        let report = &shelf.report;
+        if report.overview.is_some() {
+            rows.push(caption(format!(
+                "{} · {} 章 · 拆解完成",
+                book.format,
+                book.chapters.len()
+            )));
+        } else if reading.is_some() && report.total > 0 && report.notes.len() == report.total {
+            rows.push(caption("正在综合全书结构…"));
+        } else if report.total > 0 {
+            rows.push(caption(format!(
+                "已分析 {}/{} 个分段",
+                report.notes.len(),
+                report.total
+            )));
+        } else if reading.is_some() {
+            rows.push(caption("正在读取章节…"));
+        } else {
+            rows.push(caption(format!(
+                "{} · {} 章 · {} 字",
+                book.format,
+                book.chapters.len(),
+                book.characters
+            )));
+        }
+
+        if let Some(chapter) = shelf.chapter {
+            let nav = [
+                (None, "全书总览"),
+                (chapter.checked_sub(1).filter(|value| *value > 0), "上一章"),
+                (
+                    (chapter < book.chapters.len()).then_some(chapter + 1),
+                    "下一章",
+                ),
+            ];
+            rows.push(wrap_controls(
+                nav.into_iter()
+                    .map(|(target, name)| {
+                        let refs = references.clone();
+                        let key = key.clone();
+                        AnyView::new(
+                            Button::title(name, move || refs.select_chapter(&key, target))
+                                .enabled(target.is_some() || name == "全书总览"),
+                        )
+                    })
+                    .collect(),
+            ));
+            if let Some(section) = book.chapters.get(chapter - 1) {
+                rows.push(AnyView::new(
+                    Text::new(&section.title).semantic_font(SemanticFontRef::headline()),
+                ));
+            }
+            let notes: Vec<_> = report
+                .notes
+                .iter()
+                .filter(|note| note.chapter == chapter)
+                .collect();
+            if notes.is_empty() {
+                rows.push(caption("这一章尚未拆解。"));
+            }
+            for (index, note) in notes.iter().enumerate() {
+                if notes.len() > 1 {
+                    rows.push(caption(format!("分段 {}", index + 1)));
+                }
+                for (title, value) in [
+                    ("梗概", &note.summary),
+                    ("选择与转折", &note.structure),
+                    ("人物与知情差", &note.characters),
+                    ("场景与节奏", &note.pacing),
+                    ("叙述与文风", &note.voice),
+                    ("可借鉴的写法", &note.craft),
+                ] {
+                    reference_note(&mut rows, title, value);
+                }
+                for evidence in &note.evidence {
+                    rows.push(caption(format!("原文 · 「{}」", evidence.quote)));
+                    rows.push(AnyView::new(Text::new(&evidence.insight)));
+                }
+            }
+        } else {
+            if let Some(overview) = &report.overview {
+                for (title, value) in [
+                    ("全书结构", &overview.structure),
+                    ("人物与关系", &overview.characters),
+                    ("信息与节奏", &overview.pacing),
+                    ("叙述与文风", &overview.voice),
+                ] {
+                    reference_note(&mut rows, title, value);
+                }
+                let memories = self.model.ai_brief().memories;
+                for technique in &overview.techniques {
+                    let source = format!("参考书《{}》", book.title);
+                    let expected = key.clone();
+                    let saved = memories.iter().any(|entry| {
+                        entry.title == technique.title && entry.text == technique.guidance
+                    });
+                    let model = self.model.clone();
+                    let technique = technique.clone();
+                    let chapters = technique
+                        .chapters
+                        .iter()
+                        .map(|chapter| chapter.to_string())
+                        .collect::<Vec<_>>();
+                    let mut notes = Vec::new();
+                    reference_note(&mut notes, &technique.title, &technique.guidance);
+                    if !chapters.is_empty() {
+                        notes.push(caption(format!("对应章节 · {}", chapters.join("、"))));
+                    }
+                    notes.push(wrap_controls(vec![AnyView::new(
+                        Button::title(
+                            if saved {
+                                "已记为写法经验"
+                            } else {
+                                "记为写法经验"
+                            },
+                            move || {
+                                model.remember_reference_technique(
+                                    &expected,
+                                    &technique.title,
+                                    &technique.guidance,
+                                    source.clone(),
+                                )
+                            },
+                        )
+                        .enabled(!saved),
+                    )]));
+                    rows.push(AnyView::new(
+                        vstack(5.0, Align::Stretch, notes)
+                            .padding_edges(10.0, 8.0)
+                            .semantic_background(SemanticColorRef::surface_raised())
+                            .corner_radius(9.0),
+                    ));
+                }
+            }
+            rows.push(AnyView::new(
+                Text::new("分章查看").semantic_font(SemanticFontRef::headline()),
+            ));
+            let search = self.model.ai.brief_search;
+            if book.chapters.len() > 12 {
+                rows.push(AnyView::new(
+                    TextField::new("查找章节标题或序号", search.binding())
+                        .text_field_style(ProseFieldStyle)
+                        .frame_height(38.0),
+                ));
+            }
+            let query = search.get().string_value().trim().to_lowercase();
+            let chapter_number = query.parse::<usize>().ok();
+            let mut matching = book
+                .chapters
+                .iter()
+                .enumerate()
+                .filter(|(index, section)| {
+                    section.title.to_lowercase().contains(&query)
+                        || chapter_number == Some(index + 1)
+                })
+                .peekable();
+            if matching.peek().is_none() {
+                rows.push(caption("找不到匹配的章节。"));
+            }
+            for (index, section) in matching.by_ref().take(12) {
+                let chapter = index + 1;
+                let refs = references.clone();
+                let key = key.clone();
+                rows.push(wrap_controls(vec![AnyView::new(Button::title(
+                    &format!("{chapter} · {}", section.title),
+                    move || refs.select_chapter(&key, Some(chapter)),
+                ))]));
+            }
+            if matching.peek().is_some() {
+                rows.push(caption("输入章节标题或序号可定位更多章节。"));
+            }
+        }
+        let action = if let Some(reading) = reading {
+            let abort = references.clone();
+            let stopping = reading.token.load(std::sync::atomic::Ordering::Relaxed);
+            primary(
+                if stopping {
+                    "正在暂停…"
+                } else {
+                    "暂停拆书"
+                },
+                !stopping,
+                move || abort.pause(&key),
+            )
+        } else if report.overview.is_some() {
+            import
+        } else {
+            let start = self.model.clone();
+            let book = book.clone();
+            let config = self.model.ai_settings();
+            let selected = config
+                .selected
+                .first()
+                .and_then(|index| config.models.get(*index));
+            if let Some(profile) = selected {
+                rows.push(caption(format!(
+                    "拆书模型 · {}。正文将发送给该模型。",
+                    profile.model
+                )));
+            }
+            primary(
+                if report.notes.is_empty() {
+                    "开始拆书"
+                } else {
+                    "继续拆书"
+                },
+                shelf.reading.is_none(),
+                move || start.analyze_reference_book(book.clone()),
+            )
+        };
+        (rows, action)
     }
 
     fn outline_workspace(&self, rows: &mut Vec<AnyView>, has_reading: bool) {
@@ -3412,12 +3726,15 @@ impl View for AiPanel {
             last_geometry.set(None);
         }
         if brief {
-            let page = (
-                self.model.ai.brief_page.get(),
-                self.model.ai.brief_item.get(),
-            );
+            let brief_page = self.model.ai.brief_page.get();
+            let reference = (brief_page == 6)
+                .then(|| self.model.reference_key())
+                .flatten()
+                .map(|key| self.model.ai.references.shelf(&key))
+                .map(|shelf| (shelf.selected, shelf.chapter));
+            let page = (brief_page, self.model.ai.brief_item.get(), reference);
             let mut previous = brief_scroll.borrow_mut();
-            if previous.as_ref().is_none_or(|(prior, _)| *prior != page) {
+            if previous.as_ref().is_none_or(|(prior, _)| prior != &page) {
                 *previous = Some((page, ScrollRequest::new(Point::new(0.0, 0.0), 0.0)));
             }
             if let Some((_, request)) = &*previous {
