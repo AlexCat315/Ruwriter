@@ -1603,16 +1603,26 @@ impl Model {
     pub fn send_ai_message(&self) {
         let prompt = self.ai.prompt.get_untracked().string_value();
         let index = self.ai.viewed_result.get_untracked();
+        let batch = self.ai.current_batch();
         if crate::ai_work::is_edit_request(&prompt) {
             self.ai.task.set(WritingTask::Request);
             self.run_ai();
             return;
         }
         if self.ai.follow_draft.get_untracked()
-            && self
-                .ai
-                .current_batch()
-                .is_some_and(|batch| batch.can_revise(index))
+            && batch
+                .as_ref()
+                .is_some_and(|batch| batch.scene_question(index).is_some())
+        {
+            self.ai.task.set(WritingTask::Continue);
+            if is_continuation_command(&prompt) {
+                self.ai.follow_draft.set(false);
+            }
+            self.run_ai();
+            return;
+        }
+        if self.ai.follow_draft.get_untracked()
+            && batch.as_ref().is_some_and(|batch| batch.can_revise(index))
         {
             if !is_continuation_command(&prompt) {
                 self.ai.feedback.set(String::new());
@@ -1675,7 +1685,7 @@ impl Model {
         self.ai
             .prompt
             .set(batch.retry_prompt(self.ai.target.get_untracked().as_ref()));
-        self.run_ai();
+        self.run_ai_at_target_request(None, batch.preparing_work);
     }
 
     /// Ask for a fresh answer to the current request without feeding the
@@ -1969,23 +1979,14 @@ impl Model {
     }
 
     pub fn decide_ai_work_change(&self, id: &str, approve: bool) {
-        let result = (|| {
-            let change = self
-                .ai
-                .current_batch()
-                .and_then(|batch| {
-                    batch.runs.into_iter().find_map(|run| match run.status {
-                        ModelStatus::NeedsUserAnswer(question) if question.id == id => {
-                            question.work_change
-                        }
-                        _ => None,
-                    })
-                })
-                .ok_or("这份提案已经结束。")?;
+        let mut saved_brief = None;
+        let result = self.ai.resolve_user_question(id, |question| {
+            let change = question
+                .work_change
+                .as_ref()
+                .ok_or("当前问题需要一个文字答复。")?;
             if !approve {
-                return self
-                    .ai
-                    .answer_user_question(id, crate::ai_work::DECLINED.into());
+                return Ok(crate::ai_work::DECLINED.into());
             }
             if self.ai_work().as_ref() != Some(&change.base.key) {
                 return Err("作品已切换，请回到原作品确认。".into());
@@ -2009,15 +2010,18 @@ impl Model {
                     .save_writing_brief(work, change.updated.clone())
                     .map_err(|error| error.to_string())
             })?;
-            self.ai.use_brief.set(!change.updated.is_empty());
+            saved_brief = Some(!change.updated.is_empty());
+            Ok(crate::ai_work::APPLIED.into())
+        });
+        if let Some(active) = saved_brief {
+            self.ai.use_brief.set(active);
             self.ai.brief_open.set(false);
             self.revision.update(|value| *value += 1);
-            self.ai
-                .flash_feedback("已保存到作品资料，下一轮写作会使用。");
-            self.ai
-                .answer_user_question(id, crate::ai_work::APPLIED.into())
-        })();
-        self.ai.error.set(result.err().unwrap_or_default());
+            self.ai.flash_feedback("已保存到作品资料。");
+        }
+        if let Err(error) = result {
+            self.ai.error.set(error);
+        }
     }
 
     pub fn remember_archived_reflection(&self, id: &str) {

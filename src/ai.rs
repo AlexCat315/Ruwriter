@@ -269,11 +269,18 @@ pub struct UserQuestion {
 pub type AskUser = Arc<dyn Fn(UserQuestion) -> Option<String> + Send + Sync>;
 
 #[derive(Clone)]
+pub struct PendingQuestion {
+    pub question: UserQuestion,
+    reply: std::sync::mpsc::Sender<String>,
+    resume: WritingStage,
+}
+
+#[derive(Clone)]
 pub enum ModelStatus {
     Indexing,
     Running(WritingStage),
     NeedsDirection(SceneQuestion),
-    NeedsUserAnswer(UserQuestion),
+    NeedsUserAnswer(PendingQuestion),
     Ready(Box<WritingResult>),
     Failed(AgentError),
     Cancelled,
@@ -328,6 +335,30 @@ pub struct ModelRun {
 }
 
 impl ModelRun {
+    fn waiting_for(&self, id: &str) -> Option<&PendingQuestion> {
+        match &self.status {
+            ModelStatus::NeedsUserAnswer(pending) if pending.question.id == id => Some(pending),
+            _ => None,
+        }
+    }
+
+    fn resolve_question(
+        &mut self,
+        id: &str,
+        answer: String,
+    ) -> Option<std::sync::mpsc::Sender<String>> {
+        let pending = self.waiting_for(id)?;
+        let reply = pending.reply.clone();
+        let label = if pending.question.work_change.is_some() {
+            pending.question.header.clone()
+        } else {
+            pending.question.question.clone()
+        };
+        self.status = ModelStatus::Running(pending.resume);
+        self.answers.push((label, answer));
+        Some(reply)
+    }
+
     pub fn author_answers(&self) -> &[(String, String)] {
         &self.answers
     }
@@ -554,7 +585,9 @@ impl Batch {
             .fallback
             .as_ref()
             .filter(|turn| turn.id == self.turn_id);
-        let answer = generated.or_else(|| fallback.and_then(|turn| turn.answer.clone()));
+        let answer = generated
+            .or_else(|| run.and_then(|run| run.revising.as_ref().map(|draft| draft.text.clone())))
+            .or_else(|| fallback.and_then(|turn| turn.answer.clone()));
         Arc::make_mut(&mut history).push(ChatTurn {
             id: self.turn_id.clone(),
             markdown: self.task == WritingTask::Request,
@@ -577,6 +610,7 @@ impl Batch {
             ),
             at: fallback.map_or(Some(self.created_at), |turn| turn.at),
             local: Some(LocalTurn {
+                has_tool_answers: run.is_some_and(|run| !run.answers.is_empty()),
                 pending: self.scene_question(index).and_then(|question| {
                     Some(PendingScene {
                         anchor: SceneAnchor::capture(self.target.as_ref()?)?,
@@ -899,8 +933,6 @@ pub struct AiState {
     archived_writes: Signal<Vec<PendingDraftEdit>>,
     pub error: Signal<String>,
     pub archive_read_error: Signal<String>,
-    answers:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<String>>>>,
 }
 
 impl AiState {
@@ -974,7 +1006,6 @@ impl AiState {
             archived_writes: cx.state(Vec::new),
             error: cx.state(String::new),
             archive_read_error: cx.state(String::new),
-            answers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -1219,19 +1250,63 @@ impl AiState {
         )
     }
 
-    /// A short-lived confirmation in the composer area. Repeating the same
-    /// message restarts the timer; a later message is never cleared by an
-    /// older timer.
     pub fn answer_user_question(&self, id: &str, answer: String) -> Result<(), String> {
-        let sender = self
-            .answers
-            .lock()
-            .map_err(|_| "提问状态已失效。".to_owned())?
-            .remove(id)
-            .ok_or_else(|| "这个问题已经回答过了。".to_owned())?;
-        sender.send(answer).map_err(|_| "生成已停止。".to_owned())
+        let answered = self.resolve_user_question(id, |question| {
+            if question.work_change.is_some() {
+                return Err("请在提案中选择是否保存。".to_owned());
+            }
+            Ok(answer)
+        })?;
+        if answered {
+            self.prompt.set(TextBuffer::empty());
+            self.follow_draft.set(true);
+        }
+        Ok(())
     }
 
+    /// Commit the answer and remove its controls on the UI thread before waking
+    /// the model. A queued click from an old view is a no-op.
+    pub fn resolve_user_question(
+        &self,
+        id: &str,
+        prepare_answer: impl FnOnce(&UserQuestion) -> Result<String, String>,
+    ) -> Result<bool, String> {
+        let key = self.workspace.get_untracked();
+        let pending = self.batches.with_untracked(|batches| {
+            batches
+                .get(&key)?
+                .runs
+                .iter()
+                .enumerate()
+                .find_map(|(index, run)| Some((index, run.waiting_for(id)?.question.clone())))
+        });
+        let Some((index, question)) = pending else {
+            return Ok(false);
+        };
+        let answer = prepare_answer(&question)?;
+        let mut reply = None;
+        self.batches.update_if(|batches| {
+            let Some(batch) = batches.get_mut(&key) else {
+                return false;
+            };
+            let Some(run) = batch.runs.get_mut(index) else {
+                return false;
+            };
+            reply = run.resolve_question(id, answer.clone());
+            if reply.is_some() {
+                persist_batch(&key, batch);
+            }
+            reply.is_some()
+        });
+        let Some(reply) = reply else { return Ok(false) };
+        self.error.set(String::new());
+        reply
+            .send(answer)
+            .map_err(|_| "答复已记录，当前请求已结束。".to_owned())?;
+        Ok(true)
+    }
+
+    /// A short-lived confirmation in the composer area.
     pub fn flash_feedback(&self, message: impl Into<String>) {
         let message = message.into();
         self.feedback.set(message.clone());
@@ -1731,8 +1806,27 @@ impl AiState {
         let replay = history_override.is_some();
         let prompt = self.prompt.get_untracked().string_value();
         let requested_task = self.task.get_untracked();
-        let target = self.target.get_untracked();
-        let context_task = if plan_only {
+        let setup_followup = work.is_some()
+            && previous.as_ref().is_some_and(|batch| batch.preparing_work)
+            && self.follow_draft.get_untracked()
+            && !is_continuation_command(&prompt);
+        let live_target = self.target.get_untracked();
+        let target = if setup_followup {
+            previous
+                .as_ref()
+                .and_then(|batch| batch.target.as_ref())
+                .filter(|prior| {
+                    live_target.as_ref().is_some_and(|live| {
+                        prior.document == live.document
+                            && prior.buffer.has_same_contents(&live.buffer)
+                    })
+                })
+                .cloned()
+                .or(live_target)
+        } else {
+            live_target
+        };
+        let context_task = if plan_only || setup_followup {
             WritingTask::Continue
         } else {
             requested_task
@@ -1765,18 +1859,24 @@ impl AiState {
         {
             missing.push("本场冲突的具体结果与下一场承接");
         }
-        let setup_followup = work.is_some()
-            && previous.as_ref().is_some_and(|batch| batch.preparing_work)
-            && self.follow_draft.get_untracked()
-            && !is_continuation_command(&prompt);
         let preparing_work = !missing.is_empty() || setup_followup || plan_only;
-        let must_ask_about_work = plan_only && !missing.is_empty()
-            || preparing_work
-                && !setup_followup
-                && matches!(
-                    prompt.trim().trim_end_matches(['。', '！', '？']),
-                    "" | "续写" | "继续写" | "接着写"
-                );
+        let already_answered = previous.as_ref().is_some_and(|batch| {
+            batch.preparing_work
+                && batch.same_scene(target.as_ref())
+                && batch.runs.iter().any(|run| {
+                    run.answers
+                        .iter()
+                        .any(|(_, reply)| reply != ai_work::APPLIED && reply != ai_work::DECLINED)
+                })
+        });
+        let must_ask_about_work = !already_answered
+            && (plan_only && !missing.is_empty()
+                || preparing_work
+                    && !setup_followup
+                    && matches!(
+                        prompt.trim().trim_end_matches(['。', '！', '？']),
+                        "" | "续写" | "继续写" | "接着写"
+                    ));
         let task = if preparing_work {
             WritingTask::Request
         } else {
@@ -1928,7 +2028,6 @@ impl AiState {
 
         let sender = self.batches.sender();
         let cache = self.cache.clone();
-        let answers = self.answers.clone();
         let reading = match self.story_status() {
             Some(StoryStatus::Ready(draft))
                 if task == WritingTask::Continue
@@ -1995,7 +2094,6 @@ impl AiState {
                             job.work = None;
                         }
                         job.ask_user = Some(question_handler(
-                            answers.clone(),
                             worker_sender.clone(),
                             worker_key.clone(),
                             worker_flag.clone(),
@@ -2198,7 +2296,6 @@ impl AiState {
         let worker_flag = flag.clone();
         let ask_user = revising.then(|| {
             question_handler(
-                self.answers.clone(),
                 sender.clone(),
                 key.clone(),
                 flag.clone(),
@@ -2459,11 +2556,7 @@ fn cancellable(model: AgentModel, flag: &Arc<AtomicBool>) -> AgentModel {
     })
 }
 
-type QuestionAnswers =
-    Arc<std::sync::Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<String>>>>;
-
 fn question_handler(
-    answers: QuestionAnswers,
     batches: SignalSender<Workspaces>,
     key: WorkspaceKey,
     flag: Arc<AtomicBool>,
@@ -2473,40 +2566,22 @@ fn question_handler(
 ) -> AskUser {
     Arc::new(move |mut question| {
         question.id = format!("{turn}-{index}-{}", ai_chat::new_id());
-        let id = question.id.clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        answers.lock().ok()?.insert(id.clone(), sender);
-        let shown = question.clone();
+        let (reply, receiver) = std::sync::mpsc::channel();
         update_batch(&batches, &key, &flag, move |batch| {
-            batch.runs[index].status = ModelStatus::NeedsUserAnswer(shown);
-        });
-        let answer = loop {
-            if flag.load(Ordering::Relaxed) {
-                break None;
-            }
-            match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
-                Ok(answer) => break Some(answer),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
-            }
-        };
-        if let Ok(mut answers) = answers.lock() {
-            answers.remove(&id);
-        }
-        if let Some(answer) = &answer {
-            let answer = answer.clone();
-            update_batch(&batches, &key, &flag, move |batch| {
-                let run = &mut batch.runs[index];
-                let description = if question.work_change.is_some() {
-                    question.header
-                } else {
-                    question.question
-                };
-                run.answers.push((description, answer));
-                run.status = ModelStatus::Running(resume);
+            batch.runs[index].status = ModelStatus::NeedsUserAnswer(PendingQuestion {
+                question,
+                reply,
+                resume,
             });
+        });
+        while !flag.load(Ordering::Relaxed) {
+            match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(answer) => return Some(answer),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
-        answer
+        None
     })
 }
 
@@ -2657,16 +2732,26 @@ fn parse_user_questions(input: serde_json::Value) -> Result<Vec<UserQuestion>, A
 
 fn recent_messages(history: &[ChatTurn]) -> Vec<AgentMessage> {
     let mut messages = Vec::new();
-    for turn in history.iter().rev() {
-        let Some(answer) = &turn.answer else {
+    for turn in history {
+        if turn.answer.is_none()
+            && !turn
+                .local
+                .as_ref()
+                .is_some_and(|local| local.has_tool_answers)
+        {
             continue;
-        };
+        }
         let author = turn.author.string_value();
-        let answer = answer.string_value();
-        messages.push(AgentMessage::text(AgentRole::Assistant, answer));
-        messages.push(AgentMessage::user(author));
+        if !author.trim().is_empty() {
+            messages.push(AgentMessage::user(author));
+        }
+        if let Some(answer) = &turn.answer {
+            messages.push(AgentMessage::text(
+                AgentRole::Assistant,
+                answer.string_value(),
+            ));
+        }
     }
-    messages.reverse();
     messages
 }
 
@@ -3061,24 +3146,29 @@ fn run_writing_agent(
     } else {
         String::new()
     };
-    let work_proposed = Arc::new(AtomicBool::new(false));
-    let proposed = work_proposed.clone();
+    let work_saved = Arc::new(AtomicBool::new(false));
+    let saved = work_saved.clone();
+    let work = work.map(std::sync::Mutex::new);
+    let declined = std::sync::Mutex::new(None);
     let work_answered = AtomicBool::new(false);
     let asked_for_scene_direction = AtomicBool::new(false);
     let toolbox = AgentToolbox::new(
         tools,
         Arc::new(move |name, input| {
             if can_edit_work && matches!(name, "read_work_material" | "propose_work_changes") {
-                let work = work.as_ref().ok_or(AgentError::InvalidResult)?;
+                let state = work.as_ref().ok_or(AgentError::InvalidResult)?;
+                let work = state.lock().map_err(|_| AgentError::InvalidResult)?.clone();
                 let response = if name == "read_work_material" {
                     work.read(input.clone())
                 } else if must_ask_about_work && !work_answered.load(Ordering::Relaxed) {
                     Err("先用 ask_user 核对本章尚未确定的关键选择，再提交细纲。".to_owned())
-                } else if proposed.load(Ordering::Relaxed) {
-                    Err("本轮的提案已处理。可继续讨论，下一轮再提交新提案。".to_owned())
                 } else {
+                    let mut declined = declined.lock().map_err(|_| AgentError::InvalidResult)?;
                     work.propose(input.clone()).and_then(|change| {
-                        proposed.store(true, Ordering::Relaxed);
+                        if declined.as_ref() == Some(&change.updated) {
+                            return Err("作者已保留原样。请按新的要求调整提案后再提交。".to_owned());
+                        }
+                        let change = Arc::new(change);
                         let question = UserQuestion {
                             id: String::new(),
                             header: "作品资料变更".into(),
@@ -3086,13 +3176,25 @@ fn run_writing_agent(
                             options: Vec::new(),
                             multiple: false,
                             recommended: None,
-                            work_change: Some(Arc::new(change)),
+                            work_change: Some(change.clone()),
                         };
                         let answer = ask_tool
                             .as_ref()
                             .and_then(|ask| ask(question))
                             .ok_or_else(|| "提案未确认。".to_owned())?;
-                        Ok(json!({"status": answer, "saved": answer == ai_work::APPLIED}))
+                        let applied = answer == ai_work::APPLIED;
+                        if applied {
+                            *state.lock().map_err(|_| "无法读取已保存的作品资料。")? =
+                                Arc::new(WorkMaterial {
+                                    key: work.key.clone(),
+                                    brief: change.updated.clone(),
+                                });
+                            *declined = None;
+                            saved.store(true, Ordering::Relaxed);
+                        } else {
+                            *declined = Some(change.updated.clone());
+                        }
+                        Ok(json!({"status": answer, "saved": applied}))
                     })
                 };
                 return Ok(match response {
@@ -3165,7 +3267,7 @@ fn run_writing_agent(
         WritingStage::Draft
     }));
     let first = session.run(messages)?.answer;
-    let first = if preparing_work && !work_proposed.load(Ordering::Relaxed) {
+    let first = if preparing_work && !work_saved.load(Ordering::Relaxed) {
         format!("{first}\n\n这轮还有资料待确认。场景确定后可以继续补齐细纲。")
     } else {
         first
@@ -3408,6 +3510,21 @@ mod tests {
                 }
                 Some("propose_work_changes") => {
                     assert!(messages.last().unwrap().text.contains(ai_work::APPLIED));
+                    call("read_work_material", json!({"field":"detailed_outline"}))
+                }
+                Some("read_work_material") => {
+                    assert!(messages.last().unwrap().text.contains("她决定沿缆索下水。"));
+                    AgentReply::Tools(vec![AgentToolCall {
+                        id: "update_detail".into(),
+                        name: "propose_work_changes".into(),
+                        arguments: json!({"edits":[{
+                            "field":"detailed_outline","before":"她决定沿缆索下水。",
+                            "after":"灯灭后，她决定沿缆索下水。"
+                        }]}),
+                    }])
+                }
+                Some("update_detail") => {
+                    assert!(messages.last().unwrap().text.contains(ai_work::APPLIED));
                     AgentReply::Answer("已补齐本章细纲。".into())
                 }
                 other => panic!("unexpected tool response: {other:?}"),
@@ -3416,11 +3533,14 @@ mod tests {
         });
         let ask_user: AskUser = Arc::new(|question| {
             if let Some(proposal) = question.work_change {
-                assert!(proposal.base.brief.story.detailed_outline.is_empty());
-                assert_eq!(
-                    proposal.updated.story.detailed_outline,
-                    "第十四章\n她决定沿缆索下水。"
-                );
+                let before = &proposal.base.brief.story.detailed_outline;
+                let after = &proposal.updated.story.detailed_outline;
+                if before.is_empty() {
+                    assert_eq!(after, "第十四章\n她决定沿缆索下水。");
+                } else {
+                    assert_eq!(before, "第十四章\n她决定沿缆索下水。");
+                    assert_eq!(after, "第十四章\n灯灭后，她决定沿缆索下水。");
+                }
                 Some(ai_work::APPLIED.into())
             } else {
                 assert_eq!(question.options.len(), 2);
@@ -3444,6 +3564,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.text.string_value(), "已补齐本章细纲。");
+    }
+
+    #[test]
+    fn stale_answers_cannot_consume_the_next_question() {
+        let pending = |id: &str| {
+            let (reply, receiver) = std::sync::mpsc::channel();
+            (
+                ModelStatus::NeedsUserAnswer(PendingQuestion {
+                    question: UserQuestion {
+                        id: id.into(),
+                        header: String::new(),
+                        question: id.into(),
+                        options: Vec::new(),
+                        multiple: false,
+                        recommended: None,
+                        work_change: None,
+                    },
+                    reply,
+                    resume: WritingStage::PrepareWork,
+                }),
+                receiver,
+            )
+        };
+        let (status, first) = pending("first");
+        let mut run = ModelRun {
+            profile: AiPreferences::default(),
+            status,
+            previous: None,
+            revision_error: None,
+            answers: Vec::new(),
+            revising: None,
+            draft_preview: None,
+            streamed_text: TextBuffer::empty(),
+        };
+        let reply = run.resolve_question("first", "这轮答复".into()).unwrap();
+        assert!(matches!(
+            run.status,
+            ModelStatus::Running(WritingStage::PrepareWork)
+        ));
+        assert!(run.resolve_question("first", "重复点击".into()).is_none());
+        reply.send("这轮答复".into()).unwrap();
+        assert_eq!(first.try_recv().unwrap(), "这轮答复");
+        let (status, second) = pending("second");
+        run.status = status;
+        assert!(run.resolve_question("first", "失效的按钮".into()).is_none());
+        assert!(matches!(
+            second.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(run.resolve_question("second", "新答复".into()).is_some());
+        assert_eq!(run.answers.len(), 2);
     }
 
     #[test]
@@ -3511,6 +3682,7 @@ mod tests {
                 [
                     (&AgentRole::User, "银匣交给了谁？"),
                     (&AgentRole::Assistant, "交给了晏澄。"),
+                    (&AgentRole::User, "作者答复 · 那只银匣留在大堂。"),
                     (&AgentRole::User, "他把它放在哪？"),
                 ]
             );
@@ -3527,6 +3699,20 @@ mod tests {
                 model: None,
                 at: None,
                 local: None,
+            },
+            ChatTurn {
+                id: ai_chat::new_id(),
+                markdown: true,
+                task: None,
+                author: TextBuffer::new("作者答复 · 那只银匣留在大堂。"),
+                answer: None,
+                adopted: false,
+                model: None,
+                at: None,
+                local: Some(LocalTurn {
+                    has_tool_answers: true,
+                    ..Default::default()
+                }),
             },
             ChatTurn {
                 id: ai_chat::new_id(),

@@ -1194,7 +1194,7 @@ impl AiPanel {
             .as_ref()
             .and_then(|batch| batch.runs.get(index))
             .and_then(|run| match &run.status {
-                ModelStatus::NeedsUserAnswer(question) => Some(question.clone()),
+                ModelStatus::NeedsUserAnswer(pending) => Some(pending.question.clone()),
                 _ => None,
             });
         let confirming_work = user_question
@@ -1490,7 +1490,7 @@ impl AiPanel {
         let ready = (!busy || user_question.is_some())
             && !confirming_work
             && !preparing_story
-            && if revising || answering {
+            && if user_question.is_some() || revising || answering {
                 !prompt.trim().is_empty()
             } else {
                 match mode {
@@ -1507,12 +1507,8 @@ impl AiPanel {
                 if question.work_change.is_some() || answer.trim().is_empty() {
                     return;
                 }
-                match model.ai.answer_user_question(&question.id, answer) {
-                    Ok(()) => {
-                        model.ai.prompt.set(TextBuffer::empty());
-                        model.ai.follow_draft.set(true);
-                    }
-                    Err(error) => model.ai.error.set(error),
+                if let Err(error) = model.ai.answer_user_question(&question.id, answer) {
+                    model.ai.error.set(error);
                 }
                 return;
             }
@@ -2106,7 +2102,8 @@ impl AiPanel {
                     )]));
                 }
             }
-            ModelStatus::NeedsUserAnswer(question) => {
+            ModelStatus::NeedsUserAnswer(pending) => {
+                let question = &pending.question;
                 if !question.header.trim().is_empty() {
                     rows.push(caption(question.header.clone()));
                 }
@@ -3345,7 +3342,20 @@ impl View for AiPanel {
                 batch
                     .runs
                     .get(self.model.ai.viewed_result.get())
-                    .map(|run| (run.streamed_text.utf8_length(), batch.busy()))
+                    .map(|run| {
+                        let pending = match &run.status {
+                            ModelStatus::NeedsUserAnswer(pending) => {
+                                Some(pending.question.id.clone())
+                            }
+                            _ => None,
+                        };
+                        (
+                            run.streamed_text.utf8_length(),
+                            batch.busy(),
+                            run.author_answers().len(),
+                            pending,
+                        )
+                    })
             });
             let key = (
                 last_turn,
@@ -3361,6 +3371,16 @@ impl View for AiPanel {
                 let y = geometry.offset.y;
                 let previous = position.replace(Some((end, y)));
                 let near_tail = end - y <= 28.0;
+                detached.set_if_changed(!near_tail);
+                if follow.get()
+                    && !near_tail
+                    && previous
+                        .is_some_and(|(old_end, old_y)| end > old_end + 1.0 && y >= old_y - 1.0)
+                {
+                    // A rich reply can grow after the first scroll request
+                    // was laid out. Follow the new bottom in that case.
+                    jump.update(|value| *value += 1);
+                }
                 if near_tail
                     || previous.is_some_and(|(old_end, old_y)| {
                         let moved_up = y < old_y - 1.0 && end >= old_end - 1.0;
@@ -3368,7 +3388,6 @@ impl View for AiPanel {
                     })
                 {
                     follow.set(near_tail);
-                    detached.set_if_changed(!near_tail);
                 }
             });
             let mut previous = scroll.borrow_mut();

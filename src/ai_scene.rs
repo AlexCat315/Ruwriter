@@ -65,6 +65,8 @@ pub struct SceneAnswer {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct LocalTurn {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_tool_answers: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingScene>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
