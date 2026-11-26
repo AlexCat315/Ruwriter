@@ -2113,16 +2113,17 @@ impl Model {
             }
             let (root, work) = &change.base.key;
             self.with_session(|session| {
-                if session.library_root() != root
-                    || session
-                        .library
-                        .state
-                        .writing_briefs
-                        .get(work)
-                        .cloned()
-                        .unwrap_or_default()
-                        != change.base.brief
-                {
+                if session.library_root() != root {
+                    return Err("作品已切换，请回到原作品确认。".into());
+                }
+                let latest = session
+                    .library
+                    .state
+                    .writing_briefs
+                    .get(work)
+                    .cloned()
+                    .unwrap_or_default();
+                if !crate::ai_work::brief_compatible(&latest, &change.base.brief) {
                     return Err("作品资料已发生变化，请保留原样后重新提交。".into());
                 }
                 session

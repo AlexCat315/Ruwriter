@@ -170,6 +170,68 @@ struct Edit {
     after: Value,
 }
 
+/// Fields the proposal flow owns end to end: the model read the snapshot,
+/// proposed replacements for these fields, and the author is confirming them.
+const OWNED_TOP_LEVEL: [&str; 3] = ["canon", "voice", "avoid"];
+const OWNED_STORY: [&str; 10] = [
+    "outline",
+    "detailed_outline",
+    "characters",
+    "open_threads",
+    "genre",
+    "tone",
+    "direction",
+    "character_claims",
+    "character_cards",
+    "relationships",
+];
+
+/// Optimistic check when the author confirms a proposal.
+///
+/// The snapshot was taken when the current request started. Since then, other
+/// paths may legitimately append their own records (hand-edit examples, craft
+/// notes) or drop stale samples; those do not conflict with the proposal. Only
+/// a change to a field the proposal itself edits can make the base stale.
+pub fn brief_compatible(latest: &WritingBrief, base: &WritingBrief) -> bool {
+    for field in OWNED_TOP_LEVEL {
+        if top_level_field(latest, field) != top_level_field(base, field) {
+            return false;
+        }
+    }
+    for field in OWNED_STORY {
+        if story_field(latest, field) != story_field(base, field) {
+            return false;
+        }
+    }
+    true
+}
+
+fn top_level_field<'a>(brief: &'a WritingBrief, field: &str) -> Option<&'a String> {
+    match field {
+        "canon" => Some(&brief.canon),
+        "voice" => Some(&brief.voice),
+        "avoid" => Some(&brief.avoid),
+        _ => None,
+    }
+}
+
+fn story_field<'a>(brief: &'a WritingBrief, field: &str) -> Option<String> {
+    let story = &brief.story;
+    Some(match field {
+        "outline" => story.outline.clone(),
+        "detailed_outline" => story.detailed_outline.clone(),
+        "characters" => story.characters.clone(),
+        "open_threads" => story.open_threads.clone(),
+        "genre" => story.genre.clone(),
+        "tone" => story.tone.clone(),
+        "direction" => story.direction.clone(),
+        "character_claims" => story.character_claims.clone(),
+        "character_cards" => serde_json::to_string(&story.character_cards).ok()?,
+        "relationships" => serde_json::to_string(&story.relationships).ok()?,
+        _ => return None,
+    })
+}
+
 pub fn is_edit_request(prompt: &str) -> bool {
     [
         "作品资料",
@@ -662,5 +724,37 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn accumulated_records_do_not_make_the_proposal_stale() {
+        let mut base = WritingBrief::default();
+        base.story.outline = "第一卷：分开。".into();
+        base.feedback.push(ruwriter_core::WritingFeedback {
+            instruction: "作者手改".into(),
+            before: "旧句".into(),
+            after: "新句".into(),
+            ..Default::default()
+        });
+
+        let mut latest = base.clone();
+        // Adopting a draft appends another hand-edit example after the snapshot.
+        latest.feedback.push(ruwriter_core::WritingFeedback {
+            instruction: "作者手改".into(),
+            before: "前一句".into(),
+            after: "后一句".into(),
+            ..Default::default()
+        });
+        latest.memories.push(ruwriter_core::WritingMemory {
+            title: "写法归纳".into(),
+            text: "动作替代心理旁白。".into(),
+            ..Default::default()
+        });
+        assert!(brief_compatible(&latest, &base));
+
+        // An actual edit to a proposed field still conflicts.
+        let mut changed = latest.clone();
+        changed.story.outline = "第一卷：重逢。".into();
+        assert!(!brief_compatible(&changed, &base));
     }
 }
